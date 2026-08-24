@@ -32,12 +32,51 @@ def test_unknown_last():
     assert m.data_type == UNKNOWN
 
 
-def test_unknown_length_varchar_omits_datalength():
-    # Never emit the dataLength:1 placeholder for an unknown-length char type.
+def test_unknown_length_varchar_maps_to_text():
+    # OM rejects a null dataLength for char/varchar; a length-less varchar must
+    # fall back to a length-free OM type (TEXT), never a dataLength:1 placeholder.
     m = map_datatype(definition={"type": "VARCHAR"})
-    assert m.data_type == "VARCHAR"
+    assert m.data_type == "TEXT"
     assert m.data_length is None
-    assert m.data_type_display == "VARCHAR"
+    assert m.data_type_display == "VARCHAR"  # source type name preserved
+
+
+def test_unknown_length_char_maps_to_text():
+    m = map_datatype(definition={"type": "CHAR"})
+    assert m.data_type == "TEXT"
+    assert m.data_length is None
+
+
+def test_unknown_length_string_basetype_maps_to_text():
+    # A length-less Keboola STRING basetype (no native type) also becomes TEXT.
+    m = map_datatype(legacy={"basetype": "STRING"})
+    assert m.data_type == "TEXT"
+    assert m.data_length is None
+
+
+def test_known_length_varchar_keeps_varchar_and_length():
+    m = map_datatype(definition={"type": "VARCHAR", "length": "255"})
+    assert m.data_type == "VARCHAR"
+    assert m.data_length == 255
+
+
+def test_unknown_length_binary_maps_to_bytes():
+    # binary/varbinary also require dataLength in OM; length-less -> BYTES.
+    m = map_datatype(definition={"type": "BINARY"})
+    assert m.data_type == "BYTES"
+    assert m.data_length is None
+
+
+def test_unknown_length_varbinary_maps_to_bytes():
+    m = map_datatype(definition={"type": "VARBINARY"})
+    assert m.data_type == "BYTES"
+    assert m.data_length is None
+
+
+def test_known_length_binary_keeps_binary_and_length():
+    m = map_datatype(definition={"type": "BINARY", "length": "16"})
+    assert m.data_type == "BINARY"
+    assert m.data_length == 16
 
 
 def test_length_only_set_for_char_types():

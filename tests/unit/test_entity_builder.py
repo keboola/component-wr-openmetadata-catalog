@@ -30,6 +30,7 @@ def test_regular_table_body_has_columns_pk_and_sourceurl():
         columns=[
             SourceColumn(name="id", definition={"type": "NUMBER", "length": "38,0"}),
             SourceColumn(name="note", definition={"type": "VARCHAR"}),
+            SourceColumn(name="code", definition={"type": "VARCHAR", "length": "50"}),
         ],
     )
     built = _builder().table_body(bucket, table)
@@ -41,8 +42,13 @@ def test_regular_table_body_has_columns_pk_and_sourceurl():
     assert body["sourceUrl"].endswith("/storage/out.c-sales/table/out.c-sales.orders")
     cols = {c["name"]: c for c in body["columns"]}
     assert cols["id"]["dataType"] == "NUMERIC"
-    # unknown-length varchar must omit dataLength (never dataLength:1)
+    # unknown-length varchar must become TEXT (length-free) and omit dataLength;
+    # OM rejects a null dataLength for char/varchar, and we never emit dataLength:1.
+    assert cols["note"]["dataType"] == "TEXT"
     assert "dataLength" not in cols["note"]
+    # a known-length varchar keeps VARCHAR + dataLength
+    assert cols["code"]["dataType"] == "VARCHAR"
+    assert cols["code"]["dataLength"] == 50
     assert built.view_source_fqn is None
 
 

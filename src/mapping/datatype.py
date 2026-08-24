@@ -6,8 +6,13 @@ Map order, driven purely off what the Storage API returns for the column
     typed ``definition.type`` -> typed ``definition.basetype`` -> legacy
     ``KBC.datatype.type`` -> legacy ``KBC.datatype.basetype`` -> UNKNOWN
 
-The mapping preserves a ``dataTypeDisplay`` and never emits the ``dataLength: 1``
-placeholder for unknown-length character types (spec 6.5 / E8).
+OpenMetadata rejects a null ``dataLength`` for the ``char``/``varchar``/``binary``/
+``varbinary`` data types (``400 ... dataLength must not be null``). When the source
+column carries no usable length, we therefore map it to a length-free OM type
+(``TEXT`` for the char family, ``BYTES`` for the binary family) rather than emit a
+fake ``dataLength: 1`` placeholder (spec 6.5 / E8). A known length keeps
+``VARCHAR(n)`` / ``BINARY(n)`` with its ``dataLength``. The mapping always preserves
+the original source type name in ``dataTypeDisplay``.
 """
 
 from __future__ import annotations
@@ -17,7 +22,17 @@ from dataclasses import dataclass
 UNKNOWN = "UNKNOWN"
 
 # OM DataType values that carry a length; we only ever set dataLength for these.
+# OM also *requires* a non-null dataLength for exactly these types.
 _LENGTH_TYPES = frozenset({"VARCHAR", "CHAR", "BINARY", "VARBINARY"})
+
+# When a length-required OM type has no usable source length, fall back to a
+# length-free OM DataType that OM accepts without a dataLength (never a placeholder).
+_LENGTHLESS_FALLBACK = {
+    "VARCHAR": "TEXT",
+    "CHAR": "TEXT",
+    "BINARY": "BYTES",
+    "VARBINARY": "BYTES",
+}
 
 # Keboola basetype (typed definition.basetype or legacy KBC.datatype.basetype) -> OM DataType.
 _BASETYPE_TO_OM = {
@@ -152,6 +167,14 @@ def map_datatype(
         om_type = UNKNOWN
 
     length = _parse_length(raw_length)
+
+    # OM requires a non-null dataLength for char/varchar/binary/varbinary. With no
+    # usable source length, remap to a length-free OM type instead of a placeholder.
+    # This only fires when length is None, so the known-length display suffix below
+    # (which requires a length) is unaffected and keeps the original OM type.
+    if length is None and om_type in _LENGTH_TYPES:
+        om_type = _LENGTHLESS_FALLBACK[om_type]
+
     data_length = length if om_type in _LENGTH_TYPES else None
 
     display = None
