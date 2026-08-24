@@ -56,6 +56,19 @@ def _is_empty(value: object) -> bool:
     return value is None or value == "" or value == [] or value == {}
 
 
+# Owned string sub-fields OpenMetadata re-renders with a deterministic case change
+# on read-back (it does NOT alter their meaning). ``dataTypeDisplay`` is authored
+# from the source's native type name — often UPPERCASE for typed Snowflake columns
+# (``NUMBER``, ``VARCHAR(16777216)``, ``TIMESTAMP_LTZ``) — but OM stores and returns
+# it lowercased (``number``, ``varchar(16777216)``, ``timestamp_ltz``). A
+# case-sensitive ``==`` on this cosmetic render string false-diverges every typed
+# table (11/185 in the recorder; the rest are untyped -> no ``dataTypeDisplay`` -- or
+# already lowercase). Folding case here treats OM's re-render as our own value while
+# a genuine type change is still caught by the case-stable ``dataType`` /
+# ``dataLength`` / ``arrayDataType`` fields, which OM returns in canonical form.
+_CASE_FOLDED_KEYS = frozenset({"dataTypeDisplay"})
+
+
 def _project_owned(desired_value: object, om_value: object) -> object:
     """Project OM's stored value onto only the shape the component authored.
 
@@ -69,9 +82,26 @@ def _project_owned(desired_value: object, om_value: object) -> object:
     keys and positions ``desired_value`` declares ignores that enrichment while
     still surfacing a genuine change to an owned sub-value (e.g. a column's
     ``dataType``/``description`` or ``ordinalPosition``).
+
+    Beyond enrichment, OM also *re-renders* a few owned string fields with a
+    deterministic case change (see ``_CASE_FOLDED_KEYS``); such a key is folded to
+    the desired value when it differs only by case, so an unchanged typed column
+    (or a nested STRUCT child, reached by the same recursion) compares equal.
     """
     if isinstance(desired_value, dict) and isinstance(om_value, dict):
-        return {k: _project_owned(v, om_value.get(k)) for k, v in desired_value.items()}
+        projected: dict = {}
+        for key, value in desired_value.items():
+            om_sub = om_value.get(key)
+            if (
+                key in _CASE_FOLDED_KEYS
+                and isinstance(value, str)
+                and isinstance(om_sub, str)
+                and value.casefold() == om_sub.casefold()
+            ):
+                projected[key] = value  # OM only case-normalized this render -> treat as ours
+            else:
+                projected[key] = _project_owned(value, om_sub)
+        return projected
     if isinstance(desired_value, list) and isinstance(om_value, list):
         if len(desired_value) != len(om_value):
             return om_value  # a length change is a real change; leave it unequal to desired

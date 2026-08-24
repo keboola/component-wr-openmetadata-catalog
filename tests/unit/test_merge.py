@@ -186,3 +186,134 @@ def test_snapshot_store_roundtrip():
     )
     assert store2.base_fields("svc.p.b.t") == {"description": "d", "tableType": "Regular"}
     assert store2.base_fields("missing") is None
+
+
+# --------------------------------------------------------------------------- #
+# Residual columns false-diverge: OM lowercases dataTypeDisplay on read-back.
+#
+# ROOT CAUSE of the 11/185 tables that still recorded skipped_diverged,
+# detail="columns" on a full re-push. The component authors dataTypeDisplay from
+# the source native type name (often UPPERCASE for typed Snowflake columns:
+# NUMBER, VARCHAR(16777216), TIMESTAMP_LTZ); OM stores and returns it lowercased.
+# The owned-field projection now folds that case difference, so an unchanged table
+# of ANY column shape compares equal while a genuine owned change still diverges.
+# --------------------------------------------------------------------------- #
+
+
+def _om_readback(columns):
+    """Simulate what OM returns on read-back: the authored shape plus the
+    server-only enrichment (``fullyQualifiedName``/``tags``/``children``) and the
+    ``dataTypeDisplay`` render string lowercased. Applied recursively to STRUCT
+    ``children`` (which OM enriches and re-renders the same way)."""
+    out = []
+    for col in columns:
+        enriched = dict(col)
+        if "dataTypeDisplay" in enriched:
+            enriched["dataTypeDisplay"] = enriched["dataTypeDisplay"].lower()
+        enriched.setdefault("fullyQualifiedName", f"svc.p.b.t.{col['name']}")
+        enriched.setdefault("tags", [])
+        enriched["children"] = _om_readback(col["children"]) if col.get("children") else []
+        out.append(enriched)
+    return out
+
+
+def test_typed_column_datatypedisplay_case_only_is_skipped_unchanged():
+    # The direct root cause: dataTypeDisplay differs ONLY by case (OM lowercases).
+    cols = [{"name": "id", "dataType": "NUMERIC", "dataTypeDisplay": "NUMBER", "ordinalPosition": 1}]
+    desired = {"columns": cols}
+    current = {"columns": _om_readback(cols)}
+    base = {"columns": cols}
+    d = _merge(TWM, desired, current, base, owned=("columns",))
+    assert d.action == ACTION_SKIPPED_UNCHANGED
+    assert d.diverged_fields == []
+
+
+def test_deduped_suffixed_column_unchanged_is_skipped_unchanged():
+    # (a) A disambiguated ``name_2`` column (name != displayName) round-trips equal.
+    cols = [
+        {"name": "a_b", "displayName": "a.b", "dataType": "VARCHAR", "dataTypeDisplay": "VARCHAR(50)",
+         "dataLength": 50, "ordinalPosition": 1},
+        {"name": "a_b_2", "displayName": "a_b", "dataType": "VARCHAR", "dataTypeDisplay": "VARCHAR(50)",
+         "dataLength": 50, "ordinalPosition": 2},
+    ]
+    d = _merge(TWM, {"columns": cols}, {"columns": _om_readback(cols)}, {"columns": cols}, owned=("columns",))
+    assert d.action == ACTION_SKIPPED_UNCHANGED
+    assert d.diverged_fields == []
+
+
+def test_deduped_suffixed_column_changed_attr_diverges():
+    # A genuine owned change on the deduped column (dataLength) still diverges.
+    cols = [
+        {"name": "a_b", "displayName": "a.b", "dataType": "VARCHAR", "dataTypeDisplay": "VARCHAR(50)",
+         "dataLength": 50, "ordinalPosition": 1},
+        {"name": "a_b_2", "displayName": "a_b", "dataType": "VARCHAR", "dataTypeDisplay": "VARCHAR(50)",
+         "dataLength": 50, "ordinalPosition": 2},
+    ]
+    current = _om_readback(cols)
+    current[1]["dataLength"] = 200  # curator widened the deduped column
+    base = [dict(c) for c in cols]
+    d = _merge(TWM, {"columns": cols}, {"columns": current}, {"columns": base}, owned=("columns",))
+    assert d.action == ACTION_SKIPPED_DIVERGED
+    assert d.diverged_fields == ["columns"]
+
+
+def test_array_column_unchanged_is_skipped_unchanged():
+    # (b) An ARRAY column with arrayDataType round-trips equal (dataTypeDisplay case folded).
+    cols = [{"name": "tags", "dataType": "ARRAY", "arrayDataType": "STRING",
+             "dataTypeDisplay": "ARRAY", "ordinalPosition": 1}]
+    d = _merge(TWM, {"columns": cols}, {"columns": _om_readback(cols)}, {"columns": cols}, owned=("columns",))
+    assert d.action == ACTION_SKIPPED_UNCHANGED
+    assert d.diverged_fields == []
+
+
+def test_array_column_changed_arraydatatype_diverges():
+    # A genuine owned change on the ARRAY sub-type still diverges.
+    cols = [{"name": "tags", "dataType": "ARRAY", "arrayDataType": "STRING",
+             "dataTypeDisplay": "ARRAY", "ordinalPosition": 1}]
+    current = _om_readback(cols)
+    current[0]["arrayDataType"] = "BIGINT"  # curator changed the element type
+    d = _merge(TWM, {"columns": cols}, {"columns": current}, {"columns": [dict(cols[0])]}, owned=("columns",))
+    assert d.action == ACTION_SKIPPED_DIVERGED
+    assert d.diverged_fields == ["columns"]
+
+
+def test_struct_children_unchanged_is_skipped_unchanged():
+    # (c) A nested STRUCT column whose children carry owned attributes round-trips
+    # equal: the projection recurses into children, ignoring per-child enrichment
+    # and folding each child's dataTypeDisplay case.
+    cols = [
+        {
+            "name": "addr",
+            "dataType": "STRUCT",
+            "dataTypeDisplay": "STRUCT<city VARCHAR>",
+            "ordinalPosition": 1,
+            "children": [
+                {"name": "city", "dataType": "VARCHAR", "dataTypeDisplay": "VARCHAR(80)", "dataLength": 80},
+                {"name": "zip", "dataType": "VARCHAR", "dataTypeDisplay": "VARCHAR(10)", "dataLength": 10},
+            ],
+        }
+    ]
+    d = _merge(TWM, {"columns": cols}, {"columns": _om_readback(cols)}, {"columns": cols}, owned=("columns",))
+    assert d.action == ACTION_SKIPPED_UNCHANGED
+    assert d.diverged_fields == []
+
+
+def test_struct_child_changed_attr_diverges():
+    # A genuine owned change on a STRUCT child (its dataType) still diverges.
+    cols = [
+        {
+            "name": "addr",
+            "dataType": "STRUCT",
+            "dataTypeDisplay": "STRUCT<city VARCHAR>",
+            "ordinalPosition": 1,
+            "children": [
+                {"name": "city", "dataType": "VARCHAR", "dataTypeDisplay": "VARCHAR(80)", "dataLength": 80},
+            ],
+        }
+    ]
+    current = _om_readback(cols)
+    current[0]["children"][0]["dataType"] = "INT"  # curator retyped the nested child
+    base = [{**cols[0], "children": [dict(cols[0]["children"][0])]}]
+    d = _merge(TWM, {"columns": cols}, {"columns": current}, {"columns": base}, owned=("columns",))
+    assert d.action == ACTION_SKIPPED_DIVERGED
+    assert d.diverged_fields == ["columns"]
