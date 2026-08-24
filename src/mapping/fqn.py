@@ -67,6 +67,25 @@ def table_fqn(service_name: str, project: str, bucket_path: str, table_name: str
     )
 
 
+def table_fqn_from_storage_id(service_name: str, project: str, storage_id: str) -> str | None:
+    """OM Table FQN from a Keboola storage id (``stage.c-bucket.table``).
+
+    The first two dotted parts are the bucket path, the remainder the table
+    name. Returns ``None`` for an unparseable id.
+    """
+    parts = str(storage_id).split(".")
+    if len(parts) < 3:
+        return None
+    bucket_path = ".".join(parts[:2])
+    table_name = ".".join(parts[2:])
+    return table_fqn(service_name, project, bucket_path, table_name)
+
+
+def column_fqn(table_fqn_value: str, column_name: str) -> str:
+    """OM Column FQN: ``<tableFqn>.<column>`` (column segment sanitised)."""
+    return f"{table_fqn_value}.{sanitize_name(column_name)}"
+
+
 def pipeline_name(project: str, config_or_flow_id: str) -> str:
     """Entity ``name`` for a Pipeline (E13/E14).
 
