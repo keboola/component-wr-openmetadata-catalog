@@ -37,6 +37,9 @@ extend-select = [
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = [
+    "coverage_gate: E17 column-lineage coverage CI gate over tests/lineage_corpus (plan T14)",
+]
 
 [tool.ty.environment]
 extra-paths = ["src"]
