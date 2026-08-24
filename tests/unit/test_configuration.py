@@ -61,8 +61,21 @@ def test_missing_bot_token_raises_userexception():
 
 def test_all_projects_without_manage_token_raises_userexception():
     with pytest.raises(UserException) as exc:
-        Configuration(**_tier1_params(project_scope="all_projects"))
+        Configuration(**_tier1_params(project_scope="all_projects", organization_id="123"))
     assert "manage_token" in str(exc.value) or "#manage_token" in str(exc.value)
+
+
+def test_all_projects_without_organization_id_raises_userexception():
+    with pytest.raises(UserException) as exc:
+        Configuration(**_tier1_params(project_scope="all_projects", **{"#manage_token": "manage-xyz"}))
+    assert "organization_id" in str(exc.value)
+
+
+def test_all_projects_missing_both_names_both_in_message():
+    with pytest.raises(UserException) as exc:
+        Configuration(**_tier1_params(project_scope="all_projects"))
+    message = str(exc.value)
+    assert "#manage_token" in message and "organization_id" in message
 
 
 def test_bad_enum_value_rejected():

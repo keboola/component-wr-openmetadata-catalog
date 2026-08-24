@@ -109,11 +109,12 @@
     "organization_id": {
       "type": "string",
       "title": "Organization ID",
-      "description": "Organization to enumerate; auto-resolved from the token when empty",
+      "description": "Keboola organization to enumerate (required for All organization projects)",
       "options": {
         "dependencies": {
           "project_scope": "all_projects"
-        }
+        },
+        "tooltip": "Required when Project Scope is `all_projects`. Enumeration is bound to this single organization via GET /manage/organizations/{id}/projects; the component never lists all organizations."
       },
       "propertyOrder": 70
     },

@@ -239,7 +239,7 @@ def test_all_projects_without_manage_token_raises(tmp_path, monkeypatch, _env):
 
 
 def test_tier2_scope_failure_degrades(tmp_path, monkeypatch, _env):
-    params = {**BASE_PARAMS, "project_scope": "all_projects", "#manage_token": "mng"}
+    params = {**BASE_PARAMS, "project_scope": "all_projects", "#manage_token": "mng", "organization_id": "123"}
     monkeypatch.setenv("KBC_DATADIR", _make_datadir(tmp_path, params))
     monkeypatch.setattr(component_mod, "OMClient", FakeOM)
     monkeypatch.setattr(component_mod, "StorageReader", FakeStorage)
@@ -249,6 +249,7 @@ def test_tier2_scope_failure_degrades(tmp_path, monkeypatch, _env):
             pass
 
         def enumerate_and_mint(self, org):
+            assert org == "123"  # the configured org id is passed through, path-scoped
             raise ManageScopeError("insufficient scope")
 
     monkeypatch.setattr(component_mod, "ManageClient", FailingManage)

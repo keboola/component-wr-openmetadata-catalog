@@ -117,11 +117,17 @@ class Configuration(BaseModel):
     @model_validator(mode="after")
     def _check_cross_fields(self) -> Configuration:
         """Cross-field rules that map to config-error exit codes (spec 6.3)."""
-        if self.project_scope == ProjectScope.ALL_PROJECTS and not self.manage_token:
-            raise UserException(
-                "project_scope='all_projects' requires a Management API token (#manage_token). "
-                "Either provide it or switch project_scope to 'rows'."
-            )
+        if self.project_scope == ProjectScope.ALL_PROJECTS:
+            missing: list[str] = []
+            if not self.manage_token:
+                missing.append("a Management API token (#manage_token)")
+            if not self.organization_id:
+                missing.append("an organization_id")
+            if missing:
+                raise UserException(
+                    f"project_scope='all_projects' requires {' and '.join(missing)}. "
+                    "Provide the missing value(s) or switch project_scope to 'rows'."
+                )
         if self.use_ssh_tunnel and self.ssh is None:
             raise UserException("use_ssh_tunnel is enabled but the 'ssh' configuration block is missing.")
         return self

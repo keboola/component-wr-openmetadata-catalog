@@ -89,17 +89,6 @@ class ManageClient:
             return response.json() if response.content else {}
         raise ManageScopeError(f"Management API exhausted retries: {method} {path}")
 
-    def resolve_organization_id(self, organization_id: str | None) -> str:
-        if organization_id:
-            return str(organization_id)
-        orgs = self._request("GET", "/manage/organizations")
-        org_list = orgs if isinstance(orgs, list) else []
-        if len(org_list) == 1:
-            return str(org_list[0].get("id"))
-        raise ManageScopeError(
-            "organization_id not provided and could not be resolved unambiguously from the manage token."
-        )
-
     def enumerate_projects(self, organization_id: str) -> list[dict]:
         raw = self._request("GET", f"/manage/organizations/{organization_id}/projects")
         projects = raw if isinstance(raw, list) else []
@@ -129,10 +118,18 @@ class ManageClient:
         )
 
     def enumerate_and_mint(self, organization_id: str | None) -> list[MintedProject]:
-        """Resolve org, enumerate projects, mint a read-only token per project."""
-        org_id = self.resolve_organization_id(organization_id)
+        """Enumerate the ONE configured org's projects (path-scoped) and mint a
+        read-only token per project.
+
+        The org id is required (enforced by the Configuration validator); the
+        enumerate call hits the path-scoped ``GET /manage/organizations/{id}/projects``
+        directly and never the list-all ``GET /manage/organizations``, so the scope
+        is bounded to that single org.
+        """
+        if not organization_id:
+            raise ManageScopeError("organization_id is required for Tier-2 enumeration.")
         minted: list[MintedProject] = []
-        for project in self.enumerate_projects(org_id):
+        for project in self.enumerate_projects(str(organization_id)):
             pid = str(project.get("id"))
             pname = project.get("name") or pid
             minted.append(self.mint_storage_token(pid, pname))

@@ -30,6 +30,21 @@ def test_enumerate_and_mint_happy_path():
     assert [m.storage_token for m in minted] == ["minted-a", "minted-b"]
     assert minted[0].storage_url == "https://connection.keboola.com"
     assert minted[0].project_name == "Proj A"
+    # Enumeration must hit the PATH-SCOPED endpoint for the one org, never the
+    # list-all /manage/organizations (which would leak every org's projects).
+    first_url = session.request.call_args_list[0][0][1]
+    assert first_url.endswith("/manage/organizations/99/projects")
+    all_urls = [c[0][1] for c in session.request.call_args_list]
+    assert not any(u.endswith("/manage/organizations") for u in all_urls)
+
+
+def test_enumerate_and_mint_requires_organization_id():
+    session = mock.Mock()
+    client = ManageClient("https://connection.keboola.com", "manage-tok", session=session, backoff_base=0)
+    with pytest.raises(ManageScopeError):
+        client.enumerate_and_mint(organization_id=None)
+    # No HTTP call is made when the org id is absent.
+    session.request.assert_not_called()
 
 
 def test_scope_403_raises_degrade_signal():
@@ -38,21 +53,6 @@ def test_scope_403_raises_degrade_signal():
     client = ManageClient("https://connection.keboola.com", "manage-tok", session=session, backoff_base=0)
     with pytest.raises(ManageScopeError):
         client.enumerate_and_mint(organization_id="99")
-
-
-def test_resolve_org_id_from_single_org():
-    session = mock.Mock()
-    session.request.return_value = FakeResponse(200, [{"id": 42}])
-    client = ManageClient("https://connection.keboola.com", "manage-tok", session=session, backoff_base=0)
-    assert client.resolve_organization_id(None) == "42"
-
-
-def test_resolve_org_id_ambiguous_raises():
-    session = mock.Mock()
-    session.request.return_value = FakeResponse(200, [{"id": 1}, {"id": 2}])
-    client = ManageClient("https://connection.keboola.com", "manage-tok", session=session, backoff_base=0)
-    with pytest.raises(ManageScopeError):
-        client.resolve_organization_id(None)
 
 
 def test_mint_without_token_in_response_raises():
