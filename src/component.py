@@ -369,7 +369,7 @@ class Component(ComponentBase):
             merger,
         )
         for component in run.reader.list_component_configs():
-            component_id = component.get("id") or component.get("componentId")
+            component_id = str(component.get("id") or component.get("componentId") or "")
             for cfg in component.get("configurations") or []:
                 if not (run.pipelines.is_flow(component_id) or self._is_producing(cfg)):
                     continue
@@ -411,7 +411,7 @@ class Component(ComponentBase):
     def _lineage_pass(self, config: Configuration, om: OMClient, run: _ProjectRun, report: RunReport) -> None:
         edges: list[lineage_builder.LineageEdge] = []
         for component in run.reader.list_component_configs():
-            component_id = component.get("id") or component.get("componentId")
+            component_id = str(component.get("id") or component.get("componentId") or "")
             for cfg in component.get("configurations") or []:
                 storage = (cfg.get("configuration") or {}).get("storage") or {}
                 pipeline_fqn = run.pipeline_fqn_by_config.get(str(cfg.get("id")))
@@ -522,7 +522,11 @@ class Component(ComponentBase):
                 logger.warning("deleteStale failed (fail-closed): %s", exc)
             return
         try:
-            listed = [t.get("fullyQualifiedName") for t in om.list("tables", {"database": database_fqn})]
+            listed = [
+                fqn
+                for t in om.list_entities("tables", {"database": database_fqn})
+                if (fqn := t.get("fullyQualifiedName"))
+            ]
         except Exception as exc:  # noqa: BLE001 - fail closed on listing error
             logger.warning("Tombstone listing failed (fail-closed): %s", exc)
             return

@@ -164,6 +164,6 @@ def test_list_paginates_via_cursor():
         FakeResponse(200, {"data": [{"id": "2"}], "paging": {}}),
     ]
     c = _client(session)
-    ids = [e["id"] for e in c.list("tables")]
+    ids = [e["id"] for e in c.list_entities("tables")]
     assert ids == ["1", "2"]
     assert session.request.call_count == 2

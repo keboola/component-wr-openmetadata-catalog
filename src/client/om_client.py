@@ -205,7 +205,7 @@ class OMClient:
             return None
         return response.json()
 
-    def list(self, kind: str, params: dict | None = None, *, page_size: int = 200) -> Iterator[dict]:
+    def list_entities(self, kind: str, params: dict | None = None, *, page_size: int = 200) -> Iterator[dict]:
         """Cursor-paginated iteration over a collection (spec 4.4)."""
         query = dict(params or {})
         query["limit"] = page_size

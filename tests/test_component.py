@@ -58,7 +58,7 @@ class FakeOM:
     def patch_entity(self, kind, fqn, patch):
         return {"id": "x"}
 
-    def list(self, kind, params=None, page_size=200):
+    def list_entities(self, kind, params=None, page_size=200):
         return iter([])
 
     def put_lineage(self, edge):
