@@ -8,6 +8,9 @@ dependencies = [
     "keboola-http-client>=1.0.1",
     "keboola-utils>=1.1.0",
     "pydantic>=2.11.7",
+    "requests>=2.32.0",
+    "sqlglot>=27.0.0",
+    "sshtunnel>=0.4.0",
 ]
 
 [dependency-groups]
