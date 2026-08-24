@@ -42,6 +42,7 @@ def test_to_add_lineage_request_resolves_ids_and_attaches_pipeline():
         "keboola-stack.Acme_Project__99": "id-pipe",
     }
     req = to_add_lineage_request(edge, _resolver(known))
+    assert req is not None
     assert req["edge"]["fromEntity"] == {"id": "id-a", "type": "table"}
     assert req["edge"]["toEntity"] == {"id": "id-x", "type": "table"}
     assert req["edge"]["lineageDetails"]["source"] == SOURCE_PIPELINE

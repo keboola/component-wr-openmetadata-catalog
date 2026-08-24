@@ -343,6 +343,10 @@ class Component(ComponentBase):
 
     @staticmethod
     def _bucket_in_scope(config: Configuration, bucket: SourceBucket) -> bool:
+        # The component's own bookkeeping bucket (report/snapshot tables) is always
+        # excluded, so the writer never catalogs itself even under the default scope.
+        if bucket.id == report_mod.OUTPUT_BUCKET:
+            return False
         stages = {s.value for s in config.stages} or {Stage.IN.value, Stage.OUT.value}
         if bucket.stage not in stages:
             return False

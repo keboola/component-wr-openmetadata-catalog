@@ -152,20 +152,38 @@ class StorageReader:
             return response.json()
         raise UserException(f"Keboola Storage request exhausted retries: GET {path}")
 
-    def read_snapshot_rows(self, table_id: str, *, limit: int = 1000000) -> list[dict]:
+    def read_snapshot_rows(self, table_id: str, *, limit: int = 1_000_000) -> list[dict]:
         """Best-effort read of a prior snapshot table via data-preview (CSV).
 
         Returns ``[]`` if the table does not exist yet (first run) or on any
         read error — the merge base is then rebuilt on the next full refresh.
+
+        Limitation: ``data-preview`` is a *row-capped* endpoint. We request an
+        explicit high ``limit``, but for very large catalogs (5k+ tables) the
+        server may still return fewer rows than the snapshot holds. When the
+        response fills the requested ``limit`` the merge base is likely
+        truncated, so changed fields on entities beyond the cap silently stop
+        propagating (those entities fail *safe* to ``skipped_diverged`` and are
+        never clobbered). A truncated read emits a ``logger.warning``. The
+        durable fix is an async full-table export, which is out of scope here.
         """
         url = f"{self.base_url}/v2/storage/tables/{table_id}/data-preview"
         try:
             response = self.session.get(url, params={"limit": limit}, timeout=self.timeout)
             if response.status_code >= 400:
                 return []
-            return list(csv.DictReader(io.StringIO(response.text)))
+            rows = list(csv.DictReader(io.StringIO(response.text)))
         except requests.RequestException, csv.Error:
             return []
+        if len(rows) >= limit:
+            logger.warning(
+                "Snapshot merge base for '%s' hit the data-preview row cap (%d rows); the merge "
+                "base is likely truncated and updates to existing entities may be skipped for this "
+                "run. This affects large catalogs (5k+ tables).",
+                table_id,
+                limit,
+            )
+        return rows
 
     # ------------------------------------------------------------ connection
 

@@ -153,6 +153,7 @@ def test_second_run_loads_base_and_updates_changed_owned_field(tmp_path, monkeyp
             return om_store.get((kind, fqn))
 
         def put_entity(self, kind, body):
+            assert self._last is not None  # always set by a preceding get_by_fqn
             om_store[self._last] = dict(body)
             return {"id": f"id-{self._last[1]}"}
 

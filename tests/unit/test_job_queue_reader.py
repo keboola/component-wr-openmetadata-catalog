@@ -26,6 +26,7 @@ def test_summarize_run_failure_when_any_child_fails():
         {"eventType": "COMPLETE", "eventTime": "2026-08-24T10:01:00Z", "job": {"name": "flow"}},
     ]
     rec = JobQueueReader.summarize_run(events)
+    assert rec is not None
     assert rec.execution_status == "Failed"
 
 

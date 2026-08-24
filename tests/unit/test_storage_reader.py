@@ -138,3 +138,35 @@ def test_missing_token_401_raises_userexception():
     reader = StorageReader("https://connection.keboola.com", "bad", session=session)
     with pytest.raises(UserException):
         reader.verify_token()
+
+
+class CsvResponse:
+    def __init__(self, text, status_code=200):
+        self.status_code = status_code
+        self.text = text
+
+
+def _snapshot_reader(csv_text):
+    session = mock.Mock()
+    session.get.return_value = CsvResponse(csv_text)
+    return StorageReader("https://connection.keboola.com", "tok", session=session)
+
+
+def test_read_snapshot_rows_warns_when_data_preview_row_cap_hit(caplog):
+    """When the returned row count hits the requested limit the merge base is
+    likely truncated, so a clear warning is emitted (mitigation, not a fix)."""
+    csv_text = "kind,fqn\na,1\nb,2\n"  # 2 data rows; request limit=2 -> cap hit
+    reader = _snapshot_reader(csv_text)
+    with caplog.at_level("WARNING"):
+        rows = reader.read_snapshot_rows("in.c-x.snapshot", limit=2)
+    assert len(rows) == 2
+    assert any("truncated" in r.message.lower() or "row cap" in r.message.lower() for r in caplog.records)
+
+
+def test_read_snapshot_rows_no_warning_below_cap(caplog):
+    csv_text = "kind,fqn\na,1\n"  # 1 data row, well under the limit
+    reader = _snapshot_reader(csv_text)
+    with caplog.at_level("WARNING"):
+        rows = reader.read_snapshot_rows("in.c-x.snapshot", limit=1000)
+    assert len(rows) == 1
+    assert caplog.records == []
