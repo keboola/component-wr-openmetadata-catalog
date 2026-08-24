@@ -27,5 +27,5 @@ SPEC.md
 assessment.html
 reference-connector/
 lineage-spike/
-docs/superpowers/
+# Only the local lifecycle tracker is ignored; specs/plans/research under docs/superpowers/ ARE committed.
 docs/superpowers/*-lifecycle.md
