@@ -12,6 +12,8 @@ caller resolves which credential to use (row ``#storage_token`` / injected
 
 from __future__ import annotations
 
+import csv
+import io
 import logging
 import time
 from collections.abc import Iterator
@@ -149,6 +151,21 @@ class StorageReader:
                 raise UserException(f"Keboola Storage GET {path} failed: {response.status_code}")
             return response.json()
         raise UserException(f"Keboola Storage request exhausted retries: GET {path}")
+
+    def read_snapshot_rows(self, table_id: str, *, limit: int = 1000000) -> list[dict]:
+        """Best-effort read of a prior snapshot table via data-preview (CSV).
+
+        Returns ``[]`` if the table does not exist yet (first run) or on any
+        read error — the merge base is then rebuilt on the next full refresh.
+        """
+        url = f"{self.base_url}/v2/storage/tables/{table_id}/data-preview"
+        try:
+            response = self.session.get(url, params={"limit": limit}, timeout=self.timeout)
+            if response.status_code >= 400:
+                return []
+            return list(csv.DictReader(io.StringIO(response.text)))
+        except (requests.RequestException, csv.Error):
+            return []
 
     # ------------------------------------------------------------ connection
 
