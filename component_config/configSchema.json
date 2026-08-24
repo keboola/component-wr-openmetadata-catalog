@@ -1,19 +1,249 @@
 {
   "type": "object",
-  "title": "extractor configuration",
+  "title": "OpenMetadata Catalog Writer",
   "required": [
-    "print_hello"
+    "om_host",
+    "#bot_token"
   ],
   "properties": {
-    "print_hello": {
+    "test_connection": {
+      "type": "button",
+      "format": "test-connection",
+      "propertyOrder": 5
+    },
+    "om_host": {
+      "type": "string",
+      "title": "OpenMetadata Host",
+      "description": "Base URL of the OpenMetadata API",
+      "options": {
+        "inputAttributes": {
+          "placeholder": "https://openmetadata.example.com"
+        },
+        "tooltip": "The component appends `/api/v1`. Must be reachable from Keboola's static egress IPs, or via the SSH tunnel below."
+      },
+      "propertyOrder": 10
+    },
+    "#bot_token": {
+      "type": "string",
+      "title": "Bot Token",
+      "format": "password",
+      "description": "OpenMetadata JWT bot token",
+      "options": {
+        "tooltip": "In OpenMetadata: Settings → Bots → your bot → Generate new token. A dedicated bot with a long expiry is recommended over the shared ingestion-bot."
+      },
+      "propertyOrder": 20
+    },
+    "use_ssh_tunnel": {
       "type": "boolean",
-      "title": "Print Hello",
-      "propertyOrder": 1
+      "format": "checkbox",
+      "title": "Use SSH Tunnel",
+      "description": "Reach the OpenMetadata host through an SSH bastion",
+      "propertyOrder": 30
+    },
+    "ssh": {
+      "type": "object",
+      "title": "SSH Tunnel",
+      "format": "grid",
+      "options": {
+        "dependencies": {
+          "use_ssh_tunnel": true
+        }
+      },
+      "properties": {
+        "host": {
+          "type": "string",
+          "title": "Bastion Host",
+          "propertyOrder": 1
+        },
+        "user": {
+          "type": "string",
+          "title": "Bastion User",
+          "propertyOrder": 2
+        },
+        "port": {
+          "type": "integer",
+          "title": "Bastion Port",
+          "options": {
+            "tooltip": "Defaults to 22 when left empty."
+          },
+          "propertyOrder": 3
+        },
+        "#private_key": {
+          "type": "string",
+          "title": "Private Key",
+          "format": "password",
+          "propertyOrder": 4
+        }
+      },
+      "propertyOrder": 40
+    },
+    "project_scope": {
+      "type": "string",
+      "title": "Project Scope",
+      "enum": [
+        "rows",
+        "all_projects"
+      ],
+      "options": {
+        "enum_titles": [
+          "Config rows (one row per project)",
+          "All organization projects (management token)"
+        ],
+        "tooltip": "`rows` catalogs one project per config row (Tier-1). `all_projects` enumerates every organization project and mints short-lived read-only tokens with a management token (Tier-2), degrading to the host project if the token lacks scope. Defaults to config rows."
+      },
+      "propertyOrder": 50
+    },
+    "#manage_token": {
+      "type": "string",
+      "title": "Management Token",
+      "format": "password",
+      "description": "Management API token with manage:storage-tokens scope",
+      "options": {
+        "dependencies": {
+          "project_scope": "all_projects"
+        },
+        "tooltip": "Org-wide credential used only to enumerate projects and mint short-lived read-only Storage tokens. Host the config in a locked-down admin project."
+      },
+      "propertyOrder": 60
+    },
+    "organization_id": {
+      "type": "string",
+      "title": "Organization ID",
+      "description": "Organization to enumerate; auto-resolved from the token when empty",
+      "options": {
+        "dependencies": {
+          "project_scope": "all_projects"
+        }
+      },
+      "propertyOrder": 70
+    },
+    "service_name": {
+      "type": "string",
+      "title": "Service Name (Advanced)",
+      "description": "OpenMetadata DatabaseService name (FQN root)",
+      "options": {
+        "tooltip": "One service per stack is recommended. Defaults to a value derived from the stack id when left empty."
+      },
+      "propertyOrder": 100
+    },
+    "merge_mode": {
+      "type": "string",
+      "title": "Merge Mode (Advanced)",
+      "enum": [
+        "three_way_merge",
+        "keboola_always_wins"
+      ],
+      "options": {
+        "enum_titles": [
+          "Three-way merge (preserve curator edits)",
+          "Keboola always wins (overwrite)"
+        ],
+        "tooltip": "Three-way merge leaves fields a human edited in OpenMetadata and logs the divergence. Defaults to three-way merge."
+      },
+      "propertyOrder": 110
+    },
+    "failure_mode": {
+      "type": "string",
+      "title": "Failure Mode (Advanced)",
+      "enum": [
+        "collect_and_fail",
+        "fail_fast",
+        "log_only"
+      ],
+      "options": {
+        "enum_titles": [
+          "Collect and fail at end",
+          "Fail fast",
+          "Log only (never fail)"
+        ],
+        "tooltip": "Defaults to collect and fail: per-entity failures are recorded in the run report and the job fails at the end."
+      },
+      "propertyOrder": 120
+    },
+    "branch_filter": {
+      "type": "string",
+      "title": "Branch Filter (Advanced)",
+      "enum": [
+        "production_only",
+        "all_branches"
+      ],
+      "options": {
+        "enum_titles": [
+          "Production only",
+          "All branches"
+        ],
+        "tooltip": "Whether to catalog development-branch buckets. Defaults to production only."
+      },
+      "propertyOrder": 130
+    },
+    "write_lineage": {
+      "type": "boolean",
+      "format": "checkbox",
+      "title": "Write Table Lineage (Advanced)",
+      "description": "Emit declared table-level lineage",
+      "options": {
+        "tooltip": "Enabled by default."
+      },
+      "propertyOrder": 140
+    },
+    "write_column_lineage": {
+      "type": "boolean",
+      "format": "checkbox",
+      "title": "Write Column Lineage (Advanced)",
+      "description": "Emit column-level lineage from transformation SQL",
+      "options": {
+        "tooltip": "Enabled by default."
+      },
+      "propertyOrder": 150
+    },
+    "write_pipelines": {
+      "type": "boolean",
+      "format": "checkbox",
+      "title": "Write Pipelines (Advanced)",
+      "description": "Emit Pipeline entities for component configs and flows",
+      "options": {
+        "tooltip": "Enabled by default."
+      },
+      "propertyOrder": 160
+    },
+    "write_pipeline_status": {
+      "type": "boolean",
+      "format": "checkbox",
+      "title": "Write Pipeline Status (Advanced)",
+      "description": "Emit run history as pipeline status",
+      "options": {
+        "dependencies": {
+          "write_pipelines": true
+        },
+        "tooltip": "Enabled by default when pipelines are written."
+      },
+      "propertyOrder": 170
+    },
+    "full_refresh": {
+      "type": "boolean",
+      "format": "checkbox",
+      "title": "Full Refresh (Advanced)",
+      "description": "Ignore per-bucket digests and re-push everything this run",
+      "options": {
+        "tooltip": "Disabled by default; incremental digests skip unchanged buckets."
+      },
+      "propertyOrder": 180
+    },
+    "om_version_override": {
+      "type": "string",
+      "title": "OM Version Override (Advanced)",
+      "description": "Override the auto-probed OpenMetadata version",
+      "options": {
+        "tooltip": "Normally auto-probed via GET /api/v1/system/version. Leave empty."
+      },
+      "propertyOrder": 190
     },
     "debug": {
       "type": "boolean",
+      "format": "checkbox",
       "title": "Debug",
-      "propertyOrder": 2
+      "description": "Verbose logging",
+      "propertyOrder": 200
     }
   }
 }

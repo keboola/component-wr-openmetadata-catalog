@@ -1,21 +1,11 @@
 {
-  "storage": {
-    "input": {
-      "files": [],
-      "tables": [
-        {
-          "source": "in.c-example.example",
-          "destination": "example.csv"
-        }
-      ]
-    },
-    "output": {
-      "files": [],
-      "tables": []
-    }
-  },
   "parameters": {
-    "#api_token": "your-secret-token",
-    "debug": false
+    "om_host": "https://openmetadata.example.com",
+    "#bot_token": "your-om-jwt-bot-token",
+    "project_scope": "rows",
+    "write_lineage": true,
+    "write_column_lineage": true,
+    "write_pipelines": true,
+    "write_pipeline_status": true
   }
 }
