@@ -8,12 +8,15 @@ UI base + project/bucket/table ids — never a hardcoded stack URL.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from client.storage_reader import SourceBucket, SourceColumn, SourceTable
 from mapping import fqn
 from mapping.datatype import map_datatype
 from mapping.table_type import VIEW, detect_table_type
+
+logger = logging.getLogger(__name__)
 
 _SERVICE_TYPE = "CustomDatabase"
 
@@ -103,6 +106,43 @@ class EntityBuilder:
         }
         return self._drop_none(body)
 
+    @staticmethod
+    def _disambiguate_column_names(columns: list[dict], table_name: str) -> list[dict]:
+        """Ensure the emitted ``columns[]`` carry unique ``name`` values.
+
+        Two distinct source columns can sanitise to the same FQN-safe segment
+        (e.g. a dotted ``a.b`` and an underscored ``a_b`` both -> ``a_b``).
+        OpenMetadata rejects a table whose ``columns[]`` repeat a name
+        (``400 Column name <x> is repeated``), which under the default
+        ``collect_and_fail`` mode fails the whole catalog write. Rather than
+        drop a column, colliding occurrences after the first get an ordinal
+        suffix (``name``, ``name_2``, ``name_3``, ...), so both survive. Only
+        ``name`` is rewritten; ``displayName``/``dataTypeDisplay`` (the original
+        source name and rendered type) are left untouched. Deterministic:
+        stable input order -> stable suffixes. Columns without a collision are
+        not touched.
+        """
+        seen: set[str] = set()
+        for col in columns:
+            base = col["name"]
+            if base not in seen:
+                seen.add(base)
+                continue
+            ordinal = 2
+            candidate = f"{base}_{ordinal}"
+            while candidate in seen:
+                ordinal += 1
+                candidate = f"{base}_{ordinal}"
+            seen.add(candidate)
+            logger.warning(
+                "Table %r column name %r collides after sanitisation; disambiguating to %r.",
+                table_name,
+                base,
+                candidate,
+            )
+            col["name"] = candidate
+        return columns
+
     def table_body(self, bucket: SourceBucket, table: SourceTable) -> BuiltTable:
         bucket_path = bucket.path or bucket.name
         table_type = detect_table_type(
@@ -114,6 +154,7 @@ class EntityBuilder:
         )
         table_fqn = fqn.table_fqn(self.service_name, self.project, bucket_path, table.name)
         columns = [self._column_body(col, i + 1) for i, col in enumerate(table.columns)]
+        columns = self._disambiguate_column_names(columns, table.name)
 
         body: dict = {
             "name": fqn.sanitize_name(table.name),

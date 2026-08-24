@@ -1,3 +1,5 @@
+import logging
+
 from client.storage_reader import SourceBucket, SourceColumn, SourceTable
 from mapping.entity_builder import EntityBuilder
 
@@ -72,6 +74,59 @@ def test_view_table_yields_schema_definition_and_source_fqn():
     assert built.body["schemaDefinition"].startswith(
         "CREATE VIEW keboola-stack.Acme_Project.in_c-linked.customers AS SELECT * FROM "
     )
+
+
+def test_colliding_sanitized_column_names_are_disambiguated(caplog):
+    # Two distinct source columns that sanitize to the SAME FQN-safe segment:
+    # a dotted name and an underscored name both -> "properties_hs_migration_soft_delete".
+    # OM rejects a table whose columns[] repeat a name; both must survive, disambiguated.
+    bucket = SourceBucket(id="out.c-hs", name="c-hs", stage="out", path="out.c-hs")
+    table = SourceTable(
+        id="out.c-hs.contacts",
+        name="contacts",
+        columns=[
+            SourceColumn(name="properties.hs_migration_soft_delete", definition={"type": "VARCHAR", "length": "50"}),
+            SourceColumn(name="properties_hs_migration_soft_delete", definition={"type": "VARCHAR", "length": "50"}),
+        ],
+    )
+    with caplog.at_level(logging.WARNING):
+        built = _builder().table_body(bucket, table)
+
+    cols = built.body["columns"]
+    names = [c["name"] for c in cols]
+    # both source columns survive, second occurrence gets an ordinal suffix
+    assert names == [
+        "properties_hs_migration_soft_delete",
+        "properties_hs_migration_soft_delete_2",
+    ]
+    # no duplicate column name remains
+    assert len(names) == len(set(names))
+    # original source name preserved as displayName; dataTypeDisplay preserved
+    assert cols[0]["displayName"] == "properties.hs_migration_soft_delete"
+    assert cols[1]["displayName"] == "properties_hs_migration_soft_delete"
+    assert cols[0]["dataTypeDisplay"] == cols[1]["dataTypeDisplay"] == "VARCHAR(50)"
+    # a warning naming the table + the collided name is logged
+    assert any(
+        "contacts" in r.getMessage() and "properties_hs_migration_soft_delete" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_normal_table_columns_are_not_disambiguated(caplog):
+    bucket = SourceBucket(id="out.c-sales", name="c-sales", stage="out", path="out.c-sales")
+    table = SourceTable(
+        id="out.c-sales.orders",
+        name="orders",
+        columns=[
+            SourceColumn(name="id", definition={"type": "NUMBER", "length": "38,0"}),
+            SourceColumn(name="note", definition={"type": "VARCHAR"}),
+        ],
+    )
+    with caplog.at_level(logging.WARNING):
+        built = _builder().table_body(bucket, table)
+
+    assert [c["name"] for c in built.body["columns"]] == ["id", "note"]
+    assert caplog.records == []
 
 
 def test_external_table_detected():
