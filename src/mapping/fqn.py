@@ -68,8 +68,14 @@ def table_fqn(service_name: str, project: str, bucket_path: str, table_name: str
 
 
 def pipeline_name(project: str, config_or_flow_id: str) -> str:
-    """Entity ``name`` for a Pipeline (E13/E14): ``<project>.<config-or-flow-id>``."""
-    return f"{sanitize_name(project)}.{sanitize_name(str(config_or_flow_id))}"
+    """Entity ``name`` for a Pipeline (E13/E14).
+
+    OM Pipeline FQNs are two-level (``pipelineService.pipelineName``), so the
+    project and config/flow id are encoded into one dot-free segment
+    (``<project>__<config-or-flow-id>``) rather than a dotted name OM would
+    otherwise store quoted.
+    """
+    return f"{sanitize_name(project)}__{sanitize_name(str(config_or_flow_id))}"
 
 
 def pipeline_fqn(service_name: str, project: str, config_or_flow_id: str) -> str:

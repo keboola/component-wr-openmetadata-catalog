@@ -39,5 +39,5 @@ def test_table_fqn_linked_bucket_resolves_to_owning_project():
 
 
 def test_pipeline_fqn_and_name():
-    assert fqn.pipeline_name("Proj", "12345") == "Proj.12345"
-    assert fqn.pipeline_fqn("svc", "Proj", "12345") == "svc.Proj.12345"
+    assert fqn.pipeline_name("Proj", "12345") == "Proj__12345"
+    assert fqn.pipeline_fqn("svc", "Proj", "12345") == "svc.Proj__12345"
