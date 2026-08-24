@@ -82,6 +82,82 @@ def test_pipeline_merge_updates_tasks():
     assert {"op": "replace", "path": "/tasks", "value": [{"name": "a"}]} in d.patch
 
 
+def _om_enriched_columns():
+    """OM's stored ``columns`` — the desired shape plus the server-only sub-fields
+    OpenMetadata always adds (``fullyQualifiedName``, ``tags``, ``children``)."""
+    return [
+        {
+            "name": "id",
+            "dataType": "BIGINT",
+            "ordinalPosition": 1,
+            "fullyQualifiedName": "svc.p.b.t.id",
+            "tags": [],
+            "children": [],
+        }
+    ]
+
+
+def test_columns_unchanged_under_om_enrichment_is_skipped_unchanged():
+    # BUG #4 regression: OM enriches columns with fullyQualifiedName/tags/children
+    # the writer never sends. A raw == would false-diverge EVERY table; after the
+    # owned-field projection an otherwise-unchanged table compares equal.
+    desired = {"columns": [{"name": "id", "dataType": "BIGINT", "ordinalPosition": 1}]}
+    current = {"columns": _om_enriched_columns()}
+    base = {"columns": [{"name": "id", "dataType": "BIGINT", "ordinalPosition": 1}]}
+    d = _merge(TWM, desired, current, base, owned=("columns",))
+    assert d.action == ACTION_SKIPPED_UNCHANGED
+    assert d.patch == []
+    assert d.diverged_fields == []
+
+
+def test_changed_owned_column_attribute_updates_in_three_way():
+    # A genuine change to an OWNED column attribute (dataType) where OM still holds
+    # what we last wrote (base) -> update, despite OM's server enrichment.
+    desired = {"columns": [{"name": "id", "dataType": "VARCHAR", "ordinalPosition": 1}]}
+    current = {"columns": _om_enriched_columns()}  # OM has BIGINT (== base)
+    base = {"columns": [{"name": "id", "dataType": "BIGINT", "ordinalPosition": 1}]}
+    d = _merge(TWM, desired, current, base, owned=("columns",))
+    assert d.action == ACTION_UPDATED
+    assert d.patch == [{"op": "replace", "path": "/columns", "value": desired["columns"]}]
+
+
+def test_curator_edited_column_diverges_but_keboola_wins_overwrites():
+    # OM's owned column attribute was changed away from base by a curator -> diverged
+    # in three-way; overwritten under keboola_always_wins. Enrichment is ignored.
+    desired = {"columns": [{"name": "id", "dataType": "BIGINT", "ordinalPosition": 1}]}
+    curator = [
+        {
+            "name": "id",
+            "dataType": "VARCHAR",  # curator changed it away from base BIGINT
+            "ordinalPosition": 1,
+            "fullyQualifiedName": "svc.p.b.t.id",
+            "tags": [],
+            "children": [],
+        }
+    ]
+    base = {"columns": [{"name": "id", "dataType": "BIGINT", "ordinalPosition": 1}]}
+    diverged = _merge(TWM, desired, {"columns": curator}, base, owned=("columns",))
+    assert diverged.action == ACTION_SKIPPED_DIVERGED
+    assert diverged.diverged_fields == ["columns"]
+
+    won = _merge(KAW, desired, {"columns": curator}, base, owned=("columns",))
+    assert won.action == ACTION_UPDATED
+
+
+def test_table_constraints_ignore_server_enrichment():
+    # tableConstraints get the same owned-field projection (OM may add its own
+    # sub-fields); an unchanged PK constraint must not false-diverge.
+    desired = {"tableConstraints": [{"constraintType": "PRIMARY_KEY", "columns": ["id"]}]}
+    current = {
+        "tableConstraints": [
+            {"constraintType": "PRIMARY_KEY", "columns": ["id"], "referredColumns": []},
+        ]
+    }
+    base = {"tableConstraints": [{"constraintType": "PRIMARY_KEY", "columns": ["id"]}]}
+    d = _merge(TWM, desired, current, base, owned=("tableConstraints",))
+    assert d.action == ACTION_SKIPPED_UNCHANGED
+
+
 def test_manual_lineage_source_never_dropped():
     assert "Manual" not in OUR_LINEAGE_SOURCES
     assert set(OUR_LINEAGE_SOURCES) == {"PipelineLineage", "QueryLineage", "ViewLineage"}

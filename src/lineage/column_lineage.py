@@ -193,6 +193,19 @@ def extract_column_lineage(
     return result
 
 
+def _add_column_edge(result: LineageResult, from_table: str, from_col: str, to_table: str, to_col: str) -> None:
+    """Record a resolved column edge, dropping same-storage-table self-references.
+
+    A column has no lineage to itself; an SCD / self-snapshot config that reads and
+    rewrites the same storage table would otherwise yield a ``from_table ==
+    to_table`` edge that becomes an OM self-loop (rejected 400 downstream), so it is
+    never emitted (spec 4.2).
+    """
+    if from_table == to_table:
+        return
+    result.column_edges.add(ColumnEdge(from_table, from_col, to_table, to_col))
+
+
 def _classify(name: str, in_map: dict[str, str], out_map: dict[str, str]) -> tuple[str, str]:
     """Return (storage_id_or_name, kind) with kind in {input, output, intermediate}."""
     if name in in_map:
@@ -235,7 +248,7 @@ def _resolve_to_storage(
         for t_tbl, t_col in targets:
             t_id, t_kind = _classify(t_tbl, in_map, out_map)
             if s_kind == "input" and t_kind == "output":
-                result.column_edges.add(ColumnEdge(s_id, s_col, t_id, t_col))
+                _add_column_edge(result, s_id, s_col, t_id, t_col)
 
     # one-hop chaining: input.col -> intermediate.col -> output.col
     for (s_tbl, s_col), targets in col_succ.items():
@@ -248,8 +261,8 @@ def _resolve_to_storage(
                 continue
             for out_tbl, out_col in col_succ.get((mid_tbl, mid_col), set()):
                 out_id, out_kind = _classify(out_tbl, in_map, out_map)
-                if out_kind == "output":
-                    result.column_edges.add(ColumnEdge(s_id, s_col, out_id, out_col))
+                if out_kind == "output" and s_id != out_id:
+                    _add_column_edge(result, s_id, s_col, out_id, out_col)
                     result.temp_lineage_tables.add(mid_tbl)
 
 

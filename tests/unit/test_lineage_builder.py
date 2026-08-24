@@ -1,3 +1,5 @@
+import logging
+
 from lineage.column_lineage import ColumnEdge, LineageResult
 from mapping.lineage_builder import (
     SOURCE_PIPELINE,
@@ -82,3 +84,50 @@ def test_declared_edges_skip_self_reference():
         "output": {"tables": [{"destination": "out.c-res.x"}]},
     }
     assert declared_edges(storage, service_name=SVC, project=PROJ) == []
+
+
+def test_column_edges_drop_self_loop_not_emitted_and_warn(caplog):
+    # An SCD / self-snapshot config resolves the SAME storage table on both ends
+    # (in.c-scd.snapshot read AND rewritten); the same-table pair would become an
+    # OM self-loop (400). It must be dropped (not emitted) with a warning.
+    result = LineageResult(
+        column_edges={
+            ColumnEdge("in.c-scd.snapshot", "id", "in.c-scd.snapshot", "id"),
+            ColumnEdge("in.c-main.orders", "id", "out.c-res.result", "id"),  # normal edge, kept
+        },
+    )
+    with caplog.at_level(logging.WARNING):
+        edges = column_edges(result, service_name=SVC, project=PROJ)
+
+    # the self-loop pair is gone; the normal edge survives unchanged
+    assert len(edges) == 1
+    assert edges[0].from_fqn == "keboola-stack.Acme_Project.in_c-main.orders"
+    assert edges[0].to_fqn == "keboola-stack.Acme_Project.out_c-res.result"
+    assert edges[0].from_fqn != edges[0].to_fqn
+    assert any("self-loop" in rec.getMessage() for rec in caplog.records)
+
+
+def test_to_add_lineage_request_drops_self_loop_view_edge(caplog):
+    # A ViewLineage edge whose source FQN equals its target FQN (e.g. a linked
+    # bucket pointing at itself) is caught by the central pre-PUT gate.
+    edge = view_edge("keboola-stack.P.b.t", "keboola-stack.P.b.t")
+    assert edge.source == SOURCE_VIEW
+    with caplog.at_level(logging.WARNING):
+        req = to_add_lineage_request(edge, _resolver({"keboola-stack.P.b.t": "id-t"}))
+    assert req is None
+    assert any("self-loop" in rec.getMessage() for rec in caplog.records)
+
+
+def test_to_add_lineage_request_drops_id_level_self_loop(caplog):
+    # Two distinct FQNs that resolve to the SAME OM entity id are a malformed
+    # self-referential payload (entities exist -> not a 404 -> OM 400). Skipped.
+    edge = declared_edges(
+        {"input": {"tables": [{"source": "in.c-main.a"}]}, "output": {"tables": [{"destination": "out.c-res.x"}]}},
+        service_name=SVC,
+        project=PROJ,
+    )[0]
+    known = {edge.from_fqn: "same-id", edge.to_fqn: "same-id"}
+    with caplog.at_level(logging.WARNING):
+        req = to_add_lineage_request(edge, _resolver(known))
+    assert req is None
+    assert any("same OM entity" in rec.getMessage() for rec in caplog.records)

@@ -56,6 +56,29 @@ def _is_empty(value: object) -> bool:
     return value is None or value == "" or value == [] or value == {}
 
 
+def _project_owned(desired_value: object, om_value: object) -> object:
+    """Project OM's stored value onto only the shape the component authored.
+
+    OpenMetadata enriches stored entities with server-only sub-fields the writer
+    never sends — a column gains ``fullyQualifiedName``, ``tags: []`` and
+    ``children: []`` (verified via ``GET /tables``), constraints and tags can gain
+    their own server fields — so a raw ``==`` between OM's ``columns`` and the
+    desired ``columns`` never matches and *every* table false-diverges (a
+    full_refresh recorded ``skipped_diverged`` with ``detail="columns"`` for all
+    tables, silently disabling the three-way merge). Recursively keeping only the
+    keys and positions ``desired_value`` declares ignores that enrichment while
+    still surfacing a genuine change to an owned sub-value (e.g. a column's
+    ``dataType``/``description`` or ``ordinalPosition``).
+    """
+    if isinstance(desired_value, dict) and isinstance(om_value, dict):
+        return {k: _project_owned(v, om_value.get(k)) for k, v in desired_value.items()}
+    if isinstance(desired_value, list) and isinstance(om_value, list):
+        if len(desired_value) != len(om_value):
+            return om_value  # a length change is a real change; leave it unequal to desired
+        return [_project_owned(d, o) for d, o in zip(desired_value, om_value, strict=True)]
+    return om_value
+
+
 def _patch_op(current: dict, field_name: str, value: object) -> dict:
     op = "replace" if field_name in current and current.get(field_name) is not None else "add"
     return {"op": op, "path": f"/{field_name}", "value": value}
@@ -95,9 +118,11 @@ class ThreeWayMerger:
                 patch.append(_patch_op(current, name, desired_val))
                 snapshot[name] = desired_val
                 changed = True
-            elif om_val == desired_val:
+            elif _project_owned(desired_val, om_val) == desired_val:
+                # OM already holds our value (ignoring server-only enrichment) -> no-op.
                 snapshot[name] = desired_val
-            elif (base is not None and om_val == base_val) or self.keboola_always_wins:
+            elif (base is not None and _project_owned(base_val, om_val) == base_val) or self.keboola_always_wins:
+                # OM still matches what we last wrote (base) -> safe to update.
                 patch.append(_patch_op(current, name, desired_val))
                 snapshot[name] = desired_val
                 changed = True

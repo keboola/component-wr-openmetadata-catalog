@@ -7,6 +7,7 @@ resolving entity FQNs to ids just before ``PUT /lineage`` (entities exist first)
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -14,9 +15,53 @@ from dataclasses import dataclass, field
 from lineage.column_lineage import LineageResult
 from mapping import fqn
 
+logger = logging.getLogger(__name__)
+
 SOURCE_PIPELINE = "PipelineLineage"
 SOURCE_QUERY = "QueryLineage"
 SOURCE_VIEW = "ViewLineage"
+
+
+def _is_self_loop(from_fqn: str, to_fqn: str, source: str) -> bool:
+    """A lineage edge whose endpoints are the same entity — OM rejects it (400).
+
+    SCD / self-snapshot tables (a config that reads and rewrites the same storage
+    table) and some google-drive/typeform transformation tables produce these.
+    They are dropped with a warning rather than emitted, so a single self-loop can
+    never fail the whole run under ``collect_and_fail``.
+    """
+    if from_fqn == to_fqn:
+        logger.warning(
+            "Dropping self-loop lineage edge %s -> %s (source=%s); OpenMetadata rejects self-referential edges.",
+            from_fqn,
+            to_fqn,
+            source,
+        )
+        return True
+    return False
+
+
+def _lineage_request_error(request: dict) -> str | None:
+    """Return a reason string if the ``AddLineage`` payload is malformed, else ``None``.
+
+    A defensive final gate before ``PUT /lineage``: a payload missing an endpoint
+    id/source, or whose two endpoints resolve to the *same* OM entity id (an
+    id-level self-loop two distinct FQNs can collapse into), is rejected 400 by OM.
+    """
+    edge = request.get("edge") or {}
+    from_entity = edge.get("fromEntity") or {}
+    to_entity = edge.get("toEntity") or {}
+    from_id = from_entity.get("id")
+    to_id = to_entity.get("id")
+    if not from_id:
+        return "missing fromEntity id"
+    if not to_id:
+        return "missing toEntity id"
+    if from_id == to_id:
+        return "fromEntity and toEntity resolve to the same OM entity"
+    if not (edge.get("lineageDetails") or {}).get("source"):
+        return "missing lineageDetails.source"
+    return None
 
 
 @dataclass
@@ -49,7 +94,7 @@ def declared_edges(
     edges: list[LineageEdge] = []
     for source_fqn in in_fqns:
         for dest_fqn in out_fqns:
-            if source_fqn == dest_fqn:
+            if _is_self_loop(source_fqn, dest_fqn, SOURCE_PIPELINE):
                 continue
             edges.append(
                 LineageEdge(
@@ -81,6 +126,8 @@ def column_edges(
         to_tbl_fqn = fqn.table_fqn_from_storage_id(service_name, project, edge.to_table)
         if not from_tbl_fqn or not to_tbl_fqn:
             continue
+        if _is_self_loop(from_tbl_fqn, to_tbl_fqn, SOURCE_QUERY):
+            continue
         grouped[(from_tbl_fqn, to_tbl_fqn)].append(
             {
                 "fromColumns": [fqn.column_fqn(from_tbl_fqn, edge.from_column)],
@@ -110,7 +157,12 @@ def to_add_lineage_request(
 
     ``resolve_id(fqn, type)`` returns the entity id or ``None``; if either
     endpoint is missing the edge is skipped (referenced entity absent -> OM 404).
+    A self-loop (or an otherwise malformed payload) is dropped with a warning
+    rather than returned, so it never reaches ``PUT /lineage`` (OM 400).
     """
+    if _is_self_loop(edge.from_fqn, edge.to_fqn, edge.source):
+        return None
+
     from_id = resolve_id(edge.from_fqn, edge.from_type)
     to_id = resolve_id(edge.to_fqn, edge.to_type)
     if not from_id or not to_id:
@@ -128,10 +180,21 @@ def to_add_lineage_request(
         if pipeline_id:
             details["pipeline"] = {"id": pipeline_id, "type": "pipeline"}
 
-    return {
+    request = {
         "edge": {
             "fromEntity": {"id": from_id, "type": edge.from_type},
             "toEntity": {"id": to_id, "type": edge.to_type},
             "lineageDetails": details,
         }
     }
+    reason = _lineage_request_error(request)
+    if reason:
+        logger.warning(
+            "Skipping malformed lineage edge %s -> %s (source=%s): %s",
+            edge.from_fqn,
+            edge.to_fqn,
+            edge.source,
+            reason,
+        )
+        return None
+    return request

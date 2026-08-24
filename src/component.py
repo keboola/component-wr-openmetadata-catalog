@@ -106,6 +106,10 @@ class _ProjectRun:
     entities: EntityBuilder
     pipelines: PipelineBuilder
     seen_table_fqns: set[str] = field(default_factory=set)
+    # DatabaseSchema FQNs this run actually enumerated (in-scope buckets only) —
+    # the tombstone pass reconciles *only* within these, so allowlist/denylist
+    # excluded buckets are never a deletion scope (spec risk #4).
+    seen_schema_fqns: set[str] = field(default_factory=set)
     pipeline_fqn_by_config: dict[str, str] = field(default_factory=dict)
     id_cache: dict[str, str | None] = field(default_factory=dict)
     failures: int = 0
@@ -279,7 +283,7 @@ class Component(ComponentBase):
             self._pipeline_pass(config, om, run, snapshot, report, merger, env)
         if config.write_lineage or config.write_column_lineage:
             self._lineage_pass(config, om, run, report)
-        self._tombstone_pass(config, om, run, report)
+        self._tombstone_pass(om, run, report)
 
     def _catalog_pass(
         self,
@@ -321,6 +325,9 @@ class Component(ComponentBase):
         for bucket in run.reader.list_buckets():
             if not self._bucket_in_scope(config, bucket):
                 continue
+            # This bucket is in scope this run: its schema is a valid tombstone scope.
+            schema_fqn = fqn_mod.schema_fqn(run.entities.service_name, run.entities.project, bucket.path or bucket.name)
+            run.seen_schema_fqns.add(schema_fqn)
             tables = list(run.reader.iter_tables(bucket.id))
             digest = bucket_digest(vars(bucket), [vars(t) for t in tables])
             if not should_process_bucket(
@@ -350,7 +357,7 @@ class Component(ComponentBase):
                 run,
                 "databaseSchemas",
                 "Schema",
-                fqn_mod.schema_fqn(run.entities.service_name, run.entities.project, bucket.path or bucket.name),
+                schema_fqn,
                 run.entities.schema_body(bucket),
                 ("displayName", "description", "sourceUrl"),
                 snapshot,
@@ -547,30 +554,49 @@ class Component(ComponentBase):
             run.id_cache[cache_key] = entity.get("id") if entity else None
         return run.id_cache[cache_key]
 
-    def _tombstone_pass(self, config: Configuration, om: OMClient, run: _ProjectRun, report: RunReport) -> None:
-        database_fqn = fqn_mod.database_fqn(run.entities.service_name, run.entities.project)
-        seen = sorted(run.seen_table_fqns)
-        if not seen:
-            return
+    def _tombstone_pass(self, om: OMClient, run: _ProjectRun, report: RunReport) -> None:
+        """Reconcile stale OM tables — scoped to the buckets this run enumerated.
+
+        Scope-safety (spec risk #4 / §6.2 step 8): reconciliation happens *per
+        DatabaseSchema* the run actually enumerated, never over the whole Database.
+        Buckets excluded by the stage / allowlist / denylist filters — or not
+        enumerated at all this run — are never a deletion scope, so a scoped run
+        (e.g. a ``bucket_allowlist`` subset) can never tombstone entities that
+        belong to the rest of the catalog. The delete path stays fail-closed within
+        each schema (skip on a listing error or an implausibly short scope).
+        """
+        for schema_fqn in sorted(run.seen_schema_fqns):
+            seen_in_schema = sorted(f for f in run.seen_table_fqns if f.startswith(f"{schema_fqn}."))
+            self._tombstone_schema(om, run, report, schema_fqn, seen_in_schema)
+
+    def _tombstone_schema(
+        self,
+        om: OMClient,
+        run: _ProjectRun,
+        report: RunReport,
+        schema_fqn: str,
+        seen_in_schema: list[str],
+    ) -> None:
         if om.is_2_0_or_newer:
-            body = TombstonePlanner.deletestale_body(database_fqn, "database", seen, dry_run=False)
+            # 2.0+ deleteStale, scoped to this DatabaseSchema (not the whole Database).
+            body = TombstonePlanner.deletestale_body(schema_fqn, "databaseSchema", seen_in_schema, dry_run=False)
             try:
                 om.delete_stale(body)
             except Exception as exc:  # noqa: BLE001 - tombstoning never fails the run
-                logger.warning("deleteStale failed (fail-closed): %s", exc)
+                logger.warning("deleteStale failed for %s (fail-closed): %s", schema_fqn, exc)
             return
         try:
             listed = [
                 fqn
-                for t in om.list_entities("tables", {"database": database_fqn})
+                for t in om.list_entities("tables", {"databaseSchema": schema_fqn})
                 if (fqn := t.get("fullyQualifiedName"))
             ]
         except Exception as exc:  # noqa: BLE001 - fail closed on listing error
-            logger.warning("Tombstone listing failed (fail-closed): %s", exc)
+            logger.warning("Tombstone listing failed for %s (fail-closed): %s", schema_fqn, exc)
             return
-        plan = TombstonePlanner.self_diff(listed, seen)
+        plan = TombstonePlanner.self_diff(listed, seen_in_schema)
         if plan.blocked:
-            logger.warning("Tombstoning skipped (fail-closed): %s", plan.fail_closed_reason)
+            logger.warning("Tombstoning skipped for %s (fail-closed): %s", schema_fqn, plan.fail_closed_reason)
             return
         for stale_fqn in plan.to_delete:
             entity = om.get_by_fqn("tables", stale_fqn)
