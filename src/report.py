@@ -32,6 +32,14 @@ REPORT_PRIMARY_KEY = ("run_id", "entity_fqn", "entity_type")
 SNAPSHOT_COLUMNS = ("entity_fqn", "entity_type", "written_fields_json", "content_hash", "updated_at")
 SNAPSHOT_PRIMARY_KEY = ("entity_fqn",)
 
+# Explicit, in-repo output destinations (spec 2.3 / 6.4). Set on the manifests so
+# the component does NOT depend on the portal defaultBucket, and so the snapshot
+# table id is deterministic: it is recorded into state after each write and read
+# back on the next run as the three-way-merge base.
+OUTPUT_BUCKET = "in.c-wr-openmetadata-catalog"
+REPORT_DESTINATION = f"{OUTPUT_BUCKET}.{REPORT_TABLE}"
+SNAPSHOT_DESTINATION = f"{OUTPUT_BUCKET}.{SNAPSHOT_TABLE}"
+
 # Action enum (spec 6.4).
 ACTION_CREATED = "created"
 ACTION_UPDATED = "updated"

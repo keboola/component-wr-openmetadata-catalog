@@ -114,10 +114,6 @@ class Configuration(BaseModel):
             messages = [f"{'.'.join(str(p) for p in err['loc'])}: {err['msg']}" for err in e.errors()]
             raise UserException(f"Configuration validation error: {'; '.join(messages)}") from e
 
-        if self.debug:
-            logger.setLevel(logging.DEBUG)
-            logger.debug("Component will run in DEBUG mode")
-
     @model_validator(mode="after")
     def _check_cross_fields(self) -> Configuration:
         """Cross-field rules that map to config-error exit codes (spec 6.3)."""

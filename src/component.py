@@ -120,6 +120,10 @@ class Component(ComponentBase):
                 proxy.close()
 
         self._write_snapshot(snapshot)
+        # Record the (stable, explicit) snapshot destination so the next run reads
+        # it back as the three-way-merge base (spec 2.3). write_always on the
+        # snapshot manifest means the table is uploaded even when the run fails.
+        state.snapshot_table = report_mod.SNAPSHOT_DESTINATION
         self._write_report(report)
         self.write_state_file(state.to_dict())
         self._finalize(config, report)
@@ -127,9 +131,9 @@ class Component(ComponentBase):
     # -------------------------------------------------------- configuration
 
     def _load_configuration(self) -> Configuration:
+        # The platform sets the root log level to DEBUG from the job `debug` param;
+        # no manual setLevel is needed here.
         self._config = Configuration(**self.configuration.parameters)
-        if self._config.debug:
-            logging.getLogger().setLevel(logging.DEBUG)
         return self._config
 
     @staticmethod
@@ -615,6 +619,7 @@ class Component(ComponentBase):
         }
         table = self.create_out_table_definition(
             f"{report_mod.REPORT_TABLE}.csv",
+            destination=report_mod.REPORT_DESTINATION,
             schema=schema,
             primary_key=list(report_mod.REPORT_PRIMARY_KEY),
             incremental=True,
@@ -628,9 +633,11 @@ class Component(ComponentBase):
         rows = report_mod.snapshot_rows(snapshot.entries())
         table = self.create_out_table_definition(
             f"{report_mod.SNAPSHOT_TABLE}.csv",
+            destination=report_mod.SNAPSHOT_DESTINATION,
             schema=list(report_mod.SNAPSHOT_COLUMNS),
             primary_key=list(report_mod.SNAPSHOT_PRIMARY_KEY),
             incremental=True,
+            write_always=True,
             has_header=True,
         )
         self._write_rows(table.full_path, report_mod.SNAPSHOT_COLUMNS, rows)
@@ -684,8 +691,7 @@ if __name__ == "__main__":
     try:
         Component().execute_action()
     except UserException as exc:
-        logger.exception("Component failed with a user error")
-        print(exc, file=sys.stderr)
+        logger.error(str(exc))
         sys.exit(1)
     except Exception:
         logger.exception("Component failed with an unexpected error")

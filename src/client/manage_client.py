@@ -18,7 +18,6 @@ import time
 from dataclasses import dataclass
 
 import requests
-from keboola.component.exceptions import UserException
 
 logger = logging.getLogger(__name__)
 
@@ -140,8 +139,3 @@ class ManageClient:
         if not minted:
             raise ManageScopeError("No projects enumerated for the organization.")
         return minted
-
-
-def missing_manage_token_error() -> UserException:
-    """Config error (exit 1) for ``all_projects`` with no ``#manage_token``."""
-    return UserException("project_scope='all_projects' requires #manage_token; none was provided.")

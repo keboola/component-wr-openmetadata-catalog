@@ -3,6 +3,8 @@
 Runs Component against a temporary KBC_DATADIR with the network clients faked.
 """
 
+import csv
+import io
 import json
 
 import pytest
@@ -123,6 +125,104 @@ def test_run_catalog_happy_path(tmp_path, monkeypatch, _env):
     state = json.loads((tmp_path / "data" / "out" / "state.json").read_text())
     assert state["run_count"] == 1
     assert "out.c-sales" in state["projects"]["777"]["bucket_digests"]
+
+
+def test_second_run_loads_base_and_updates_changed_owned_field(tmp_path, monkeypatch, _env):
+    """BLOCKING #1 regression: the three-way-merge base must be populated on the
+    second run from the prior run's snapshot, round-tripped through
+    ``state.snapshot_table``. A Keboola-side change to an owned field then merges
+    (``updated``) instead of being classified ``skipped_diverged``.
+
+    Under the original defect ``state.snapshot_table`` was never written, so the
+    base was always empty and this test would report ``skipped_diverged``.
+    """
+    om_store: dict = {}  # (kind, fqn) -> body, shared across both runs (like OM server)
+    snapshot_holder: dict = {"rows": []}  # rows the prior run wrote to Storage
+    desc_holder: dict = {"description": "v1"}  # the desired table description per run
+
+    class StatefulOM:
+        def __init__(self, *a, **k):
+            self.is_2_0_or_newer = False
+            self._last: tuple[str, str] | None = None
+
+        def probe_version(self):
+            return {"version": "1.13.4", "revision": "r", "timestamp": 1}
+
+        def get_by_fqn(self, kind, fqn, fields=None):
+            self._last = (kind, fqn)
+            return om_store.get((kind, fqn))
+
+        def put_entity(self, kind, body):
+            om_store[self._last] = dict(body)
+            return {"id": f"id-{self._last[1]}"}
+
+        def patch_entity(self, kind, fqn, patch):
+            entity = dict(om_store.get((kind, fqn)) or {})
+            for op in patch:
+                entity[op["path"].lstrip("/")] = op["value"]
+            om_store[(kind, fqn)] = entity
+            return {"id": "x"}
+
+        def list_entities(self, kind, params=None, page_size=200):
+            return iter([])
+
+        def delete_lineage_by_source(self, *a):
+            return None
+
+        def soft_delete(self, *a, **k):
+            return None
+
+        def put_lineage(self, *a):
+            return {}
+
+        def put_pipeline_status(self, *a):
+            return {}
+
+    class RecordingStorage(FakeStorage):
+        def iter_tables(self, bucket_id):
+            return iter(
+                [
+                    SourceTable(
+                        id="out.c-sales.orders",
+                        name="orders",
+                        description=desc_holder["description"],
+                        columns=[SourceColumn(name="id")],
+                    )
+                ]
+            )
+
+        def read_snapshot_rows(self, table_id, limit=1000000):
+            return list(snapshot_holder["rows"])
+
+    monkeypatch.setattr(component_mod, "OMClient", StatefulOM)
+    monkeypatch.setattr(component_mod, "StorageReader", RecordingStorage)
+
+    # --- Run 1: first sight of the table, created at description "v1". ---
+    monkeypatch.setenv("KBC_DATADIR", _make_datadir(tmp_path / "r1", BASE_PARAMS))
+    component_mod.Component().run()
+
+    state_after_1 = json.loads((tmp_path / "r1" / "data" / "out" / "state.json").read_text())
+    assert state_after_1["snapshot_table"] == "in.c-wr-openmetadata-catalog.last_written_snapshot"
+
+    # The platform would load this CSV into Storage; feed it to run 2 as the base.
+    snap_csv = (tmp_path / "r1" / "data" / "out" / "tables" / "last_written_snapshot.csv").read_text()
+    snapshot_holder["rows"] = list(csv.DictReader(io.StringIO(snap_csv)))
+    assert snapshot_holder["rows"], "run 1 must produce a non-empty snapshot base"
+
+    # --- Run 2: same table, owned field changed to "v2" (state carried over). ---
+    desc_holder["description"] = "v2"
+    monkeypatch.setenv("KBC_DATADIR", _make_datadir(tmp_path / "r2", BASE_PARAMS, state=state_after_1))
+    component_mod.Component().run()
+
+    report_rows = list(
+        csv.DictReader(
+            io.StringIO((tmp_path / "r2" / "data" / "out" / "tables" / "catalog_run_report.csv").read_text())
+        )
+    )
+    table_rows = [r for r in report_rows if r["entity_type"] == "Table"]
+    assert table_rows, "the table must appear in run 2's report"
+    assert all(r["action"] != "skipped_diverged" for r in table_rows)
+    assert any(r["action"] == "updated" for r in table_rows)
 
 
 def test_all_projects_without_manage_token_raises(tmp_path, monkeypatch, _env):
