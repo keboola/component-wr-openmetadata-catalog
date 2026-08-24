@@ -1,0 +1,31 @@
+__pycache__/
+.DS_Store
+.idea
+.ruff_cache
+.venv
+.vscode
+*.py[cod]
+*.egg-info
+venv
+.claude
+.DS_Store
+
+# kbc datafolder
+/data
+
+# vcr datadirtesting
+secrets.json
+tests/functional/*/source/data/out/
+tests/functional/*/source/data/in/
+
+# env
+.env
+
+# Component Factory build inputs — LOCAL only, never committed
+# (reference materials may contain customer identifiers; not part of the shipped component)
+SPEC.md
+assessment.html
+reference-connector/
+lineage-spike/
+docs/superpowers/
+docs/superpowers/*-lifecycle.md
