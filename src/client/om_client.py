@@ -39,6 +39,15 @@ class OMAuthError(UserException):
     """OM auth failure (401/403) — user-fixable, exit 1."""
 
 
+class OMConnectionError(UserException):
+    """OM host unreachable / network failure after retries (spec 6.3).
+
+    User-fixable (wrong ``om_host``, network/proxy, or a broken SSH tunnel), so it
+    is a ``UserException`` -> exit 1, distinct from ``OMClientError`` (an
+    unexpected/internal error -> exit 2).
+    """
+
+
 class OMNotFound(OMClientError):
     """Requested entity does not exist (404)."""
 
@@ -118,7 +127,10 @@ class OMClient:
                 if attempt < self.max_retries:
                     self._sleep(attempt)
                     continue
-                raise OMClientError(f"OM request failed after retries: {method} {url}: {exc}") from exc
+                raise OMConnectionError(
+                    f"Could not reach OpenMetadata ({method} {path}) after {self.max_retries + 1} attempts: {exc}. "
+                    "Check om_host, network/proxy reachability, and the SSH tunnel if enabled."
+                ) from exc
 
             if response.status_code in (401, 403):
                 raise OMAuthError(
@@ -137,7 +149,7 @@ class OMClient:
                 raise OMClientError(f"OM {method} {path} failed: {response.status_code} {response.text[:500]}")
             return response
 
-        raise OMClientError(f"OM request exhausted retries: {method} {url}: {last_exc}")
+        raise OMConnectionError(f"Could not reach OpenMetadata ({method} {path}) — retries exhausted: {last_exc}")
 
     def _sleep(self, attempt: int) -> None:
         time.sleep(self.backoff_base * (2**attempt))

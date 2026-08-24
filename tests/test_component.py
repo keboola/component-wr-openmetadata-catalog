@@ -12,7 +12,7 @@ from keboola.component.exceptions import UserException
 
 import component as component_mod
 from client.manage_client import ManageScopeError
-from client.om_client import OMAuthError
+from client.om_client import OMAuthError, OMConnectionError
 from client.storage_reader import SourceBucket, SourceColumn, SourceTable
 
 BASE_PARAMS = {
@@ -301,6 +301,21 @@ def test_test_connection_bad_bot_token(tmp_path, monkeypatch, _env):
     monkeypatch.setattr(component_mod, "OMClient", BadOM)
     monkeypatch.setattr(component_mod, "StorageReader", FakeStorage)
     # the sync-action wrapper converts a UserException into exit(1)
+    with pytest.raises(SystemExit) as exc:
+        component_mod.Component().test_connection()
+    assert exc.value.code == 1
+
+
+def test_test_connection_unreachable_host(tmp_path, monkeypatch, _env):
+    # An unreachable OM host is user-fixable -> UserException -> exit 1 (spec 6.3),
+    # not an exit-2 internal error.
+    class UnreachableOM(FakeOM):
+        def probe_version(self):
+            raise OMConnectionError("Could not reach OpenMetadata (GET /system/version) after 5 attempts.")
+
+    monkeypatch.setenv("KBC_DATADIR", _make_datadir(tmp_path, BASE_PARAMS, action="testConnection"))
+    monkeypatch.setattr(component_mod, "OMClient", UnreachableOM)
+    monkeypatch.setattr(component_mod, "StorageReader", FakeStorage)
     with pytest.raises(SystemExit) as exc:
         component_mod.Component().test_connection()
     assert exc.value.code == 1

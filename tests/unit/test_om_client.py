@@ -8,6 +8,7 @@ from client.om_client import (
     OMAuthError,
     OMClient,
     OMClientError,
+    OMConnectionError,
     OMPreconditionFailed,
 )
 
@@ -70,12 +71,19 @@ def test_backoff_retries_on_500_then_succeeds():
     assert session.request.call_count == 2
 
 
-def test_connection_error_retried_then_raises():
+def test_connection_error_retried_then_raises_user_exception():
+    # A reachability failure is user-fixable (host/network/proxy/SSH), so it maps
+    # to OMConnectionError (a UserException -> exit 1), NOT the internal-error
+    # OMClientError (-> exit 2). Spec 6.3.
     session = mock.Mock()
     session.request.side_effect = requests.ConnectionError("boom")
     c = OMClient("https://om.example.com", "tok", session=session, backoff_base=0, max_retries=2)
-    with pytest.raises(OMClientError):
+    from keboola.component.exceptions import UserException
+
+    with pytest.raises(OMConnectionError) as exc:
         c.put_entity("tables", {"name": "t"})
+    assert isinstance(exc.value, UserException)
+    assert not isinstance(exc.value, OMClientError)
     assert session.request.call_count == 3  # initial + 2 retries
 
 

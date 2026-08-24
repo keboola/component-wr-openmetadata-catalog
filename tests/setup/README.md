@@ -65,7 +65,7 @@ Most success cases record straight from the sandbox + scratch project with the
 | `17`/`18` config-validation failures | No HTTP — empty cassette, `expected_status.json` exit 1. Record straight through. `#manage_token` must stay absent from `secrets.json` for `18`. |
 | `19_run_tier2_all_projects` | Needs a real `manage:storage-tokens` **manage token** + `organization_id`; add `#manage_token` to `--secrets` for this pass only. If unavailable, record later / against a mock — do not block the phase. |
 | `20_run_tier2_degrade` | Needs a **scope-limited** manage token (or a mocked 401/403) + a real `KBC_TOKEN` for the host-project fallback. Conditional, like `19`. |
-| `21_testConnection_unreachable_host` | Records a real connection error (unreachable `om_host`); the retry/backoff makes this the slowest recording (~15 s). Currently exits 2 (reachability → OMClientError), not the exit 1 spec §6.3 describes — a separate minor gap, not fixed here. |
+| `21_testConnection_unreachable_host` | Records a real connection error (unreachable `om_host`); the retry/backoff makes this the slowest recording (~15 s). Maps to `OMConnectionError` → `UserException` → **exit 1** (spec §6.3). |
 
 ## Sanitizers (secrets scrubbed from cassettes)
 
