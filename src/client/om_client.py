@@ -163,6 +163,18 @@ class OMClient:
             return False
         return _version_tuple(self.server_version) >= (2, 0)
 
+    def verify_auth(self) -> dict:
+        """Authenticated ping: GET /users/loggedInUser -> the bot's own user.
+
+        ``GET /system/version`` is in OM's ``JwtFilter.EXCLUDED_ENDPOINTS`` (spec
+        3.5), so it proves reachability but NOT that the bot token is valid — a
+        bad/expired ``#bot_token`` still gets a 200 there. This endpoint is behind
+        the JWT filter, so an invalid token surfaces as ``OMAuthError`` (401/403),
+        which ``testConnection`` turns into a clear ``UserException``.
+        """
+        response = self._request("GET", "/users/loggedInUser")
+        return response.json()
+
     # --------------------------------------------------------------- writes
 
     def put_entity(self, kind: str, body: dict) -> dict:

@@ -87,6 +87,27 @@ def test_401_raises_userexception():
         c.probe_version()
 
 
+def test_verify_auth_hits_authenticated_endpoint():
+    session = mock.Mock()
+    session.request.return_value = FakeResponse(200, {"name": "ingestion-bot", "id": "u1"})
+    c = _client(session)
+    data = c.verify_auth()
+    assert data["name"] == "ingestion-bot"
+    method, url = session.request.call_args[0]
+    assert method == "GET"
+    assert url == "https://om.example.com/api/v1/users/loggedInUser"
+
+
+def test_verify_auth_raises_on_bad_token():
+    # A bad/expired bot token 401s on the authenticated endpoint (unlike the
+    # unauthenticated /system/version probe), so testConnection can surface it.
+    session = mock.Mock()
+    session.request.return_value = FakeResponse(401, {"error": "unauthorized"})
+    c = _client(session)
+    with pytest.raises(OMAuthError):
+        c.verify_auth()
+
+
 def test_412_raises_precondition():
     session = mock.Mock()
     session.request.return_value = FakeResponse(412, {})

@@ -702,13 +702,19 @@ class Component(ComponentBase):
         om = OMClient(config.om_host, config.bot_token)
         try:
             version = om.probe_version().get("version")
+            # /system/version is unauthenticated (OM JwtFilter.EXCLUDED_ENDPOINTS),
+            # so it only checks reachability. Follow with an authenticated call so an
+            # invalid/expired #bot_token is surfaced here instead of only at run time.
+            om.verify_auth()
         except OMAuthError as exc:
             raise UserException(str(exc)) from exc
         token, url = resolve_storage_credentials(
             row_token=config.storage_token, injected_token=env["token"], injected_url=env["url"]
         )
         StorageReader(url, token).verify_token()
-        return ValidationResult(f"Connected to OpenMetadata {version}; Storage token valid.", MessageType.SUCCESS)
+        return ValidationResult(
+            f"Connected to OpenMetadata {version} (bot token valid); Storage token valid.", MessageType.SUCCESS
+        )
 
     @sync_action("listBuckets")
     def list_buckets(self) -> list[SelectElement]:

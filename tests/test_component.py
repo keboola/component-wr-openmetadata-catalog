@@ -48,6 +48,9 @@ class FakeOM:
         self.server_version = "1.13.4"
         return {"version": "1.13.4", "revision": "r", "timestamp": 1}
 
+    def verify_auth(self):
+        return {"name": "ingestion-bot"}
+
     def get_by_fqn(self, kind, fqn, fields=None):
         return None
 
@@ -287,9 +290,12 @@ def test_test_connection_ok(tmp_path, monkeypatch, _env):
 
 
 def test_test_connection_bad_bot_token(tmp_path, monkeypatch, _env):
+    # /system/version is unauthenticated, so the version probe succeeds even with
+    # a bad token; the bad #bot_token must be caught by the authenticated
+    # verify_auth() call (GET /users/loggedInUser -> 401).
     class BadOM(FakeOM):
-        def probe_version(self):
-            raise OMAuthError("401 unauthorized")
+        def verify_auth(self):
+            raise OMAuthError("OpenMetadata rejected the bot token (401) on GET /users/loggedInUser.")
 
     monkeypatch.setenv("KBC_DATADIR", _make_datadir(tmp_path, BASE_PARAMS, action="testConnection"))
     monkeypatch.setattr(component_mod, "OMClient", BadOM)

@@ -56,6 +56,7 @@ Most success cases record straight from the sandbox + scratch project with the
 
 | Case | Special record-time handling |
 |------|------------------------------|
+| `02_testConnection_bad_bot_token` | Record in a pass whose `--secrets` file **omits `#bot_token`**, so the intentionally-bad token reaches the authenticated OM call (`GET /users/loggedInUser`) and 401s (the global merge would otherwise restore the real token). The version probe is unauthenticated, so the auth call is what fails. |
 | `04_listBuckets_bad_storage_token` | Record in a pass whose `--secrets` file **omits `#storage_token`**, so the intentionally-bad token reaches Storage and 401s (the global merge would otherwise restore the real token). |
 | `06_run_catalog_incremental_second_run` | Record **after** `05` with `--chain-state` so `05`'s `out/state.json` seeds `06`'s `in/state.json` → unchanged buckets `skipped_unchanged`. |
 | `11`/`12` merge (`skipped_diverged` / overwrite) | Pre-seed OM: create an entity, then diverge one curated field, and provide a chained snapshot base so the merge sees `base == last-written`. |
@@ -64,6 +65,7 @@ Most success cases record straight from the sandbox + scratch project with the
 | `17`/`18` config-validation failures | No HTTP — empty cassette, `expected_status.json` exit 1. Record straight through. `#manage_token` must stay absent from `secrets.json` for `18`. |
 | `19_run_tier2_all_projects` | Needs a real `manage:storage-tokens` **manage token** + `organization_id`; add `#manage_token` to `--secrets` for this pass only. If unavailable, record later / against a mock — do not block the phase. |
 | `20_run_tier2_degrade` | Needs a **scope-limited** manage token (or a mocked 401/403) + a real `KBC_TOKEN` for the host-project fallback. Conditional, like `19`. |
+| `21_testConnection_unreachable_host` | Records a real connection error (unreachable `om_host`); the retry/backoff makes this the slowest recording (~15 s). Currently exits 2 (reachability → OMClientError), not the exit 1 spec §6.3 describes — a separate minor gap, not fixed here. |
 
 ## Sanitizers (secrets scrubbed from cassettes)
 

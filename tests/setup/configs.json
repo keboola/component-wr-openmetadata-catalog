@@ -12,13 +12,13 @@
     }
   },
   {
-    "name": "02_testConnection_bad_host",
-    "description": "FAIL sync-action: OM host unreachable -> connection error surfaced, non-zero exit. NOTE: OM /system/version is unauthenticated (spec 3.5), so a bad #bot_token is NOT surfaced by testConnection; a bad host is the recordable OM-side failure. See handoff FLAG on the testConnection bot-token gap. om_host is a non-secret lever, so the secrets merge does not defeat this case.",
+    "name": "02_testConnection_bad_bot_token",
+    "description": "FAIL sync-action: an invalid/expired OM bot token -> exit 1. The version probe (GET /system/version) is unauthenticated and still returns 2xx, so testConnection follows it with an authenticated GET /users/loggedInUser which 401s -> OMAuthError -> UserException -> exit 1. RECORD NOTE: record in a pass whose --secrets file OMITS #bot_token (otherwise the global secrets merge restores the real token and the call succeeds). See tests/setup/README.md.",
     "config": {
       "action": "testConnection",
       "parameters": {
-        "om_host": "https://openmetadata.invalid.keboola.test",
-        "#bot_token": "DUMMY_BOT_TOKEN",
+        "om_host": "https://sandbox.open-metadata.org",
+        "#bot_token": "INVALID-BOT-TOKEN",
         "#storage_token": "DUMMY_STORAGE_TOKEN"
       }
     }
@@ -287,6 +287,18 @@
         "write_pipeline_status": false,
         "write_lineage": false,
         "write_column_lineage": false
+      }
+    }
+  },
+  {
+    "name": "21_testConnection_unreachable_host",
+    "description": "FAIL sync-action (reachability path, distinct from 02's auth path): OM host unreachable -> the version probe raises a connection error after retries. om_host is a non-secret lever, so the secrets merge does not defeat it. NOTE: currently surfaces as OMClientError -> exit 2 (not the exit 1 spec 6.3 describes for 'OM host unreachable'); a separate, minor spec-vs-impl gap flagged to the lead, not fixed here. Covers writer risk #1 (OM reachability). The recorder captures whatever exit code actually occurs.",
+    "config": {
+      "action": "testConnection",
+      "parameters": {
+        "om_host": "https://openmetadata.invalid.keboola.test",
+        "#bot_token": "DUMMY_BOT_TOKEN",
+        "#storage_token": "DUMMY_STORAGE_TOKEN"
       }
     }
   }
