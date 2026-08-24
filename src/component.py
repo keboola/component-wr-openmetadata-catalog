@@ -231,8 +231,12 @@ class Component(ComponentBase):
         run = _ProjectRun(
             ctx=ctx,
             reader=reader,
-            entities=EntityBuilder(config.resolve_service_name(env["stack_id"]), ctx.project_name, ctx.project_id, ui_base),
-            pipelines=PipelineBuilder(config.resolve_service_name(env["stack_id"]), ctx.project_name, ctx.project_id, ui_base),
+            entities=EntityBuilder(
+                config.resolve_service_name(env["stack_id"]), ctx.project_name, ctx.project_id, ui_base
+            ),
+            pipelines=PipelineBuilder(
+                config.resolve_service_name(env["stack_id"]), ctx.project_name, ctx.project_id, ui_base
+            ),
         )
         merger = ThreeWayMerger(config.merge_mode)
 
@@ -254,8 +258,30 @@ class Component(ComponentBase):
         merger: ThreeWayMerger,
         version_changed: bool,
     ) -> None:
-        self._upsert(om, run, "databaseServices", "DatabaseService", run.entities.database_service_body()["name"], run.entities.database_service_body(), (), snapshot, report, merger)
-        self._upsert(om, run, "databases", "Database", fqn_mod.database_fqn(run.entities.service_name, run.entities.project), run.entities.database_body(), ("displayName", "sourceUrl"), snapshot, report, merger)
+        self._upsert(
+            om,
+            run,
+            "databaseServices",
+            "DatabaseService",
+            run.entities.database_service_body()["name"],
+            run.entities.database_service_body(),
+            (),
+            snapshot,
+            report,
+            merger,
+        )
+        self._upsert(
+            om,
+            run,
+            "databases",
+            "Database",
+            fqn_mod.database_fqn(run.entities.service_name, run.entities.project),
+            run.entities.database_body(),
+            ("displayName", "sourceUrl"),
+            snapshot,
+            report,
+            merger,
+        )
 
         full_refresh_due = state.full_refresh_due()
         for bucket in run.reader.list_buckets():
@@ -270,18 +296,40 @@ class Component(ComponentBase):
                 version_changed=version_changed,
                 full_refresh_due=full_refresh_due,
             ):
-                report.record(project_id=run.ctx.project_id, entity_type="Schema", entity_fqn=bucket.id, action=report_mod.ACTION_SKIPPED_UNCHANGED)
+                report.record(
+                    project_id=run.ctx.project_id,
+                    entity_type="Schema",
+                    entity_fqn=bucket.id,
+                    action=report_mod.ACTION_SKIPPED_UNCHANGED,
+                )
                 # still mark tables as seen so tombstoning does not delete unchanged tables
                 for table in tables:
-                    run.seen_table_fqns.add(fqn_mod.table_fqn(run.entities.service_name, run.entities.project, bucket.path or bucket.name, table.name))
+                    run.seen_table_fqns.add(
+                        fqn_mod.table_fqn(
+                            run.entities.service_name, run.entities.project, bucket.path or bucket.name, table.name
+                        )
+                    )
                 continue
 
-            self._upsert(om, run, "databaseSchemas", "Schema", fqn_mod.schema_fqn(run.entities.service_name, run.entities.project, bucket.path or bucket.name), run.entities.schema_body(bucket), ("displayName", "description", "sourceUrl"), snapshot, report, merger)
+            self._upsert(
+                om,
+                run,
+                "databaseSchemas",
+                "Schema",
+                fqn_mod.schema_fqn(run.entities.service_name, run.entities.project, bucket.path or bucket.name),
+                run.entities.schema_body(bucket),
+                ("displayName", "description", "sourceUrl"),
+                snapshot,
+                report,
+                merger,
+            )
             bucket_ok = True
             for table in tables:
                 built = run.entities.table_body(bucket, table)
                 run.seen_table_fqns.add(built.fqn)
-                ok = self._upsert(om, run, "tables", "Table", built.fqn, built.body, OWNED_TABLE_FIELDS, snapshot, report, merger)
+                ok = self._upsert(
+                    om, run, "tables", "Table", built.fqn, built.body, OWNED_TABLE_FIELDS, snapshot, report, merger
+                )
                 bucket_ok = bucket_ok and ok
                 if built.view_source_fqn:
                     self._put_lineage(om, run, report, lineage_builder.view_edge(built.fqn, built.view_source_fqn))
@@ -308,7 +356,18 @@ class Component(ComponentBase):
         merger: ThreeWayMerger,
         env: dict,
     ) -> None:
-        self._upsert(om, run, "pipelineServices", "PipelineService", run.pipelines.pipeline_service_body()["name"], run.pipelines.pipeline_service_body(), (), snapshot, report, merger)
+        self._upsert(
+            om,
+            run,
+            "pipelineServices",
+            "PipelineService",
+            run.pipelines.pipeline_service_body()["name"],
+            run.pipelines.pipeline_service_body(),
+            (),
+            snapshot,
+            report,
+            merger,
+        )
         for component in run.reader.list_component_configs():
             component_id = component.get("id") or component.get("componentId")
             for cfg in component.get("configurations") or []:
@@ -316,7 +375,18 @@ class Component(ComponentBase):
                     continue
                 built = run.pipelines.build_pipeline(component_id, cfg)
                 run.pipeline_fqn_by_config[str(cfg.get("id"))] = built.fqn
-                self._upsert(om, run, "pipelines", "Pipeline", built.fqn, built.body, OWNED_PIPELINE_FIELDS, snapshot, report, merger)
+                self._upsert(
+                    om,
+                    run,
+                    "pipelines",
+                    "Pipeline",
+                    built.fqn,
+                    built.body,
+                    OWNED_PIPELINE_FIELDS,
+                    snapshot,
+                    report,
+                    merger,
+                )
                 if config.write_pipeline_status:
                     self._push_pipeline_status(run, built.fqn, cfg, env, om, report)
 
@@ -361,12 +431,28 @@ class Component(ComponentBase):
         if not dialect.is_sql:
             return []
         statements = self._statements_of(cfg)
-        in_map = {t.get("destination"): t.get("source") for t in (storage.get("input") or {}).get("tables") or [] if t.get("destination") and t.get("source")}
-        out_map = {t.get("source"): t.get("destination") for t in (storage.get("output") or {}).get("tables") or [] if t.get("source") and t.get("destination")}
+        in_map = {
+            t.get("destination"): t.get("source")
+            for t in (storage.get("input") or {}).get("tables") or []
+            if t.get("destination") and t.get("source")
+        }
+        out_map = {
+            t.get("source"): t.get("destination")
+            for t in (storage.get("output") or {}).get("tables") or []
+            if t.get("source") and t.get("destination")
+        }
         result = extract_column_lineage(statements, in_map=in_map, out_map=out_map, dialect=dialect)
         for note in result.unresolved_notes:
-            report.record(project_id=run.ctx.project_id, entity_type="Column", entity_fqn=str(cfg.get("id")), action=report_mod.ACTION_UNRESOLVED, detail=note)
-        return lineage_builder.column_edges(result, service_name=run.entities.service_name, project=run.entities.project, pipeline_fqn=pipeline_fqn)
+            report.record(
+                project_id=run.ctx.project_id,
+                entity_type="Column",
+                entity_fqn=str(cfg.get("id")),
+                action=report_mod.ACTION_UNRESOLVED,
+                detail=note,
+            )
+        return lineage_builder.column_edges(
+            result, service_name=run.entities.service_name, project=run.entities.project, pipeline_fqn=pipeline_fqn
+        )
 
     @staticmethod
     def _statements_of(cfg: dict) -> list[tuple[str, str]]:
@@ -397,11 +483,23 @@ class Component(ComponentBase):
             return
         try:
             om.put_lineage(request)
-            report.record(project_id=run.ctx.project_id, entity_type="Lineage", entity_fqn=f"{edge.from_fqn}->{edge.to_fqn}", action=report_mod.ACTION_UPDATED, detail=edge.source)
+            report.record(
+                project_id=run.ctx.project_id,
+                entity_type="Lineage",
+                entity_fqn=f"{edge.from_fqn}->{edge.to_fqn}",
+                action=report_mod.ACTION_UPDATED,
+                detail=edge.source,
+            )
         except OMAuthError:
             raise
         except Exception as exc:  # noqa: BLE001 - a single edge failure is per-entity
-            report.record(project_id=run.ctx.project_id, entity_type="Lineage", entity_fqn=f"{edge.from_fqn}->{edge.to_fqn}", action=report_mod.ACTION_FAILED, detail=str(exc))
+            report.record(
+                project_id=run.ctx.project_id,
+                entity_type="Lineage",
+                entity_fqn=f"{edge.from_fqn}->{edge.to_fqn}",
+                action=report_mod.ACTION_FAILED,
+                detail=str(exc),
+            )
 
     def _resolve_id(self, om: OMClient, run: _ProjectRun, fqn: str, entity_type: str) -> str | None:
         cache_key = f"{entity_type}:{fqn}"
@@ -436,7 +534,12 @@ class Component(ComponentBase):
             entity = om.get_by_fqn("tables", stale_fqn)
             if entity and entity.get("id"):
                 om.soft_delete("tables", entity["id"])
-                report.record(project_id=run.ctx.project_id, entity_type="Table", entity_fqn=stale_fqn, action=report_mod.ACTION_TOMBSTONED)
+                report.record(
+                    project_id=run.ctx.project_id,
+                    entity_type="Table",
+                    entity_fqn=stale_fqn,
+                    action=report_mod.ACTION_TOMBSTONED,
+                )
 
     # ---------------------------------------------------------- merge upsert
 
@@ -445,7 +548,9 @@ class Component(ComponentBase):
         try:
             current = om.get_by_fqn(kind, entity_fqn, fields="columns,tableConstraints" if kind == "tables" else None)
             base = snapshot.base_fields(entity_fqn)
-            decision = merger.merge(desired=desired, current=current, base=base, owned_fields=owned_fields or tuple(desired.keys()))
+            decision = merger.merge(
+                desired=desired, current=current, base=base, owned_fields=owned_fields or tuple(desired.keys())
+            )
             status_code = None
             if decision.is_create:
                 created = om.put_entity(kind, desired)
@@ -455,8 +560,19 @@ class Component(ComponentBase):
             elif decision.patch:
                 self._apply_patch(om, kind, entity_fqn, decision.patch)
                 status_code = 200
-            snapshot.record(entity_fqn, entity_type, decision.snapshot_fields or {k: desired[k] for k in (owned_fields or desired) if k in desired})
-            report.record(project_id=run.ctx.project_id, entity_type=entity_type, entity_fqn=entity_fqn, action=decision.action, om_status_code=status_code, detail=",".join(decision.diverged_fields))
+            snapshot.record(
+                entity_fqn,
+                entity_type,
+                decision.snapshot_fields or {k: desired[k] for k in (owned_fields or desired) if k in desired},
+            )
+            report.record(
+                project_id=run.ctx.project_id,
+                entity_type=entity_type,
+                entity_fqn=entity_fqn,
+                action=decision.action,
+                om_status_code=status_code,
+                detail=",".join(decision.diverged_fields),
+            )
             return True
         except OMAuthError:
             raise
@@ -472,7 +588,13 @@ class Component(ComponentBase):
 
     def _handle_entity_failure(self, run, report, entity_type, entity_fqn, exc) -> bool:
         run.failures += 1
-        report.record(project_id=run.ctx.project_id, entity_type=entity_type, entity_fqn=entity_fqn, action=report_mod.ACTION_FAILED, detail=str(exc))
+        report.record(
+            project_id=run.ctx.project_id,
+            entity_type=entity_type,
+            entity_fqn=entity_fqn,
+            action=report_mod.ACTION_FAILED,
+            detail=str(exc),
+        )
         if self._config and self._config.failure_mode == FailureMode.FAIL_FAST:
             raise UserException(f"Failed writing {entity_type} {entity_fqn}: {exc}") from exc
         return False
@@ -541,9 +663,7 @@ class Component(ComponentBase):
             row_token=config.storage_token, injected_token=env["token"], injected_url=env["url"]
         )
         StorageReader(url, token).verify_token()
-        return ValidationResult(
-            f"Connected to OpenMetadata {version}; Storage token valid.", MessageType.SUCCESS
-        )
+        return ValidationResult(f"Connected to OpenMetadata {version}; Storage token valid.", MessageType.SUCCESS)
 
     @sync_action("listBuckets")
     def list_buckets(self) -> list[SelectElement]:

@@ -164,7 +164,7 @@ class StorageReader:
             if response.status_code >= 400:
                 return []
             return list(csv.DictReader(io.StringIO(response.text)))
-        except (requests.RequestException, csv.Error):
+        except requests.RequestException, csv.Error:
             return []
 
     # ------------------------------------------------------------ connection

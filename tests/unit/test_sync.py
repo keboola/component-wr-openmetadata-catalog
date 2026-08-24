@@ -15,31 +15,55 @@ def test_bucket_digest_stable_and_sensitive():
 
 
 def test_unchanged_digest_skips():
-    assert should_process_bucket(
-        previous_digest="d1", current_digest="d1",
-        full_refresh=False, version_changed=False, full_refresh_due=False,
-    ) is False
+    assert (
+        should_process_bucket(
+            previous_digest="d1",
+            current_digest="d1",
+            full_refresh=False,
+            version_changed=False,
+            full_refresh_due=False,
+        )
+        is False
+    )
 
 
 def test_changed_digest_reprocesses():
-    assert should_process_bucket(
-        previous_digest="d1", current_digest="d2",
-        full_refresh=False, version_changed=False, full_refresh_due=False,
-    ) is True
+    assert (
+        should_process_bucket(
+            previous_digest="d1",
+            current_digest="d2",
+            full_refresh=False,
+            version_changed=False,
+            full_refresh_due=False,
+        )
+        is True
+    )
 
 
 def test_full_refresh_ignores_digests():
-    assert should_process_bucket(
-        previous_digest="d1", current_digest="d1",
-        full_refresh=True, version_changed=False, full_refresh_due=False,
-    ) is True
+    assert (
+        should_process_bucket(
+            previous_digest="d1",
+            current_digest="d1",
+            full_refresh=True,
+            version_changed=False,
+            full_refresh_due=False,
+        )
+        is True
+    )
 
 
 def test_version_change_forces_reprocess():
-    assert should_process_bucket(
-        previous_digest="d1", current_digest="d1",
-        full_refresh=False, version_changed=True, full_refresh_due=False,
-    ) is True
+    assert (
+        should_process_bucket(
+            previous_digest="d1",
+            current_digest="d1",
+            full_refresh=False,
+            version_changed=True,
+            full_refresh_due=False,
+        )
+        is True
+    )
 
 
 def test_state_manager_tier2_per_project_keying():

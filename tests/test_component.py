@@ -85,9 +85,7 @@ class FakeStorage:
         return [SourceBucket(id="out.c-sales", name="c-sales", stage="out", path="out.c-sales")]
 
     def iter_tables(self, bucket_id):
-        return iter(
-            [SourceTable(id="out.c-sales.orders", name="orders", columns=[SourceColumn(name="id")])]
-        )
+        return iter([SourceTable(id="out.c-sales.orders", name="orders", columns=[SourceColumn(name="id")])])
 
     def list_component_configs(self):
         return []

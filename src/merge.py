@@ -145,7 +145,7 @@ class SnapshotStore:
                 continue
             try:
                 fields = json.loads(row.get("written_fields_json") or "{}")
-            except (ValueError, TypeError):
+            except ValueError, TypeError:
                 fields = {}
             self._data[fqn] = {"entity_type": row.get("entity_type"), "fields": fields}
 
