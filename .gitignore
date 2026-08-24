@@ -15,6 +15,7 @@ venv
 
 # vcr datadirtesting
 secrets.json
+tests/functional/*/source/data/config.secrets.json
 tests/functional/*/source/data/out/
 tests/functional/*/source/data/in/
 

@@ -19,6 +19,7 @@ from keboola.component.base import ComponentBase, sync_action
 from keboola.component.dao import BaseType, ColumnDefinition
 from keboola.component.exceptions import UserException
 from keboola.component.sync_actions import MessageType, SelectElement, ValidationResult
+from keboola.vcr import DefaultSanitizer
 
 import report as report_mod
 from client import ssh_proxy
@@ -45,11 +46,40 @@ from sync import StateManager, TombstonePlanner, bucket_digest, should_process_b
 
 logger = logging.getLogger(__name__)
 
-# VCR sanitizers (spec 7) — secret config keys + token headers scrubbed from cassettes.
-# Consumed by the Phase-5 datadirtest VCR harness.
+# VCR sanitizers (spec 7) — consumed by the datadirtest recorder, which loads this
+# module-level list via runpy. ``keboola.vcr`` is a production-transitive dependency
+# of ``keboola.component``, so this import is also safe in the ``--no-dev`` image.
+#
+# ``DefaultSanitizer`` covers every secret this writer handles in two ways:
+#   1. It whitelists request/response headers to {content-type, content-length,
+#      accept}, so the three auth headers that carry our tokens are stripped from
+#      every recorded interaction: ``Authorization: Bearer <#bot_token>`` (OM),
+#      ``X-StorageApi-Token`` (Keboola Storage token / KBC_TOKEN / Tier-2 minted
+#      token) and ``X-KBC-ManageApiToken`` (``#manage_token``).
+#   2. It redacts sensitive JSON fields by name in request/response bodies. We add
+#      ``token`` — the read-only Storage token the Management API returns in the
+#      Tier-2 mint response body (``POST /manage/projects/{id}/tokens``) and that
+#      the component then round-trips as a header — plus the ``#``-prefixed config
+#      keys, so no secret value survives inside a body either.
+#
+# The OM host and the Keboola stack host are deliberately NOT sanitized: both are
+# public (the OM public sandbox / a public stack URL) and the request URI is the
+# VCR match key, so rewriting it would break replay. The SSH ``#private_key`` never
+# crosses HTTP (it is consumed by the sshtunnel bastion), so it cannot reach a
+# cassette; it is listed for defense-in-depth only.
 VCR_SANITIZERS = [
-    {"parameters": ["#bot_token", "#storage_token", "#manage_token", "#private_key"]},
-    {"headers": ["Authorization", "X-StorageApi-Token", "X-KBC-ManageApiToken"]},
+    DefaultSanitizer(
+        additional_sensitive_fields=[
+            "token",  # Tier-2 minted read-only Storage token in the mint response body
+            "botToken",
+            "jwtToken",
+            "privateKey",
+            "#bot_token",
+            "#storage_token",
+            "#manage_token",
+            "#private_key",
+        ],
+    ),
 ]
 
 _BASE_TYPE_FACTORY = {
