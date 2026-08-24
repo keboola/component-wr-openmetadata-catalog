@@ -63,8 +63,9 @@
         "port": {
           "type": "integer",
           "title": "Bastion Port",
+          "default": 22,
           "options": {
-            "tooltip": "Defaults to 22 when left empty."
+            "tooltip": "Standard SSH port; change only if your bastion listens elsewhere."
           },
           "propertyOrder": 3
         },
