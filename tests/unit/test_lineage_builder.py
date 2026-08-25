@@ -118,6 +118,81 @@ def test_to_add_lineage_request_drops_self_loop_view_edge(caplog):
     assert any("self-loop" in rec.getMessage() for rec in caplog.records)
 
 
+def test_column_edges_degrade_to_table_level_when_target_is_empty_stub(caplog):
+    # (a) An SCD / self-snapshot output ("out.c-scd.snapshot") is declared but never
+    # materialised in Storage, so it is cataloged as an empty stub (columns=[]).
+    # A columnsLineage entry to it would name columns the table lacks -> OM 400 on
+    # the WHOLE edge. It must degrade to a table-level edge (no columnsLineage) with
+    # a warning, since both endpoint tables exist in the catalog.
+    result = LineageResult(
+        column_edges={ColumnEdge("in.c-main.orders", "id", "out.c-scd.snapshot", "snapshot_pk")},
+    )
+    catalog = {
+        "keboola-stack.Acme_Project.in_c-main.orders": {"id"},
+        "keboola-stack.Acme_Project.out_c-scd.snapshot": set(),  # empty stub
+    }
+    with caplog.at_level(logging.WARNING):
+        edges = column_edges(result, service_name=SVC, project=PROJ, column_catalog=catalog)
+
+    assert len(edges) == 1
+    edge = edges[0]
+    assert edge.source == SOURCE_QUERY
+    assert edge.from_fqn == "keboola-stack.Acme_Project.in_c-main.orders"
+    assert edge.to_fqn == "keboola-stack.Acme_Project.out_c-scd.snapshot"
+    assert edge.columns_lineage == []  # no columnsLineage -> OM cannot 400 on a missing column
+    assert any("snapshot" in rec.getMessage() for rec in caplog.records)
+
+
+def test_column_edges_drop_mapping_referencing_unknown_column(caplog):
+    # (b) One mapping references a column the target does not have ("missing"); it is
+    # dropped, while the sibling mapping with a real column survives.
+    result = LineageResult(
+        column_edges={
+            ColumnEdge("in.c-main.orders", "amount", "out.c-res.result", "total"),  # valid
+            ColumnEdge("in.c-main.orders", "id", "out.c-res.result", "missing"),  # target lacks 'missing'
+        },
+    )
+    catalog = {
+        "keboola-stack.Acme_Project.in_c-main.orders": {"id", "amount"},
+        "keboola-stack.Acme_Project.out_c-res.result": {"total"},
+    }
+    with caplog.at_level(logging.WARNING):
+        edges = column_edges(result, service_name=SVC, project=PROJ, column_catalog=catalog)
+
+    assert len(edges) == 1
+    edge = edges[0]
+    assert len(edge.columns_lineage) == 1  # only the valid mapping remains
+    assert edge.columns_lineage[0]["toColumn"] == "keboola-stack.Acme_Project.out_c-res.result.total"
+    assert any("missing" in rec.getMessage() for rec in caplog.records)
+
+
+def test_column_edges_keep_fully_valid_edge_unchanged():
+    # (c) Every referenced column exists in the catalog -> the edge is emitted with
+    # its columnsLineage intact, identical to the no-catalog behaviour.
+    result = LineageResult(
+        column_edges={
+            ColumnEdge("in.c-main.orders", "id", "out.c-res.result", "id"),
+            ColumnEdge("in.c-main.orders", "amount", "out.c-res.result", "total"),
+        },
+        temp_lineage_tables={"stg"},
+    )
+    catalog = {
+        "keboola-stack.Acme_Project.in_c-main.orders": {"id", "amount"},
+        "keboola-stack.Acme_Project.out_c-res.result": {"id", "total"},
+    }
+    edges = column_edges(result, service_name=SVC, project=PROJ, column_catalog=catalog)
+
+    assert len(edges) == 1
+    edge = edges[0]
+    assert len(edge.columns_lineage) == 2
+    assert edge.temp_lineage_tables == ["stg"]
+    to_cols = {c["toColumn"] for c in edge.columns_lineage}
+    assert to_cols == {
+        "keboola-stack.Acme_Project.out_c-res.result.id",
+        "keboola-stack.Acme_Project.out_c-res.result.total",
+    }
+
+
 def test_to_add_lineage_request_drops_id_level_self_loop(caplog):
     # Two distinct FQNs that resolve to the SAME OM entity id are a malformed
     # self-referential payload (entities exist -> not a 404 -> OM 400). Skipped.

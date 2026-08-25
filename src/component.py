@@ -26,7 +26,7 @@ from client import ssh_proxy
 from client.job_queue_reader import JobQueueReader
 from client.manage_client import ManageClient, ManageScopeError
 from client.om_client import OMAuthError, OMClient, OMPreconditionFailed
-from client.storage_reader import SourceBucket, StorageReader, resolve_storage_credentials
+from client.storage_reader import SourceBucket, SourceTable, StorageReader, resolve_storage_credentials
 from configuration import BranchFilter, Configuration, FailureMode, ProjectScope, Stage
 from lineage.column_lineage import extract_column_lineage
 from lineage.dialect import dialect_for
@@ -110,6 +110,10 @@ class _ProjectRun:
     # the tombstone pass reconciles *only* within these, so allowlist/denylist
     # excluded buckets are never a deletion scope (spec risk #4).
     seen_schema_fqns: set[str] = field(default_factory=set)
+    # Cataloged table FQN -> its (sanitised) column names. The column-lineage pass
+    # validates each columnsLineage entry against this so it never references a
+    # column an endpoint table lacks (empty-stub tables map to an empty set).
+    column_catalog: dict[str, set[str]] = field(default_factory=dict)
     pipeline_fqn_by_config: dict[str, str] = field(default_factory=dict)
     id_cache: dict[str, str | None] = field(default_factory=dict)
     failures: int = 0
@@ -345,11 +349,11 @@ class Component(ComponentBase):
                 )
                 # still mark tables as seen so tombstoning does not delete unchanged tables
                 for table in tables:
-                    run.seen_table_fqns.add(
-                        fqn_mod.table_fqn(
-                            run.entities.service_name, run.entities.project, bucket.path or bucket.name, table.name
-                        )
+                    table_fqn = fqn_mod.table_fqn(
+                        run.entities.service_name, run.entities.project, bucket.path or bucket.name, table.name
                     )
+                    run.seen_table_fqns.add(table_fqn)
+                    self._record_column_catalog(run, table_fqn, table)
                 continue
 
             self._upsert(
@@ -368,6 +372,7 @@ class Component(ComponentBase):
             for table in tables:
                 built = run.entities.table_body(bucket, table)
                 run.seen_table_fqns.add(built.fqn)
+                self._record_column_catalog(run, built.fqn, table)
                 ok = self._upsert(
                     om, run, "tables", "Table", built.fqn, built.body, OWNED_TABLE_FIELDS, snapshot, report, merger
                 )
@@ -377,6 +382,15 @@ class Component(ComponentBase):
             # advance-after-success: persist the digest only once the bucket's writes succeeded
             if bucket_ok:
                 state.set_bucket_digest(run.ctx.project_id, bucket.id, digest)
+
+    @staticmethod
+    def _record_column_catalog(run: _ProjectRun, table_fqn: str, table: SourceTable) -> None:
+        """Record a table's cataloged column set (empty for an unmaterialised stub).
+
+        Feeds the column-lineage pass so a ``columnsLineage`` entry never references
+        a column the endpoint table does not actually hold (OM 400).
+        """
+        run.column_catalog[table_fqn] = {fqn_mod.sanitize_name(col.name) for col in table.columns}
 
     @staticmethod
     def _bucket_in_scope(config: Configuration, bucket: SourceBucket) -> bool:
@@ -496,7 +510,11 @@ class Component(ComponentBase):
                 detail=note,
             )
         return lineage_builder.column_edges(
-            result, service_name=run.entities.service_name, project=run.entities.project, pipeline_fqn=pipeline_fqn
+            result,
+            service_name=run.entities.service_name,
+            project=run.entities.project,
+            pipeline_fqn=pipeline_fqn,
+            column_catalog=run.column_catalog,
         )
 
     @staticmethod

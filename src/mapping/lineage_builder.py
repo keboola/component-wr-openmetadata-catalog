@@ -112,21 +112,112 @@ def view_edge(view_fqn: str, source_fqn: str) -> LineageEdge:
     return LineageEdge(from_fqn=source_fqn, to_fqn=view_fqn, source=SOURCE_VIEW)
 
 
+def _column_ref_valid(
+    catalog: dict[str, set[str]],
+    from_tbl_fqn: str,
+    from_col: str,
+    to_tbl_fqn: str,
+    to_col: str,
+) -> bool:
+    """True only if BOTH endpoint columns exist in their table's non-empty cataloged set.
+
+    An empty-stub table (an SCD / self-snapshot output declared but never
+    materialised in Storage -> cataloged with ``columns=[]`` -> empty set here) or
+    a table absent from the catalog can never back a column reference. Any mapping
+    touching one is rejected here, because OpenMetadata 400s the *whole* edge
+    ("Invalid request format") when a ``columnsLineage`` entry names a column its
+    endpoint table does not have (spec 4.2).
+    """
+    from_cols = catalog.get(from_tbl_fqn)
+    to_cols = catalog.get(to_tbl_fqn)
+    if not from_cols or not to_cols:
+        return False
+    return fqn.sanitize_name(from_col) in from_cols and fqn.sanitize_name(to_col) in to_cols
+
+
+def _table_level_fallbacks(
+    seen_pairs: set[tuple[str, str]],
+    grouped: dict[tuple[str, str], list[dict]],
+    catalog: dict[str, set[str]],
+    temp: list[str],
+    pipeline_fqn: str | None,
+) -> list[LineageEdge]:
+    """Degrade pairs that lost ALL their column mappings.
+
+    A table pair that had column edges but no *valid* column mapping left keeps a
+    table-level ``QueryLineage`` edge when both endpoint tables exist in the
+    catalog (the useful lineage — table A feeds table B — is preserved without the
+    rejected column detail); otherwise the edge is omitted entirely.
+    """
+    fallbacks: list[LineageEdge] = []
+    for from_tbl_fqn, to_tbl_fqn in sorted(seen_pairs - set(grouped)):
+        if from_tbl_fqn in catalog and to_tbl_fqn in catalog:
+            logger.warning(
+                "Degrading %s -> %s to a table-level %s edge: every column mapping referenced "
+                "a column absent from the cataloged (empty-stub) column set.",
+                from_tbl_fqn,
+                to_tbl_fqn,
+                SOURCE_QUERY,
+            )
+            fallbacks.append(
+                LineageEdge(
+                    from_fqn=from_tbl_fqn,
+                    to_fqn=to_tbl_fqn,
+                    source=SOURCE_QUERY,
+                    temp_lineage_tables=temp,
+                    pipeline_fqn=pipeline_fqn,
+                )
+            )
+        else:
+            logger.warning(
+                "Omitting column lineage edge %s -> %s: no valid column mappings and an "
+                "endpoint table is not in the catalog.",
+                from_tbl_fqn,
+                to_tbl_fqn,
+            )
+    return fallbacks
+
+
 def column_edges(
     result: LineageResult,
     *,
     service_name: str,
     project: str,
     pipeline_fqn: str | None = None,
+    column_catalog: dict[str, set[str]] | None = None,
 ) -> list[LineageEdge]:
-    """E17: group resolved column edges by (from_table, to_table) into QueryLineage edges."""
+    """E17: group resolved column edges by (from_table, to_table) into QueryLineage edges.
+
+    ``column_catalog`` maps a cataloged table FQN to the set of (sanitised) column
+    names OpenMetadata actually holds for it. When supplied, every ``columnsLineage``
+    entry is validated against it before emission: a mapping whose ``fromColumns`` or
+    ``toColumn`` is absent from its endpoint's non-empty cataloged set is dropped with
+    a warning (it would otherwise 400 the whole edge). A pair that loses all its column
+    mappings degrades to a table-level edge when both endpoints exist, else is omitted.
+    ``column_catalog=None`` disables the check (legacy behaviour: emit every mapping).
+    """
     grouped: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    seen_pairs: set[tuple[str, str]] = set()
     for edge in result.column_edges:
         from_tbl_fqn = fqn.table_fqn_from_storage_id(service_name, project, edge.from_table)
         to_tbl_fqn = fqn.table_fqn_from_storage_id(service_name, project, edge.to_table)
         if not from_tbl_fqn or not to_tbl_fqn:
             continue
         if _is_self_loop(from_tbl_fqn, to_tbl_fqn, SOURCE_QUERY):
+            continue
+        seen_pairs.add((from_tbl_fqn, to_tbl_fqn))
+        if column_catalog is not None and not _column_ref_valid(
+            column_catalog, from_tbl_fqn, edge.from_column, to_tbl_fqn, edge.to_column
+        ):
+            logger.warning(
+                "Dropping column-level mapping %s.%s -> %s.%s (source=%s): referenced column "
+                "is missing from the cataloged (empty-stub or unknown) column set.",
+                from_tbl_fqn,
+                edge.from_column,
+                to_tbl_fqn,
+                edge.to_column,
+                SOURCE_QUERY,
+            )
             continue
         grouped[(from_tbl_fqn, to_tbl_fqn)].append(
             {
@@ -136,7 +227,7 @@ def column_edges(
         )
 
     temp = sorted(result.temp_lineage_tables)
-    return [
+    edges = [
         LineageEdge(
             from_fqn=from_tbl_fqn,
             to_fqn=to_tbl_fqn,
@@ -147,6 +238,9 @@ def column_edges(
         )
         for (from_tbl_fqn, to_tbl_fqn), cols in grouped.items()
     ]
+    if column_catalog is not None:
+        edges += _table_level_fallbacks(seen_pairs, grouped, column_catalog, temp, pipeline_fqn)
+    return edges
 
 
 def to_add_lineage_request(
