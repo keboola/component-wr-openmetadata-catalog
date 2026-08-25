@@ -1,1 +1,91 @@
-{}
+{
+  "type": "object",
+  "title": "Project",
+  "properties": {
+    "#storage_token": {
+      "type": "string",
+      "title": "Storage Token",
+      "format": "password",
+      "description": "Read-only Storage token for this project",
+      "options": {
+        "tooltip": "Leave empty for the host project (the config's own project uses the forwarded token). Required for any other project: create a read-only Storage token in that project and paste it here."
+      },
+      "propertyOrder": 10
+    },
+    "project_name_override": {
+      "type": "string",
+      "title": "Project Name Override",
+      "description": "Human-readable OpenMetadata Database name",
+      "options": {
+        "tooltip": "Defaults to the project name resolved from the token."
+      },
+      "propertyOrder": 20
+    },
+    "stages": {
+      "type": "array",
+      "title": "Bucket Stages",
+      "format": "select",
+      "uniqueItems": true,
+      "description": "Which bucket stages to catalog",
+      "items": {
+        "type": "string",
+        "enum": [
+          "in",
+          "out"
+        ],
+        "options": {
+          "enum_titles": [
+            "Input (in)",
+            "Output (out)"
+          ]
+        }
+      },
+      "options": {
+        "tooltip": "Defaults to both input and output stages."
+      },
+      "propertyOrder": 30
+    },
+    "bucket_allowlist": {
+      "type": "array",
+      "title": "Bucket Allowlist",
+      "format": "select",
+      "uniqueItems": true,
+      "description": "Only catalog these buckets (empty = all)",
+      "items": {
+        "type": "string",
+        "enum": []
+      },
+      "options": {
+        "tags": true,
+        "async": {
+          "label": "Load Buckets",
+          "action": "listBuckets",
+          "autoload": true,
+          "cache": true
+        }
+      },
+      "propertyOrder": 40
+    },
+    "bucket_denylist": {
+      "type": "array",
+      "title": "Bucket Denylist",
+      "format": "select",
+      "uniqueItems": true,
+      "description": "Exclude these buckets",
+      "items": {
+        "type": "string",
+        "enum": []
+      },
+      "options": {
+        "tags": true,
+        "async": {
+          "label": "Load Buckets",
+          "action": "listBuckets",
+          "autoload": true,
+          "cache": true
+        }
+      },
+      "propertyOrder": 50
+    }
+  }
+}

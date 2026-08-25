@@ -1,0 +1,9 @@
+{
+  "destination": "in.c-wr-openmetadata-catalog.last_written_snapshot",
+  "incremental": true,
+  "primary_key": [
+    "entity_fqn"
+  ],
+  "delimiter": ",",
+  "enclosure": "\""
+}

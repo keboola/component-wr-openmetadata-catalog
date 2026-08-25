@@ -1,0 +1,11 @@
+{
+  "destination": "in.c-wr-openmetadata-catalog.catalog_run_report",
+  "incremental": true,
+  "primary_key": [
+    "run_id",
+    "entity_type",
+    "entity_fqn"
+  ],
+  "delimiter": ",",
+  "enclosure": "\""
+}

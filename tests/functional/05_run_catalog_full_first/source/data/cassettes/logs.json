@@ -1,0 +1,48 @@
+{
+  "exit_code": null,
+  "stderr": "No action defined in the configuration, using the default run action.\nTable 'goals' column name 'properties_hs_migration_soft_delete' collides after sanitisation; disambiguating to 'properties_hs_migration_soft_delete_2'.\nRunning on legacy queue some manifest properties will be ignored: ['write_always']\nRunning on legacy queue some manifest properties will be ignored: ['write_always']\n",
+  "logs": [
+    {
+      "level": "WARNING",
+      "logger": "root",
+      "message": "No action defined in the configuration, using the default run action.",
+      "timestamp": "2026-08-24T12:00:00.000Z"
+    },
+    {
+      "level": "INFO",
+      "logger": "root",
+      "message": "Loading state file..",
+      "timestamp": "2026-08-24T12:00:00.000Z"
+    },
+    {
+      "level": "INFO",
+      "logger": "client.om_client",
+      "message": "OpenMetadata server version: 1.13.4",
+      "timestamp": "2026-08-24T12:00:00.000Z"
+    },
+    {
+      "level": "WARNING",
+      "logger": "mapping.entity_builder",
+      "message": "Table 'goals' column name 'properties_hs_migration_soft_delete' collides after sanitisation; disambiguating to 'properties_hs_migration_soft_delete_2'.",
+      "timestamp": "2026-08-24T12:00:00.000Z"
+    },
+    {
+      "level": "WARNING",
+      "logger": "root",
+      "message": "Running on legacy queue some manifest properties will be ignored: ['write_always']",
+      "timestamp": "2026-08-24T12:00:00.000Z"
+    },
+    {
+      "level": "WARNING",
+      "logger": "root",
+      "message": "Running on legacy queue some manifest properties will be ignored: ['write_always']",
+      "timestamp": "2026-08-24T12:00:00.000Z"
+    },
+    {
+      "level": "INFO",
+      "logger": "__main__",
+      "message": "Run summary: {'created': 185}",
+      "timestamp": "2026-08-24T12:00:00.000Z"
+    }
+  ]
+}
