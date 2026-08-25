@@ -1,0 +1,8 @@
+{
+  "_metadata": {"component_run_duration_seconds": 0.121, "component_run_ended_at": "2026-08-24T14:45:20.417744+00:00", "component_run_started_at": "2026-08-24T14:45:20.296772+00:00", "freeze_time": "2026-08-24T12:00:00", "keboola_vcr_version": "0.7.1", "recorded_at": "2026-08-24T14:45:20.419861+00:00", "recording_duration_seconds": 0.04, "recording_ended_at": "2026-08-24T14:45:20.416101+00:00", "recording_started_at": "2026-08-24T14:45:20.375954+00:00", "request_pairs": 2},
+  "interactions": [
+    {"request": {"body": null, "headers": {"Accept": ["application/json"], "Content-Type": ["application/json"]}, "method": "GET", "uri": "http://localhost:8585/api/v1/system/version"}, "response": {"body": {"string": "{\"version\":\"1.13.4\",\"revision\":\"e850a15f1156b2c7b045bfa8d060281ea62645ba\",\"timestamp\":1787295579278}"}, "headers": {"Content-Length": ["100"], "Content-Type": ["application/json"]}, "status": {"code": 200, "message": "OK"}}},
+    {"request": {"body": null, "headers": {"Accept": ["application/json"], "Content-Type": ["application/json"]}, "method": "GET", "uri": "http://localhost:8585/api/v1/users/loggedInUser"}, "response": {"body": {"string": "{\"code\": \"REDACTED\", \"message\": \"Not Authorized! Invalid token.\"}"}, "headers": {"Content-Length": ["55"], "Content-Type": ["application/json"]}, "status": {"code": 401, "message": "Unauthorized"}}}
+  ],
+  "version": 1
+}

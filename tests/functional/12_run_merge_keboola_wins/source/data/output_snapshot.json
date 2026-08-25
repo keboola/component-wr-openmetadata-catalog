@@ -1,0 +1,47 @@
+{
+  "files": {},
+  "hash_algorithm": "sha256",
+  "tables": {
+    "catalog_run_report.csv": {
+      "columns": [
+        "run_id",
+        "config_row_id",
+        "project_id",
+        "entity_type",
+        "entity_fqn",
+        "action",
+        "detail",
+        "om_status_code",
+        "timestamp"
+      ],
+      "hash": "sha256:53e5b66eefb5ede144871d2c5603df2dba380ebe196e45ec46047ef375e0f0cd",
+      "row_count": 186,
+      "size_bytes": 36508
+    },
+    "catalog_run_report.csv.manifest": {
+      "columns": null,
+      "hash": "sha256:e975e961a503cb163896f40f34c994b4db7a9b1ae35e455c82d3b1798dbe733b",
+      "row_count": null,
+      "size_bytes": 209
+    },
+    "last_written_snapshot.csv": {
+      "columns": [
+        "entity_fqn",
+        "entity_type",
+        "written_fields_json",
+        "content_hash",
+        "updated_at"
+      ],
+      "hash": "sha256:cb6148944ab224cd87c9d1b83ab420d4aa93115c2edb2bbc21923574767986d2",
+      "row_count": 186,
+      "size_bytes": 586222
+    },
+    "last_written_snapshot.csv.manifest": {
+      "columns": null,
+      "hash": "sha256:60f49355ed2f697ccbf3f2f29882d4ab7368fa6ed0c68d87ce48c68458a0d3d2",
+      "row_count": null,
+      "size_bytes": 179
+    }
+  },
+  "version": "1.0"
+}

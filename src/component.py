@@ -10,16 +10,19 @@ snapshot/state/report -> raise at the end in collect_and_fail mode.
 from __future__ import annotations
 
 import csv
+import json
 import logging
 import os
+import re
 import sys
 from dataclasses import dataclass, field
+from typing import Any, ClassVar
 
 from keboola.component.base import ComponentBase, sync_action
 from keboola.component.dao import BaseType, ColumnDefinition
 from keboola.component.exceptions import UserException
 from keboola.component.sync_actions import MessageType, SelectElement, ValidationResult
-from keboola.vcr import DefaultSanitizer
+from keboola.vcr import BaseSanitizer, DefaultSanitizer
 
 import report as report_mod
 from client import ssh_proxy
@@ -46,6 +49,119 @@ from sync import StateManager, TombstonePlanner, bucket_digest, should_process_b
 
 logger = logging.getLogger(__name__)
 
+
+class CredentialScrubber(BaseSanitizer):
+    """Recursive, name-agnostic scrubber for *foreign* credentials in bodies.
+
+    ``DefaultSanitizer`` only redacts the handful of secret field names *this*
+    component knows about. But some recorded responses echo the configuration of
+    *other* components in the project — most dangerously
+    ``GET /v2/storage/branch/.../components?include=configuration`` — whose secret
+    field names cannot be enumerated ahead of time (foreign RSA/PKCS#8 private
+    keys, cloud access-key ids, third-party tokens). This sanitizer walks every
+    recorded request/response body and redacts, recursively:
+
+    * any value whose **field name** matches (case-insensitive, separators
+      ignored) a credential pattern — ``private_key`` / ``snowflake_private_key``
+      / ``access_key`` / ``aws_access_key_id`` / ``accessKeyId`` / ``api_key`` /
+      ``api_key_id`` / ``aws_key_id`` / ``secret`` / ``password`` / ``token`` and
+      any name ending ``_key`` / ``_secret`` / ``_password`` / ``_token`` or
+      containing ``access_key``;
+    * any string whose **shape** is a credential — a PEM/PKCS#8 private-key block
+      or an AWS access-key id (``AKIA[0-9A-Z]{16}``) — under *any* field name.
+
+    Non-secret fields are preserved: SQL blocks, storage input/output mappings,
+    table/column names, ids, and the storage ``primary_key`` list (explicitly
+    excluded from the ``*_key`` rule). It runs at record time only, so it affects
+    future recordings; already-recorded cassettes are untouched.
+    """
+
+    REPLACEMENT: ClassVar[str] = "REDACTED"
+
+    # Matched against the field name lower-cased with every non-alphanumeric
+    # character stripped, so ``private_key`` / ``privateKey`` / ``PRIVATE-KEY``
+    # all normalize to ``privatekey``.
+    _NAME_SUBSTRINGS: ClassVar[tuple[str, ...]] = (
+        "privatekey",
+        "accesskey",  # access_key, aws_access_key_id, accessKeyId, *ACCESS_KEY*
+        "apikey",  # api_key, api_key_id
+        "awskeyid",
+        "secret",
+        "password",
+        "token",
+    )
+    _NAME_SUFFIXES: ClassVar[tuple[str, ...]] = ("key", "secret", "password", "token")
+    # Benign ``*_key`` field names that are NOT credentials and must survive.
+    _NAME_ALLOWLIST: ClassVar[frozenset[str]] = frozenset({"primarykey"})
+
+    _PEM_RE: ClassVar[re.Pattern[str]] = re.compile(
+        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+        re.DOTALL,
+    )
+    _AWS_KEY_RE: ClassVar[re.Pattern[str]] = re.compile(r"AKIA[0-9A-Z]{16}")
+
+    scrub_before_read: bool = False
+
+    @classmethod
+    def _is_credential_name(cls, key: str) -> bool:
+        norm = re.sub(r"[^a-z0-9]", "", key.lower())
+        if norm in cls._NAME_ALLOWLIST:
+            return False
+        if any(needle in norm for needle in cls._NAME_SUBSTRINGS):
+            return True
+        return any(norm.endswith(suffix) for suffix in cls._NAME_SUFFIXES)
+
+    @classmethod
+    def _scrub_scalar(cls, value: str) -> str:
+        """Redact credential-shaped substrings (PEM block, AWS key id) in a string."""
+        value = cls._PEM_RE.sub(cls.REPLACEMENT, value)
+        return cls._AWS_KEY_RE.sub(cls.REPLACEMENT, value)
+
+    @classmethod
+    def _scrub_value(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: (cls.REPLACEMENT if isinstance(key, str) and cls._is_credential_name(key) else cls._scrub_value(v))
+                for key, v in value.items()
+            }
+        if isinstance(value, list):
+            return [cls._scrub_value(item) for item in value]
+        if isinstance(value, str):
+            return cls._scrub_scalar(value)
+        return value
+
+    @classmethod
+    def scrub_body_text(cls, body: str) -> str:
+        """Scrub a body: field-name + value-shape redaction over JSON, shape-only over non-JSON."""
+        if not body:
+            return body
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError, ValueError:
+            # Not JSON — still strip credential-shaped substrings from the raw text.
+            return cls._scrub_scalar(body)
+        return json.dumps(cls._scrub_value(data))
+
+    def before_record_request(self, request: Any) -> Any:
+        body = getattr(request, "body", None)
+        if body:
+            if isinstance(body, bytes):
+                request.body = self.scrub_body_text(body.decode("utf-8", errors="ignore")).encode("utf-8")
+            elif isinstance(body, str):
+                request.body = self.scrub_body_text(body)
+        return request
+
+    def before_record_response(self, response: dict) -> dict:
+        body = response.get("body") if isinstance(response, dict) else None
+        if isinstance(body, dict) and "string" in body:
+            raw = body["string"]
+            if isinstance(raw, bytes):
+                body["string"] = self.scrub_body_text(raw.decode("utf-8", errors="ignore")).encode("utf-8")
+            elif isinstance(raw, str):
+                body["string"] = self.scrub_body_text(raw)
+        return response
+
+
 # VCR sanitizers (spec 7) — consumed by the datadirtest recorder, which loads this
 # module-level list via runpy. ``keboola.vcr`` is a production-transitive dependency
 # of ``keboola.component``, so this import is also safe in the ``--no-dev`` image.
@@ -67,6 +183,15 @@ logger = logging.getLogger(__name__)
 # VCR match key, so rewriting it would break replay. The SSH ``#private_key`` never
 # crosses HTTP (it is consumed by the sshtunnel bastion), so it cannot reach a
 # cassette; it is listed for defense-in-depth only.
+#
+# ``CredentialScrubber`` is the second, name-agnostic layer (see its docstring):
+# ``DefaultSanitizer`` can only redact field names it was told about in advance,
+# but some responses — notably ``GET /v2/storage/.../components?include=configuration``
+# — echo *every other* component's configuration, whose secret field names this
+# writer cannot enumerate. The scrubber redacts any credential-shaped field name or
+# value recursively so a future recording can never bake in a foreign private key
+# or cloud access-key id. It runs at record time only, so the already-recorded
+# cassettes are unaffected.
 VCR_SANITIZERS = [
     DefaultSanitizer(
         additional_sensitive_fields=[
@@ -80,6 +205,7 @@ VCR_SANITIZERS = [
             "#private_key",
         ],
     ),
+    CredentialScrubber(),
 ]
 
 _BASE_TYPE_FACTORY = {

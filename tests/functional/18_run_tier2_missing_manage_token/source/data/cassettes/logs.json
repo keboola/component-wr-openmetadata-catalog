@@ -1,0 +1,18 @@
+{
+  "exit_code": 1,
+  "stderr": "No action defined in the configuration, using the default run action.\nproject_scope='all_projects' requires a Management API token (#manage_token) and an organization_id. Provide the missing value(s) or switch project_scope to 'rows'.\n",
+  "logs": [
+    {
+      "level": "WARNING",
+      "logger": "root",
+      "message": "No action defined in the configuration, using the default run action.",
+      "timestamp": "2026-08-24T12:00:00.000Z"
+    },
+    {
+      "level": "ERROR",
+      "logger": "__main__",
+      "message": "project_scope='all_projects' requires a Management API token (#manage_token) and an organization_id. Provide the missing value(s) or switch project_scope to 'rows'.",
+      "timestamp": "2026-08-24T12:00:00.000Z"
+    }
+  ]
+}

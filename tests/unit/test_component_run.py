@@ -14,13 +14,21 @@ self-contained (network clients faked, a temporary ``KBC_DATADIR``):
 import csv
 import io
 import json
+from types import SimpleNamespace
 
 import pytest
 from keboola.component.exceptions import UserException
 
 import component as component_mod
+import report as report_mod
 from client.storage_reader import SourceBucket, SourceColumn, SourceTable
+from component import ProjectContext, _ProjectRun
+from configuration import FailureMode, MergeMode
 from mapping import fqn as fqn_mod
+from mapping.entity_builder import EntityBuilder
+from mapping.pipeline_builder import PipelineBuilder
+from merge import SnapshotStore, ThreeWayMerger
+from sync import StateManager, bucket_digest
 
 BASE_PARAMS = {
     "om_host": "https://om.example.com",
@@ -244,3 +252,103 @@ def test_log_only_does_not_raise(tmp_path, monkeypatch, _env):
 
     component_mod.Component().run()  # log_only -> exit 0
     assert any(r["action"] == "failed" for r in _report_rows(tmp_path))
+
+
+# --------------------------------------- incremental digest-skip (tombstone-safe)
+
+
+class _RecordingOM:
+    """OM double that records every write; get returns None (create path)."""
+
+    def __init__(self):
+        self.put_calls: list[tuple[str, str | None]] = []
+        self.patch_calls: list[tuple[str, str]] = []
+        self.is_2_0_or_newer = False
+
+    def get_by_fqn(self, kind, fqn, fields=None):
+        return None
+
+    def put_entity(self, kind, body):
+        self.put_calls.append((kind, body.get("name")))
+        return {"id": f"id-{body.get('name')}"}
+
+    def patch_entity(self, kind, fqn, patch):
+        self.patch_calls.append((kind, fqn))
+        return {"id": "x"}
+
+
+class _OneBucketReader:
+    def __init__(self, bucket, tables):
+        self._bucket = bucket
+        self._tables = tables
+
+    def list_buckets(self):
+        return [self._bucket]
+
+    def iter_tables(self, bucket_id):
+        return iter(list(self._tables))
+
+
+def test_incremental_skip_is_tombstone_safe_and_writes_nothing():
+    """A bucket whose stored digest matches is skipped, but its tables must STILL be
+    marked seen (so the per-schema tombstone pass never deletes an unchanged bucket's
+    catalog), no OM schema/table write is issued, and the digest is left untouched
+    (advance-after-success only persists after a real write). VCR case 06 exercises
+    this end-to-end but does not assert the tombstone-safety wiring."""
+    svc, proj, pid = "keboola-stack", "Proj", "4214"
+    bucket = SourceBucket(id="in.c-x", name="c-x", stage="in", path="in.c-x")
+    tables = [
+        SourceTable(
+            id="in.c-x.orders",
+            name="orders",
+            columns=[SourceColumn(name="id"), SourceColumn(name="amount")],
+        )
+    ]
+    # State pre-seeded with the MATCHING digest -> should_process_bucket() is False.
+    # run_count=1 so the periodic full-refresh cadence (run_count % 20 == 0) does not
+    # force a reprocess this run.
+    digest = bucket_digest(vars(bucket), [vars(t) for t in tables])
+    state = StateManager({"projects": {pid: {"bucket_digests": {bucket.id: digest}}}, "run_count": 1})
+
+    om = _RecordingOM()
+    run = _ProjectRun(
+        ctx=ProjectContext(project_id=pid, project_name=proj, storage_token="t", storage_url="https://s"),
+        reader=_OneBucketReader(bucket, tables),  # ty: ignore[invalid-argument-type]  (duck-typed test double)
+        entities=EntityBuilder(svc, proj, pid, "https://ui.example"),
+        pipelines=PipelineBuilder(svc, proj, pid, "https://ui.example"),
+    )
+    report = component_mod.RunReport(run_id="rid")
+
+    comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
+    comp._config = SimpleNamespace(failure_mode=FailureMode.COLLECT_AND_FAIL)  # ty: ignore[invalid-assignment]
+    config = SimpleNamespace(full_refresh=False, stages=[], bucket_allowlist=[], bucket_denylist=[])
+
+    # config/om are duck-typed test doubles (SimpleNamespace / _RecordingOM).
+    comp._catalog_pass(
+        config,  # ty: ignore[invalid-argument-type]
+        om,  # ty: ignore[invalid-argument-type]
+        run,
+        state,
+        SnapshotStore(),
+        report,
+        ThreeWayMerger(MergeMode.THREE_WAY_MERGE),
+        version_changed=False,
+    )
+
+    # 1) No OM write for the unchanged bucket's schema/tables (only the always-on
+    #    DatabaseService + Database upserts precede the bucket loop).
+    written_kinds = {kind for kind, _ in om.put_calls}
+    assert written_kinds == {"databaseServices", "databases"}
+    assert om.patch_calls == []
+
+    # 2) The bucket is reported skipped_unchanged.
+    schema_rows = [r for r in report.rows() if r["entity_type"] == "Schema"]
+    assert schema_rows and all(r["action"] == report_mod.ACTION_SKIPPED_UNCHANGED for r in schema_rows)
+
+    # 3) Tombstone-safety: the skipped bucket's tables are STILL seen + cataloged.
+    assert len(run.seen_table_fqns) == 1
+    (seen_fqn,) = run.seen_table_fqns
+    assert run.column_catalog.get(seen_fqn) == {"id", "amount"}
+
+    # 4) advance-after-success: the stored digest is untouched (no write happened).
+    assert state.bucket_digest(pid, bucket.id) == digest

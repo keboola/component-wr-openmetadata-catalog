@@ -1,0 +1,8 @@
+{
+  "parameters": {
+    "om_host": "http://localhost:8585",
+    "#bot_token": "DUMMY_BOT_TOKEN",
+    "#storage_token": "DUMMY_STORAGE_TOKEN",
+    "use_ssh_tunnel": true
+  }
+}

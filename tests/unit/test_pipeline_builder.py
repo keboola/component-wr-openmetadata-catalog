@@ -79,3 +79,49 @@ def test_writer_rows_fallback_to_tasks():
     tasks = built.body["tasks"]
     assert [t["name"] for t in tasks] == ["row_one"]
     assert tasks[0]["taskSQL"] == "SELECT 9"
+
+
+def test_python_transformation_gets_python_task_type():
+    # E13, PYTHON branch of _task_type: a python transformation's block tasks are
+    # tagged PYTHON (not QUERY); the script is still carried as taskSQL (code text).
+    config = {
+        "id": "777",
+        "name": "Score",
+        "configuration": {"parameters": {"blocks": [{"name": "b", "codes": [{"name": "c", "script": ["print(1)"]}]}]}},
+    }
+    built = _builder().build_pipeline("keboola.python-transformation-v2", config)
+    task = built.body["tasks"][0]
+    assert task["taskType"] == "PYTHON"
+    assert task["taskSQL"] == "print(1)"
+
+
+def test_flow_multi_task_phase_fan_out():
+    # E14 downstream fan-out: a phase whose successor holds MULTIPLE tasks lists all
+    # of them as downstreamTasks (the single-task-per-phase test can't show this).
+    config = {
+        "id": "flow-2",
+        "configuration": {
+            "phases": [{"id": 1, "name": "extract"}, {"id": 2, "name": "load"}],
+            "tasks": [
+                {"id": "e1", "name": "extract a", "phase": 1, "enabled": True},
+                {"id": "l1", "name": "load a", "phase": 2, "enabled": True},
+                {"id": "l2", "name": "load b", "phase": 2, "enabled": True},
+            ],
+        },
+    }
+    built = _builder().build_pipeline("keboola.orchestrator", config)
+    extract = next(t for t in built.body["tasks"] if t["name"] == "extract_a")
+    assert extract["downstreamTasks"] == ["load_a", "load_b"]
+
+
+def test_writer_rows_dict_query_shape():
+    # E13 rows fallback: some writers store the row query as a nested dict
+    # ({"query": "..."}) rather than a bare string; both must yield taskSQL.
+    config = {
+        "id": "600",
+        "name": "Writer",
+        "configuration": {"parameters": {}},
+        "rows": [{"id": "r1", "name": "load", "configuration": {"parameters": {"query": {"query": "SELECT 42"}}}}],
+    }
+    built = _builder().build_pipeline("keboola.wr-db-snowflake", config)
+    assert built.body["tasks"][0]["taskSQL"] == "SELECT 42"

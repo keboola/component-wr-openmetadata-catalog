@@ -1,0 +1,5 @@
+{
+  "exit_code": 1,
+  "stderr": "Keboola Storage rejected the token (401) on GET /v2/storage/buckets. Check the Storage token is valid and has read access.",
+  "logs": []
+}

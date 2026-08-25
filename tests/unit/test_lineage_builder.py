@@ -6,7 +6,8 @@ import textwrap
 from collections import defaultdict
 from pathlib import Path
 
-from lineage.column_lineage import ColumnEdge, LineageResult
+from lineage.column_lineage import ColumnEdge, LineageResult, extract_column_lineage
+from lineage.dialect import dialect_for
 from mapping import fqn
 from mapping.lineage_builder import (
     SOURCE_PIPELINE,
@@ -20,6 +21,7 @@ from mapping.lineage_builder import (
 
 SVC = "keboola-stack"
 PROJ = "Acme_Project"
+SNOW = dialect_for(component_id="keboola.snowflake-transformation")
 
 
 def _resolver(known):
@@ -200,6 +202,73 @@ def test_column_edges_keep_fully_valid_edge_unchanged():
     }
 
 
+def test_e17_end_to_end_sql_to_add_lineage_request():
+    """E17 seam — real transformation SQL all the way to the OM AddLineageRequest.
+
+    Compensates the DROPPED functional case ``10_run_column_lineage_only``: the two
+    halves (SQL text -> ``extract_column_lineage`` in test_lineage.py, and
+    ``LineageResult`` -> edges -> request here) are each covered, but nothing else
+    chains them. This drives a multi-step transformation (with an intermediate temp
+    table) through the parser, groups + validates the parsed column edges against
+    the cataloged column sets, and asserts the resulting ``QueryLineage``
+    ``AddLineageRequest`` carries the parser-derived ``columnsLineage`` and the
+    pipeline attachment.
+    """
+    statements = [
+        ("load_stg", 'CREATE TABLE "stg" AS SELECT "id", "amount" FROM "src"'),
+        ("build_result", 'INSERT INTO "result" SELECT "id", "amount" AS "total" FROM "stg"'),
+    ]
+    result = extract_column_lineage(
+        statements,
+        in_map={"src": "in.c-main.orders"},
+        out_map={"result": "out.c-sales.result"},
+        dialect=SNOW,
+    )
+    # (1) the parser resolved both columns through the intermediate temp table
+    assert ColumnEdge("in.c-main.orders", "id", "out.c-sales.result", "id") in result.column_edges
+    assert ColumnEdge("in.c-main.orders", "amount", "out.c-sales.result", "total") in result.column_edges
+    assert "stg" in result.temp_lineage_tables
+
+    # (2) group + validate against the endpoint tables' cataloged column sets
+    catalog = {
+        "keboola-stack.Acme_Project.in_c-main.orders": {"id", "amount"},
+        "keboola-stack.Acme_Project.out_c-sales.result": {"id", "total"},
+    }
+    edges = column_edges(
+        result,
+        service_name=SVC,
+        project=PROJ,
+        pipeline_fqn="keboola-stack.Acme_Project__42",
+        column_catalog=catalog,
+    )
+    assert len(edges) == 1
+    edge = edges[0]
+    assert edge.source == SOURCE_QUERY
+    assert edge.from_fqn == "keboola-stack.Acme_Project.in_c-main.orders"
+    assert edge.to_fqn == "keboola-stack.Acme_Project.out_c-sales.result"
+    assert edge.temp_lineage_tables == ["stg"]
+
+    # (3) resolve FQNs -> OM ids and assert the final PUT /lineage payload
+    known = {
+        edge.from_fqn: "id-src",
+        edge.to_fqn: "id-result",
+        "keboola-stack.Acme_Project__42": "id-pipe",
+    }
+    req = to_add_lineage_request(edge, _resolver(known))
+    assert req is not None
+    details = req["edge"]["lineageDetails"]
+    assert req["edge"]["fromEntity"] == {"id": "id-src", "type": "table"}
+    assert req["edge"]["toEntity"] == {"id": "id-result", "type": "table"}
+    assert details["source"] == SOURCE_QUERY
+    assert details["tempLineageTables"] == ["stg"]
+    assert details["pipeline"] == {"id": "id-pipe", "type": "pipeline"}
+    to_cols = {c["toColumn"] for c in details["columnsLineage"]}
+    assert to_cols == {
+        "keboola-stack.Acme_Project.out_c-sales.result.id",
+        "keboola-stack.Acme_Project.out_c-sales.result.total",
+    }
+
+
 # --------------------------------------------------------------------------
 # Determinism: the column-lineage set feeds emitted output (PUT /lineage
 # payloads + warning logs); its iteration order must be a stable function of
@@ -310,9 +379,7 @@ def _emit_across_hash_seed(seed: int) -> str:
         """
     )
     env = dict(os.environ, PYTHONHASHSEED=str(seed), PYTHONPATH=src_dir)
-    proc = subprocess.run(
-        [sys.executable, "-c", script], capture_output=True, text=True, env=env, check=True
-    )
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, env=env, check=True)
     return proc.stdout.strip()
 
 
