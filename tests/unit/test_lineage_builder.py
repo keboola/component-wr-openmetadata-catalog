@@ -1,6 +1,13 @@
 import logging
+import os
+import subprocess
+import sys
+import textwrap
+from collections import defaultdict
+from pathlib import Path
 
 from lineage.column_lineage import ColumnEdge, LineageResult
+from mapping import fqn
 from mapping.lineage_builder import (
     SOURCE_PIPELINE,
     SOURCE_QUERY,
@@ -191,6 +198,132 @@ def test_column_edges_keep_fully_valid_edge_unchanged():
         "keboola-stack.Acme_Project.out_c-res.result.id",
         "keboola-stack.Acme_Project.out_c-res.result.total",
     }
+
+
+# --------------------------------------------------------------------------
+# Determinism: the column-lineage set feeds emitted output (PUT /lineage
+# payloads + warning logs); its iteration order must be a stable function of
+# the edge set, not Python's per-process string-hash randomization.
+# --------------------------------------------------------------------------
+
+
+def _emitted_pairs(edges):
+    return [(e.from_fqn, e.to_fqn) for e in edges]
+
+
+def test_column_edge_is_stably_sortable():
+    # ColumnEdge sorts by (from_table, from_column, to_table, to_column).
+    edges = [
+        ColumnEdge("b", "1", "z", "9"),
+        ColumnEdge("a", "2", "z", "9"),
+        ColumnEdge("a", "1", "z", "9"),
+        ColumnEdge("a", "1", "y", "9"),
+    ]
+    assert sorted(edges) == [
+        ColumnEdge("a", "1", "y", "9"),
+        ColumnEdge("a", "1", "z", "9"),
+        ColumnEdge("a", "2", "z", "9"),
+        ColumnEdge("b", "1", "z", "9"),
+    ]
+
+
+def test_column_edges_emission_order_equals_stable_sort():
+    # Several edges across several table-pairs, with several columns per pair.
+    result = LineageResult(
+        column_edges={
+            ColumnEdge("in.c-main.orders", "id", "out.c-res.result", "id"),
+            ColumnEdge("in.c-main.orders", "amount", "out.c-res.result", "total"),
+            ColumnEdge("in.c-main.orders", "qty", "out.c-res.summary", "q"),
+            ColumnEdge("in.c-ext.people", "name", "out.c-res.result", "who"),
+            ColumnEdge("in.c-ext.people", "age", "out.c-res.summary", "a"),
+        },
+    )
+    edges = column_edges(result, service_name=SVC, project=PROJ)
+
+    # Expected emission derived directly from the ColumnEdge stable-sort key:
+    # table-pairs in first-seen order, columnsLineage in the same order.
+    expected_pairs: list[tuple[str, str]] = []
+    expected_cols: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for ce in sorted(result.column_edges):
+        from_fqn = fqn.table_fqn_from_storage_id(SVC, PROJ, ce.from_table)
+        to_fqn = fqn.table_fqn_from_storage_id(SVC, PROJ, ce.to_table)
+        assert from_fqn and to_fqn  # all test storage ids resolve
+        pair = (from_fqn, to_fqn)
+        if pair not in expected_pairs:
+            expected_pairs.append(pair)
+        expected_cols[pair].append(fqn.column_fqn(to_fqn, ce.to_column))
+
+    assert _emitted_pairs(edges) == expected_pairs
+    for e in edges:
+        got = [c["toColumn"] for c in e.columns_lineage]
+        assert got == expected_cols[(e.from_fqn, e.to_fqn)]
+
+
+def test_column_edges_drop_warning_order_is_deterministic(caplog):
+    # Every mapping references a column absent from the (empty-stub) target set,
+    # so all are dropped with a "Dropping column-level mapping" warning. The
+    # warning sequence must follow the stable sort key, not hash order.
+    result = LineageResult(
+        column_edges={
+            ColumnEdge("in.c-main.orders", "id", "out.c-res.result", "gone_c"),
+            ColumnEdge("in.c-main.orders", "amount", "out.c-res.result", "gone_a"),
+            ColumnEdge("in.c-main.orders", "qty", "out.c-res.result", "gone_b"),
+        },
+    )
+    catalog = {
+        "keboola-stack.Acme_Project.in_c-main.orders": {"id", "amount", "qty"},
+        "keboola-stack.Acme_Project.out_c-res.result": {"real"},  # none of the targets exist
+    }
+    with caplog.at_level(logging.WARNING):
+        column_edges(result, service_name=SVC, project=PROJ, column_catalog=catalog)
+
+    drops = [r.getMessage() for r in caplog.records if "Dropping column-level mapping" in r.getMessage()]
+    assert len(drops) == 3
+    # The warnings appear in ColumnEdge stable-sort order (from_table constant,
+    # so by from_column here: amount < id < qty), which the source-column
+    # substring reflects — never in hash order.
+    from_cols_in_order = [m.split(".orders.")[1].split(" ")[0] for m in drops]
+    assert from_cols_in_order == ["amount", "id", "qty"]
+
+
+def _emit_across_hash_seed(seed: int) -> str:
+    """Run the column-lineage emission in a fresh interpreter under a fixed
+    PYTHONHASHSEED and return its serialized emitted order."""
+    src_dir = str(Path(__file__).resolve().parents[2] / "src")
+    script = textwrap.dedent(
+        """
+        import json
+        from lineage.column_lineage import ColumnEdge, LineageResult
+        from mapping.lineage_builder import column_edges
+
+        result = LineageResult(column_edges={
+            ColumnEdge("in.c-main.orders", "id", "out.c-res.result", "id"),
+            ColumnEdge("in.c-main.orders", "amount", "out.c-res.result", "total"),
+            ColumnEdge("in.c-main.orders", "qty", "out.c-res.summary", "q"),
+            ColumnEdge("in.c-ext.people", "name", "out.c-res.result", "who"),
+            ColumnEdge("in.c-ext.people", "age", "out.c-res.summary", "a"),
+            ColumnEdge("in.c-ext.people", "city", "out.c-res.summary", "c"),
+        })
+        edges = column_edges(result, service_name="keboola-stack", project="Acme_Project")
+        out = [(e.from_fqn, e.to_fqn, [c["toColumn"] for c in e.columns_lineage]) for e in edges]
+        print(json.dumps(out))
+        """
+    )
+    env = dict(os.environ, PYTHONHASHSEED=str(seed), PYTHONPATH=src_dir)
+    proc = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, env=env, check=True
+    )
+    return proc.stdout.strip()
+
+
+def test_column_edges_order_is_hash_seed_independent():
+    # The recorder's finding, reproduced across processes: without the stable
+    # sort the emitted order differs between hash seeds; with it, it is identical.
+    out_seed_1 = _emit_across_hash_seed(1)
+    out_seed_2 = _emit_across_hash_seed(2)
+    out_seed_3 = _emit_across_hash_seed(42)
+    assert out_seed_1  # non-empty guard
+    assert out_seed_1 == out_seed_2 == out_seed_3
 
 
 def test_to_add_lineage_request_drops_id_level_self_loop(caplog):

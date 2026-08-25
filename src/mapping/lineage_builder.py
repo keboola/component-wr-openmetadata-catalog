@@ -198,7 +198,11 @@ def column_edges(
     """
     grouped: dict[tuple[str, str], list[dict]] = defaultdict(list)
     seen_pairs: set[tuple[str, str]] = set()
-    for edge in result.column_edges:
+    # ``column_edges`` is a set; iterate it in stable ColumnEdge sort order so the
+    # emitted PUT /lineage payloads (edge order, columnsLineage order) and the
+    # "Dropping column-level mapping" warning order are deterministic run-to-run,
+    # matching the already-sorted omit path in _table_level_fallbacks.
+    for edge in sorted(result.column_edges):
         from_tbl_fqn = fqn.table_fqn_from_storage_id(service_name, project, edge.from_table)
         to_tbl_fqn = fqn.table_fqn_from_storage_id(service_name, project, edge.to_table)
         if not from_tbl_fqn or not to_tbl_fqn:

@@ -26,8 +26,13 @@ from lineage.resolution import CoverageMetrics, Resolution
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, order=True)
 class ColumnEdge:
+    # ``order=True`` makes edges deterministically sortable by
+    # (from_table, from_column, to_table, to_column) — the stable key used
+    # wherever the (unordered) ``column_edges`` set feeds emitted output/logs,
+    # so PUT /lineage payloads and warning order no longer depend on Python's
+    # per-process string-hash randomization.
     from_table: str
     from_column: str
     to_table: str
@@ -223,12 +228,16 @@ def _resolve_to_storage(
 ) -> None:
     """Resolve workspace edges to storage-to-storage edges, chaining intermediates."""
     # --- table edges: transitive reachability input -> ... -> output ---------
+    # Every iteration below is over a sorted view of an otherwise-unordered set,
+    # so the whole resolution pass (and thus emitted edge/temp-table membership
+    # and order) is stable given the same input, independent of hash seeding.
     succ: dict[str, set[str]] = defaultdict(set)
-    for s, t in graph.table_edges:
+    for s, t in sorted(graph.table_edges):
         if t:
             succ[s].add(t)
 
-    for start in list(succ.keys()) + [t for edges in succ.values() for t in edges]:
+    starts = sorted(set(succ.keys()) | {t for targets in succ.values() for t in targets})
+    for start in starts:
         sid, skind = _classify(start, in_map, out_map)
         if skind != "input":
             continue
@@ -239,13 +248,13 @@ def _resolve_to_storage(
 
     # --- column edges: chain (table,col) nodes from output back to input ------
     col_succ: dict[tuple[str, str], set[tuple[str, str]]] = defaultdict(set)
-    for s_tbl, s_col, t_tbl, t_col in graph.col_edges:
+    for s_tbl, s_col, t_tbl, t_col in sorted(graph.col_edges):
         if t_tbl:
             col_succ[(s_tbl, s_col)].add((t_tbl, t_col))
 
     for (s_tbl, s_col), targets in col_succ.items():
         s_id, s_kind = _classify(s_tbl, in_map, out_map)
-        for t_tbl, t_col in targets:
+        for t_tbl, t_col in sorted(targets):
             t_id, t_kind = _classify(t_tbl, in_map, out_map)
             if s_kind == "input" and t_kind == "output":
                 _add_column_edge(result, s_id, s_col, t_id, t_col)
@@ -255,11 +264,11 @@ def _resolve_to_storage(
         s_id, s_kind = _classify(s_tbl, in_map, out_map)
         if s_kind != "input":
             continue
-        for mid_tbl, mid_col in targets:
+        for mid_tbl, mid_col in sorted(targets):
             _, mid_kind = _classify(mid_tbl, in_map, out_map)
             if mid_kind != "intermediate":
                 continue
-            for out_tbl, out_col in col_succ.get((mid_tbl, mid_col), set()):
+            for out_tbl, out_col in sorted(col_succ.get((mid_tbl, mid_col), set())):
                 out_id, out_kind = _classify(out_tbl, in_map, out_map)
                 if out_kind == "output" and s_id != out_id:
                     _add_column_edge(result, s_id, s_col, out_id, out_col)
@@ -281,7 +290,7 @@ def _reachable_outputs(
         if node in visited:
             continue
         visited.add(node)
-        for nxt in succ.get(node, ()):
+        for nxt in sorted(succ.get(node, ())):
             _, kind = _classify(nxt, in_map, out_map)
             if kind == "output":
                 results.append((nxt, mids))
