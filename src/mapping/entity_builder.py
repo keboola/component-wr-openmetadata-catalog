@@ -191,7 +191,7 @@ class EntityBuilder:
         if len(parts) < 3:
             return None
         source_bucket_path = ".".join(parts[:2])
-        source_table_name = parts[2]
+        source_table_name = ".".join(parts[2:])
         project_info = source.get("project") or {}
         source_project = project_info.get("name") or self.project
         return fqn.table_fqn(self.service_name, source_project, source_bucket_path, source_table_name)
