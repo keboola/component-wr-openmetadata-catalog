@@ -1,10 +1,11 @@
 """Run report + snapshot output tables (spec 2.6 / 6.4, T17).
 
 ``catalog_run_report`` records one row per entity action this run (the coverage
-and drift signal). It carries an authoritative ``schema`` manifest when the
-``KBC_DATA_TYPE_SUPPORT`` gate is on, and falls back to the legacy
-``columns`` + ``column_metadata`` format when the var is absent/None (before the
-portal ``dataTypeSupport=authoritative`` switch is flipped).
+and drift signal). Its output manifest always carries an authoritative ``schema``
+(native column types) — there is no legacy ``columns`` fallback. When the
+project's Developer-Portal ``dataTypeSupport`` is not ``authoritative``, the
+platform simply degrades those declared types to hints; the component still emits
+the same authoritative manifest either way.
 """
 
 from __future__ import annotations
@@ -93,11 +94,6 @@ class RunReport:
 
     def has_failures(self) -> bool:
         return any(row["action"] == ACTION_FAILED for row in self._rows)
-
-
-def uses_authoritative_manifest(kbc_data_type_support: str | None) -> bool:
-    """Authoritative ``schema`` only when the gate var is present (not None)."""
-    return kbc_data_type_support is not None
 
 
 def report_schema() -> list[dict]:

@@ -231,10 +231,22 @@ def test_typed_column_datatypedisplay_case_only_is_skipped_unchanged():
 def test_deduped_suffixed_column_unchanged_is_skipped_unchanged():
     # (a) A disambiguated ``name_2`` column (name != displayName) round-trips equal.
     cols = [
-        {"name": "a_b", "displayName": "a.b", "dataType": "VARCHAR", "dataTypeDisplay": "VARCHAR(50)",
-         "dataLength": 50, "ordinalPosition": 1},
-        {"name": "a_b_2", "displayName": "a_b", "dataType": "VARCHAR", "dataTypeDisplay": "VARCHAR(50)",
-         "dataLength": 50, "ordinalPosition": 2},
+        {
+            "name": "a_b",
+            "displayName": "a.b",
+            "dataType": "VARCHAR",
+            "dataTypeDisplay": "VARCHAR(50)",
+            "dataLength": 50,
+            "ordinalPosition": 1,
+        },
+        {
+            "name": "a_b_2",
+            "displayName": "a_b",
+            "dataType": "VARCHAR",
+            "dataTypeDisplay": "VARCHAR(50)",
+            "dataLength": 50,
+            "ordinalPosition": 2,
+        },
     ]
     d = _merge(TWM, {"columns": cols}, {"columns": _om_readback(cols)}, {"columns": cols}, owned=("columns",))
     assert d.action == ACTION_SKIPPED_UNCHANGED
@@ -244,10 +256,22 @@ def test_deduped_suffixed_column_unchanged_is_skipped_unchanged():
 def test_deduped_suffixed_column_changed_attr_diverges():
     # A genuine owned change on the deduped column (dataLength) still diverges.
     cols = [
-        {"name": "a_b", "displayName": "a.b", "dataType": "VARCHAR", "dataTypeDisplay": "VARCHAR(50)",
-         "dataLength": 50, "ordinalPosition": 1},
-        {"name": "a_b_2", "displayName": "a_b", "dataType": "VARCHAR", "dataTypeDisplay": "VARCHAR(50)",
-         "dataLength": 50, "ordinalPosition": 2},
+        {
+            "name": "a_b",
+            "displayName": "a.b",
+            "dataType": "VARCHAR",
+            "dataTypeDisplay": "VARCHAR(50)",
+            "dataLength": 50,
+            "ordinalPosition": 1,
+        },
+        {
+            "name": "a_b_2",
+            "displayName": "a_b",
+            "dataType": "VARCHAR",
+            "dataTypeDisplay": "VARCHAR(50)",
+            "dataLength": 50,
+            "ordinalPosition": 2,
+        },
     ]
     current = _om_readback(cols)
     current[1]["dataLength"] = 200  # curator widened the deduped column
@@ -259,8 +283,15 @@ def test_deduped_suffixed_column_changed_attr_diverges():
 
 def test_array_column_unchanged_is_skipped_unchanged():
     # (b) An ARRAY column with arrayDataType round-trips equal (dataTypeDisplay case folded).
-    cols = [{"name": "tags", "dataType": "ARRAY", "arrayDataType": "STRING",
-             "dataTypeDisplay": "ARRAY", "ordinalPosition": 1}]
+    cols = [
+        {
+            "name": "tags",
+            "dataType": "ARRAY",
+            "arrayDataType": "STRING",
+            "dataTypeDisplay": "ARRAY",
+            "ordinalPosition": 1,
+        }
+    ]
     d = _merge(TWM, {"columns": cols}, {"columns": _om_readback(cols)}, {"columns": cols}, owned=("columns",))
     assert d.action == ACTION_SKIPPED_UNCHANGED
     assert d.diverged_fields == []
@@ -268,8 +299,15 @@ def test_array_column_unchanged_is_skipped_unchanged():
 
 def test_array_column_changed_arraydatatype_diverges():
     # A genuine owned change on the ARRAY sub-type still diverges.
-    cols = [{"name": "tags", "dataType": "ARRAY", "arrayDataType": "STRING",
-             "dataTypeDisplay": "ARRAY", "ordinalPosition": 1}]
+    cols = [
+        {
+            "name": "tags",
+            "dataType": "ARRAY",
+            "arrayDataType": "STRING",
+            "dataTypeDisplay": "ARRAY",
+            "ordinalPosition": 1,
+        }
+    ]
     current = _om_readback(cols)
     current[0]["arrayDataType"] = "BIGINT"  # curator changed the element type
     d = _merge(TWM, {"columns": cols}, {"columns": current}, {"columns": [dict(cols[0])]}, owned=("columns",))

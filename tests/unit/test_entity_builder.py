@@ -107,8 +107,7 @@ def test_colliding_sanitized_column_names_are_disambiguated(caplog):
     assert cols[0]["dataTypeDisplay"] == cols[1]["dataTypeDisplay"] == "VARCHAR(50)"
     # a warning naming the table + the collided name is logged
     assert any(
-        "contacts" in r.getMessage() and "properties_hs_migration_soft_delete" in r.getMessage()
-        for r in caplog.records
+        "contacts" in r.getMessage() and "properties_hs_migration_soft_delete" in r.getMessage() for r in caplog.records
     )
 
 

@@ -21,9 +21,10 @@ from keboola.component.exceptions import UserException
 
 import component as component_mod
 import report as report_mod
+from client.om_client import OMClient, OMNotFound
 from client.storage_reader import SourceBucket, SourceColumn, SourceTable
 from component import ProjectContext, _ProjectRun
-from configuration import FailureMode, MergeMode
+from configuration import Configuration, FailureMode, MergeMode
 from mapping import fqn as fqn_mod
 from mapping.entity_builder import EntityBuilder
 from mapping.pipeline_builder import PipelineBuilder
@@ -73,8 +74,12 @@ class FakeOM:
     def __init__(self, *a, fail_tables=False, **k):
         self.is_2_0_or_newer = False
         self.fail_tables = fail_tables
+        # Mirror the real client's contract: probe_version() records server_version,
+        # which run() reads back (so om_version_override can override it).
+        self.server_version = "1.13.4"
 
     def probe_version(self):
+        self.server_version = "1.13.4"
         return {"version": "1.13.4", "revision": "r", "timestamp": 1}
 
     def verify_auth(self):
@@ -352,3 +357,83 @@ def test_incremental_skip_is_tombstone_safe_and_writes_nothing():
 
     # 4) advance-after-success: the stored digest is untouched (no write happened).
     assert state.bucket_digest(pid, bucket.id) == digest
+
+
+# ------------------------------------------ IMPORTANT 1: pipeline-status is best-effort
+
+
+class _StatusJobReader:
+    """Fake JobQueueReader that yields a summarizable run for the status push."""
+
+    def __init__(self, *a, **k):
+        pass
+
+    def get_lineage_events(self, job_id):
+        return [{"id": job_id}]
+
+    @staticmethod
+    def summarize_run(events):
+        return SimpleNamespace(to_status_body=lambda: {"pipelineStatus": "Successful"})
+
+
+def test_pipeline_status_404_is_recorded_not_fatal(monkeypatch):
+    """put_pipeline_status on a non-existent FQN raises OMNotFound (an OMClientError,
+    NOT a UserException). _push_pipeline_status must swallow it — record a failed row
+    and continue — instead of letting it propagate to sys.exit(2)."""
+
+    class _NotFoundOM(FakeOM):
+        def put_pipeline_status(self, *a):
+            raise OMNotFound("Not found: PUT /pipelines/svc.P.pipeline.cfg1/status")
+
+    monkeypatch.setattr(component_mod, "JobQueueReader", _StatusJobReader)
+    om = _NotFoundOM()
+    run = _ProjectRun(
+        ctx=ProjectContext(project_id="777", project_name="P", storage_token="t", storage_url="https://s"),
+        reader=OneBucketStorage(),  # ty: ignore[invalid-argument-type]  (duck-typed test double)
+        entities=EntityBuilder("svc", "P", "777", "https://ui"),
+        pipelines=PipelineBuilder("svc", "P", "777", "https://ui"),
+    )
+    report = component_mod.RunReport(run_id="rid")
+    cfg = {"id": "cfg1", "configuration": {"_lastJobId": "999"}}
+    env = {"url": "https://connection.keboola.com"}
+
+    comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
+
+    # Pre-fix this call re-raises OMNotFound (only UserException was caught) -> exit 2.
+    comp._push_pipeline_status(run, "svc.P.pipeline.cfg1", cfg, env, om, report)
+
+    failed = [r for r in report.rows() if r["action"] == report_mod.ACTION_FAILED]
+    assert len(failed) == 1
+    assert failed[0]["entity_type"] == "Pipeline"
+    assert failed[0]["entity_fqn"] == "svc.P.pipeline.cfg1"
+    assert "pipeline status" in failed[0]["detail"]
+
+
+# ----------------------------------------- IMPORTANT 3: om_version_override drives the gate
+
+
+def _config_with(**extra) -> Configuration:
+    return Configuration(**{"om_host": "https://om.example.com", "#bot_token": "t", **extra})
+
+
+def test_om_version_override_drives_2_0_gate():
+    """With om_version_override set, the is_2_0_or_newer gate follows the override,
+    not the probed /system/version value."""
+    om = OMClient("https://om.example.com", "tok")
+    om.server_version = "1.13.4"  # as if just probed
+    assert om.is_2_0_or_newer is False
+
+    component_mod.Component._apply_version_override(_config_with(om_version_override="2.1.0"), om)
+
+    assert om.server_version == "2.1.0"
+    assert om.is_2_0_or_newer is True  # the gate now follows the override
+
+
+def test_om_version_override_absent_keeps_probe():
+    om = OMClient("https://om.example.com", "tok")
+    om.server_version = "1.13.4"  # as if just probed
+
+    component_mod.Component._apply_version_override(_config_with(), om)
+
+    assert om.server_version == "1.13.4"  # untouched
+    assert om.is_2_0_or_newer is False

@@ -158,14 +158,17 @@ class StorageReader:
         Returns ``[]`` if the table does not exist yet (first run) or on any
         read error — the merge base is then rebuilt on the next full refresh.
 
-        Limitation: ``data-preview`` is a *row-capped* endpoint. We request an
-        explicit high ``limit``, but for very large catalogs (5k+ tables) the
-        server may still return fewer rows than the snapshot holds. When the
-        response fills the requested ``limit`` the merge base is likely
-        truncated, so changed fields on entities beyond the cap silently stop
-        propagating (those entities fail *safe* to ``skipped_diverged`` and are
-        never clobbered). A truncated read emits a ``logger.warning``. The
-        durable fix is an async full-table export, which is out of scope here.
+        Limitation: ``data-preview`` is a *row-capped* endpoint that caps rows
+        server-side, *below* the requested ``limit``, so a hit on the requested
+        ``limit`` never fires. For very large catalogs (5k+ tables) it can return
+        fewer rows than the snapshot actually holds. Truncation is therefore
+        detected against the table's own server-side ``rowsCount`` (not the
+        requested ``limit``): when fewer rows come back than the table reports, the
+        merge base is truncated, so changed fields on entities beyond the cap
+        silently stop propagating (those entities fail *safe* to
+        ``skipped_diverged`` and are never clobbered). A truncated read emits a
+        ``logger.warning``; the durable fix is an async full-table export, which is
+        out of scope here.
         """
         url = f"{self.base_url}/v2/storage/tables/{table_id}/data-preview"
         try:
@@ -175,15 +178,39 @@ class StorageReader:
             rows = list(csv.DictReader(io.StringIO(response.text)))
         except requests.RequestException, csv.Error:
             return []
-        if len(rows) >= limit:
+        total = self._table_rows_count(table_id)
+        if total is not None and len(rows) < total:
             logger.warning(
-                "Snapshot merge base for '%s' hit the data-preview row cap (%d rows); the merge "
-                "base is likely truncated and updates to existing entities may be skipped for this "
-                "run. This affects large catalogs (5k+ tables).",
+                "Snapshot merge base for '%s' is truncated: data-preview returned %d of %d rows "
+                "(server-side row cap); updates to existing entities beyond the cap may be skipped "
+                "for this run. This affects large catalogs (5k+ tables).",
                 table_id,
-                limit,
+                len(rows),
+                total,
             )
         return rows
+
+    def _table_rows_count(self, table_id: str) -> int | None:
+        """Best-effort server-side ``rowsCount`` for a table (truncation detection).
+
+        Returns ``None`` on any read error so snapshot reading never fails just
+        because the row count could not be fetched.
+        """
+        try:
+            response = self.session.get(f"{self.base_url}/v2/storage/tables/{table_id}", timeout=self.timeout)
+            if response.status_code >= 400:
+                return None
+            data = response.json()
+        except requests.RequestException, ValueError:
+            return None
+        count = data.get("rowsCount") if isinstance(data, dict) else None
+        if isinstance(count, bool):  # bool subclasses int; a JSON boolean is not a row count
+            return None
+        if isinstance(count, int):
+            return count
+        if isinstance(count, str) and count.isdigit():
+            return int(count)
+        return None
 
     # ------------------------------------------------------------ connection
 

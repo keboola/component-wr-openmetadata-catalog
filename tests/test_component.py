@@ -146,9 +146,11 @@ def test_second_run_loads_base_and_updates_changed_owned_field(tmp_path, monkeyp
     class StatefulOM:
         def __init__(self, *a, **k):
             self.is_2_0_or_newer = False
+            self.server_version: str | None = None
             self._last: tuple[str, str] | None = None
 
         def probe_version(self):
+            self.server_version = "1.13.4"
             return {"version": "1.13.4", "revision": "r", "timestamp": 1}
 
         def get_by_fqn(self, kind, fqn, fields=None):

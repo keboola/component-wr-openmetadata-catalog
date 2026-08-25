@@ -17,7 +17,6 @@ dependencies = [
 dev = [
     "freezegun>=1.5.1",
     "keboola.datadirtest>=2.2.0",
-    "mock>=5.2.0",
     "pre-commit>=4.5.0",
     "pytest>=9.0.2",
     "ruff>=0.16.0",

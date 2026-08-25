@@ -94,7 +94,6 @@ class Configuration(BaseModel):
     write_pipeline_status: bool = True
     full_refresh: bool = False
     om_version_override: str | None = None
-    debug: bool = False
 
     # --- SSH (root) ---
     use_ssh_tunnel: bool = False

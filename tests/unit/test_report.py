@@ -7,7 +7,6 @@ from report import (
     RunReport,
     report_schema,
     snapshot_rows,
-    uses_authoritative_manifest,
 )
 
 
@@ -44,12 +43,6 @@ def test_no_failures_when_none_recorded():
     report = RunReport(run_id="r")
     report.record(project_id="p", entity_type="Table", entity_fqn="c", action=ACTION_CREATED)
     assert report.has_failures() is False
-
-
-def test_authoritative_manifest_gate():
-    assert uses_authoritative_manifest("authoritative") is True
-    assert uses_authoritative_manifest("none") is True
-    assert uses_authoritative_manifest(None) is False  # gate off -> legacy manifest
 
 
 def test_report_schema_native_types():

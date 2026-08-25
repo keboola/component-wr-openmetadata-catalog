@@ -127,9 +127,7 @@ def test_minted_token_driven_bucket_list_is_non_empty():
 
     manage_session = mock.Mock()
     manage_session.request.side_effect = backend.manage_request
-    manage_client = ManageClient(
-        "https://connection.keboola.com", "manage-tok", session=manage_session, backoff_base=0
-    )
+    manage_client = ManageClient("https://connection.keboola.com", "manage-tok", session=manage_session, backoff_base=0)
 
     minted = manage_client.enumerate_and_mint(organization_id="99")
     assert [m.project_id for m in minted] == ["1"]

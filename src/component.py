@@ -28,7 +28,7 @@ import report as report_mod
 from client import ssh_proxy
 from client.job_queue_reader import JobQueueReader
 from client.manage_client import ManageClient, ManageScopeError
-from client.om_client import OMAuthError, OMClient, OMPreconditionFailed
+from client.om_client import OMAuthError, OMClient, OMClientError, OMPreconditionFailed
 from client.storage_reader import SourceBucket, SourceTable, StorageReader, resolve_storage_credentials
 from configuration import BranchFilter, Configuration, FailureMode, ProjectScope, Stage
 from lineage.column_lineage import extract_column_lineage
@@ -265,7 +265,9 @@ class Component(ComponentBase):
         proxy = ssh_proxy.maybe_open_tunnel(config)
         try:
             om = self._build_om_client(config, proxy)
-            server_version = om.probe_version().get("version")
+            om.probe_version()
+            self._apply_version_override(config, om)
+            server_version = om.server_version
             version_changed = state.om_version_seen not in (None, server_version)
             snapshot = self._load_snapshot(config, env, projects, state)
             if degraded_reason:
@@ -309,7 +311,6 @@ class Component(ComponentBase):
             "project_name": os.environ.get("KBC_PROJECTNAME"),
             "run_id": os.environ.get("KBC_RUNID") or "local",
             "config_row_id": os.environ.get("KBC_CONFIGROWID"),
-            "data_type_support": os.environ.get("KBC_DATA_TYPE_SUPPORT"),
         }
 
     @staticmethod
@@ -320,6 +321,17 @@ class Component(ComponentBase):
         host = proxy.local_om_host if proxy and proxy.local_om_host else config.om_host
         verify_ssl = proxy is None  # a loopback tunnel terminates TLS at the bastion
         return OMClient(host, config.bot_token, verify_ssl=verify_ssl)
+
+    @staticmethod
+    def _apply_version_override(config: Configuration, om: OMClient) -> None:
+        """Break-glass: force the server version used for the ``is_2_0_or_newer`` gate.
+
+        Called right after ``om.probe_version()`` so the optional ``om_version_override``
+        wins over the auto-probed ``/system/version`` value. Normally unset; useful when
+        the probe reports a version whose gated 2.0 surface must be forced on/off.
+        """
+        if config.om_version_override:
+            om.server_version = config.om_version_override
 
     # ------------------------------------------------------ project resolve
 
@@ -590,8 +602,23 @@ class Component(ComponentBase):
             record = JobQueueReader.summarize_run(events)
             if record is not None:
                 om.put_pipeline_status(pipeline_fqn, record.to_status_body())
-        except UserException as exc:
+        except OMAuthError:
+            # Auth stays fatal, consistent with the per-entity write paths (_upsert /
+            # _put_lineage) — an invalid #bot_token must fail the run, not be swallowed.
+            raise
+        except (UserException, OMClientError) as exc:
+            # ``put_pipeline_status`` -> ``_request`` raises OMNotFound/OMClientError (NOT
+            # UserException) on a 404/other 4xx-5xx — e.g. a status PUT to a pipeline whose
+            # upsert failed. This is a best-effort push (like _put_lineage / _tombstone_schema):
+            # record the failure and continue rather than propagating an uncaught exit-2.
             logger.warning("Pipeline status skipped for %s: %s", pipeline_fqn, exc)
+            report.record(
+                project_id=run.ctx.project_id,
+                entity_type="Pipeline",
+                entity_fqn=pipeline_fqn,
+                action=report_mod.ACTION_FAILED,
+                detail=f"pipeline status: {exc}",
+            )
 
     def _lineage_pass(self, config: Configuration, om: OMClient, run: _ProjectRun, report: RunReport) -> None:
         edges: list[lineage_builder.LineageEdge] = []
@@ -871,7 +898,9 @@ class Component(ComponentBase):
         env = self._read_environment()
         om = OMClient(config.om_host, config.bot_token)
         try:
-            version = om.probe_version().get("version")
+            om.probe_version()
+            self._apply_version_override(config, om)
+            version = om.server_version
             # /system/version is unauthenticated (OM JwtFilter.EXCLUDED_ENDPOINTS),
             # so it only checks reachability. Follow with an authenticated call so an
             # invalid/expired #bot_token is surfaced here instead of only at run time.

@@ -146,27 +146,40 @@ class CsvResponse:
         self.text = text
 
 
-def _snapshot_reader(csv_text):
+def _snapshot_reader(csv_text, *, rows_count=None):
+    """Route the data-preview GET -> CSV rows and the table-detail GET -> rowsCount.
+
+    ``rows_count=None`` makes the table-detail read return no count (truncation
+    undetectable), mirroring a table object that omits ``rowsCount``.
+    """
     session = mock.Mock()
-    session.get.return_value = CsvResponse(csv_text)
+
+    def _get(url, params=None, timeout=None):
+        if "data-preview" in url:
+            return CsvResponse(csv_text)
+        return FakeResponse(200, {"rowsCount": rows_count} if rows_count is not None else {})
+
+    session.get.side_effect = _get
     return StorageReader("https://connection.keboola.com", "tok", session=session)
 
 
-def test_read_snapshot_rows_warns_when_data_preview_row_cap_hit(caplog):
-    """When the returned row count hits the requested limit the merge base is
-    likely truncated, so a clear warning is emitted (mitigation, not a fix)."""
-    csv_text = "kind,fqn\na,1\nb,2\n"  # 2 data rows; request limit=2 -> cap hit
-    reader = _snapshot_reader(csv_text)
+def test_read_snapshot_rows_warns_when_truncated(caplog):
+    """Fewer rows than the table's server-side ``rowsCount`` -> the data-preview row
+    cap truncated the merge base (independent of the requested limit) -> warn."""
+    csv_text = "kind,fqn\na,1\nb,2\n"  # data-preview returns 2 rows...
+    reader = _snapshot_reader(csv_text, rows_count=5)  # ...but the table holds 5
     with caplog.at_level("WARNING"):
-        rows = reader.read_snapshot_rows("in.c-x.snapshot", limit=2)
+        rows = reader.read_snapshot_rows("in.c-x.last_written_snapshot")  # default 1M limit
     assert len(rows) == 2
-    assert any("truncated" in r.message.lower() or "row cap" in r.message.lower() for r in caplog.records)
+    assert any("truncat" in r.message.lower() for r in caplog.records)
 
 
-def test_read_snapshot_rows_no_warning_below_cap(caplog):
-    csv_text = "kind,fqn\na,1\n"  # 1 data row, well under the limit
-    reader = _snapshot_reader(csv_text)
+def test_read_snapshot_rows_no_warning_on_full_read(caplog):
+    """Returned rows == rowsCount -> full read -> no warning, even though the count is
+    far below the requested 1M limit (the old ``len(rows) >= limit`` check never fired)."""
+    csv_text = "kind,fqn\na,1\nb,2\n"  # 2 rows returned, 2 rows total
+    reader = _snapshot_reader(csv_text, rows_count=2)
     with caplog.at_level("WARNING"):
-        rows = reader.read_snapshot_rows("in.c-x.snapshot", limit=1000)
-    assert len(rows) == 1
+        rows = reader.read_snapshot_rows("in.c-x.last_written_snapshot")
+    assert len(rows) == 2
     assert caplog.records == []
