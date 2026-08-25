@@ -2,10 +2,17 @@
 
 With a ``#manage_token`` (super/application token carrying
 ``manage:storage-tokens``) this enumerates the organisation's projects and
-mints a short-lived read-only Storage token per project — "one credential ->
-all projects". This is an org-wide blast-radius credential, so the exact
-project list is logged every run and only short-lived read-only tokens are
-minted; the manage token is never used to read data.
+mints a short-lived Storage token per project — "one credential -> all
+projects". This is an org-wide blast-radius credential, so the exact project
+list is logged every run and only short-lived tokens are minted; the manage
+token is never used to read data.
+
+Each minted token carries ``canManageBuckets`` because that is the only lever
+the Keboola token model offers to make *all* of a project's buckets visible to
+a freshly minted token (there is no read-only "all buckets" flag). That grant
+also permits bucket write/create/delete — over-privileged for a read-only
+cataloguer — so its blast radius is bounded by a short ``expiresIn`` and by
+withholding file-staging and trash-purge access. See ``mint_storage_token``.
 
 A scope/permission failure raises :class:`ManageScopeError` (a *degrade* signal)
 rather than a hard config error, so the orchestrator can fall back to Tier-1.
@@ -100,10 +107,33 @@ class ManageClient:
         return projects
 
     def mint_storage_token(self, project_id: str, project_name: str) -> MintedProject:
+        # ``canManageBuckets: True`` is required for the cataloguer to see the
+        # project's buckets AT ALL. This is a Keboola token-model limitation, not
+        # a design choice (see the create-token spec, kbc-manage-api-php-client
+        # apiary.apib "Create Storage Token in Project"):
+        #   * There is NO read-only "all buckets" flag. The only lever that grants
+        #     a freshly minted token visibility of every bucket is
+        #     ``canManageBuckets`` ("full permissions on tabular storage").
+        #   * The precise-scope alternative, ``bucketPermissions: {<id>: read}``,
+        #     needs the bucket IDs enumerated up front — but the Management API has
+        #     no bucket-list endpoint, and listing via the Storage API
+        #     ``GET /v2/storage/buckets`` returns 0 buckets for a token that lacks
+        #     bucket access. So enumerating buckets itself would require a
+        #     ``canManageBuckets`` bootstrap token: no net least-privilege gain,
+        #     just more moving parts.
+        # VERIFIED against the real Management API: a token minted with
+        # ``canManageBuckets: False`` yields ``bucketPermissions: {}`` and lists 0
+        # buckets, so Tier-2 catalogs nothing. ``canManageBuckets: True`` lists all
+        # buckets. MAINTAINER CAVEAT: this also permits bucket create/delete/write
+        # — over-privileged for a read-only cataloguer. A tighter read-only mint
+        # would need a Keboola feature that does not exist today (a read-all-buckets
+        # token flag, or a Management API bucket-list endpoint to drive per-bucket
+        # ``read`` grants). The blast radius is bounded by a short ``expiresIn`` and
+        # by never granting file-staging or trash-purge access.
         body = {
-            "description": "keboola.wr-openmetadata-catalog read-only (auto)",
+            "description": "keboola.wr-openmetadata-catalog catalog (auto, short-lived)",
             "canReadAllFileUploads": False,
-            "canManageBuckets": False,
+            "canManageBuckets": True,
             "expiresIn": _MINTED_TOKEN_EXPIRES_SECONDS,
         }
         result = self._request("POST", f"/manage/projects/{project_id}/tokens", json_body=body)
