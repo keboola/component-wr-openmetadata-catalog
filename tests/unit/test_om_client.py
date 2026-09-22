@@ -216,7 +216,10 @@ def test_find_user_id_by_email_matches_exact_email():
     method, url = session.request.call_args[0]
     assert method == "GET"
     assert url.endswith("/api/v1/search/query")
-    assert session.request.call_args.kwargs["params"]["index"] == "user_search_index"
+    params = session.request.call_args.kwargs["params"]
+    assert params["index"] == "user_search_index"
+    # field-qualified query: a plain full-email q does not match in ES (verified live)
+    assert params["q"] == 'email:"jakub.smagin@keboola.com"'
 
 
 def test_find_user_id_by_email_none_when_no_exact_match():

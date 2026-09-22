@@ -263,10 +263,14 @@ class OMClient:
         the email). Auth failures stay fatal, consistent with the write paths.
         """
         try:
+            # Field-qualified query: a plain full-email ``q`` does not match, because
+            # the search analyzer tokenizes the address and the default fields never
+            # hold it whole. ``email:"..."`` matches on the email field; the exact
+            # post-filter below still guards against a partial/near match.
             response = self._request(
                 "GET",
                 "/search/query",
-                params={"q": email, "index": "user_search_index", "from": 0, "size": 10},
+                params={"q": f'email:"{email}"', "index": "user_search_index", "from": 0, "size": 10},
             )
             hits = ((response.json() or {}).get("hits") or {}).get("hits") or []
         except OMAuthError:
