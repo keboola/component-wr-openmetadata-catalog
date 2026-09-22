@@ -10,10 +10,12 @@ from lineage.column_lineage import ColumnEdge, LineageResult, extract_column_lin
 from lineage.dialect import dialect_for
 from mapping import fqn
 from mapping.lineage_builder import (
+    SOURCE_DASHBOARD,
     SOURCE_PIPELINE,
     SOURCE_QUERY,
     SOURCE_VIEW,
     column_edges,
+    data_app_edges,
     declared_edges,
     to_add_lineage_request,
     view_edge,
@@ -65,6 +67,53 @@ def test_edge_skipped_when_entity_missing():
     assert edge.source == SOURCE_VIEW
     # target entity not in OM yet -> resolver returns None -> edge skipped, never a dangling ref
     assert to_add_lineage_request(edge, _resolver({"keboola-stack.P.b.base": "id-base"})) is None
+
+
+DASH_FQN = "keboola-stack.Acme_Project__01app"
+
+
+def test_data_app_edges_from_input_tables_target_the_dashboard():
+    storage = {"input": {"tables": [{"source": "in.c-main.a"}, {"source": "in.c-main.b"}]}}
+    edges = data_app_edges(storage, service_name=SVC, project=PROJ, dashboard_fqn=DASH_FQN)
+    assert len(edges) == 2
+    assert all(e.source == SOURCE_DASHBOARD for e in edges)
+    assert all(e.to_type == "dashboard" and e.to_fqn == DASH_FQN for e in edges)
+    assert all(e.from_type == "table" for e in edges)
+    assert {e.from_fqn for e in edges} == {
+        "keboola-stack.Acme_Project.in_c-main.a",
+        "keboola-stack.Acme_Project.in_c-main.b",
+    }
+
+
+def test_data_app_edges_dedup_same_source():
+    storage = {"input": {"tables": [{"source": "in.c-main.a", "destination": "x.csv"}, {"source": "in.c-main.a"}]}}
+    edges = data_app_edges(storage, service_name=SVC, project=PROJ, dashboard_fqn=DASH_FQN)
+    assert len(edges) == 1
+
+
+def test_data_app_edges_empty_without_input():
+    assert data_app_edges({}, service_name=SVC, project=PROJ, dashboard_fqn=DASH_FQN) == []
+    assert data_app_edges({"input": {"tables": []}}, service_name=SVC, project=PROJ, dashboard_fqn=DASH_FQN) == []
+
+
+def test_data_app_edge_to_add_lineage_request_carries_dashboard_target():
+    edge = data_app_edges(
+        {"input": {"tables": [{"source": "in.c-main.a"}]}}, service_name=SVC, project=PROJ, dashboard_fqn=DASH_FQN
+    )[0]
+    known = {"keboola-stack.Acme_Project.in_c-main.a": "id-a", DASH_FQN: "id-dash"}
+    req = to_add_lineage_request(edge, _resolver(known))
+    assert req is not None
+    assert req["edge"]["fromEntity"] == {"id": "id-a", "type": "table"}
+    assert req["edge"]["toEntity"] == {"id": "id-dash", "type": "dashboard"}
+    assert req["edge"]["lineageDetails"]["source"] == SOURCE_DASHBOARD
+
+
+def test_data_app_edge_skipped_when_dashboard_absent():
+    # The Dashboard is not in OM yet (resolver returns None for it) -> edge skipped.
+    edge = data_app_edges(
+        {"input": {"tables": [{"source": "in.c-main.a"}]}}, service_name=SVC, project=PROJ, dashboard_fqn=DASH_FQN
+    )[0]
+    assert to_add_lineage_request(edge, _resolver({"keboola-stack.Acme_Project.in_c-main.a": "id-a"})) is None
 
 
 def test_column_edges_group_by_table_pair_and_carry_temp_tables():

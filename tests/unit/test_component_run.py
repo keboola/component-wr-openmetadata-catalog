@@ -412,6 +412,109 @@ def test_pipeline_status_404_is_recorded_not_fatal(monkeypatch):
     assert "pipeline status" in failed[0]["detail"]
 
 
+# ----------------------------------- data-app (Dashboard) upstream table lineage
+
+
+class _DataAppReader:
+    """Reader that returns one data-app config with a table input mapping."""
+
+    def __init__(self, config_id, source_table):
+        self._config_id = config_id
+        self._source = source_table
+
+    def list_component_configs(self):
+        return [
+            {
+                "id": "keboola.data-apps",
+                "configurations": [
+                    {
+                        "id": self._config_id,
+                        "configuration": {"storage": {"input": {"tables": [{"source": self._source}]}}},
+                    }
+                ],
+            }
+        ]
+
+
+class _LineageOM:
+    """OM double recording lineage puts + source-scoped deletes; resolves known FQNs."""
+
+    def __init__(self, ids):
+        self._ids = ids
+        self.is_2_0_or_newer = False
+        self.put_edges: list[dict] = []
+        self.deletes: list[tuple[str, str, str]] = []
+
+    def get_by_fqn(self, kind, fqn, fields=None):
+        return {"id": self._ids[fqn]} if fqn in self._ids else None
+
+    def put_lineage(self, edge):
+        self.put_edges.append(edge)
+        return {}
+
+    def delete_lineage_by_source(self, entity_type, fqn, source):
+        self.deletes.append((entity_type, fqn, source))
+
+
+def test_data_app_lineage_pass_emits_table_to_dashboard_edge():
+    """The lineage pass turns a data app's input mapping into an upstream
+    table -> Dashboard DashboardLineage edge, and its stale-edge cleanup targets
+    the Dashboard with the DashboardLineage source (not a table source)."""
+    svc, proj, pid = "keboola-stack", "P", "4214"
+    config_id = "01app"
+    source_table = "in.c-main.a"
+    source_fqn = fqn_mod.table_fqn_from_storage_id(svc, proj, source_table)
+    dashboard_fqn = fqn_mod.dashboard_fqn(svc, proj, config_id)
+
+    om = _LineageOM({source_fqn: "id-src", dashboard_fqn: "id-dash"})
+    run = _ProjectRun(
+        ctx=ProjectContext(project_id=pid, project_name=proj, storage_token="t", storage_url="https://s"),
+        reader=_DataAppReader(config_id, source_table),  # ty: ignore[invalid-argument-type]  (duck-typed double)
+        entities=EntityBuilder(svc, proj, pid, "https://ui"),
+        pipelines=PipelineBuilder(svc, proj, pid, "https://ui"),
+        dashboards=DashboardBuilder(svc, proj, pid, "https://ui", "connection.keboola.com"),
+    )
+    run.dashboard_fqn_by_config[config_id] = dashboard_fqn  # the dashboard pass ran first
+    report = component_mod.RunReport(run_id="rid")
+    config = SimpleNamespace(write_lineage=True, write_column_lineage=False, write_data_apps=True)
+
+    comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
+    comp._lineage_pass(config, om, run, report)  # ty: ignore[invalid-argument-type]
+
+    assert len(om.put_edges) == 1
+    edge = om.put_edges[0]["edge"]
+    assert edge["fromEntity"] == {"id": "id-src", "type": "table"}
+    assert edge["toEntity"] == {"id": "id-dash", "type": "dashboard"}
+    assert edge["lineageDetails"]["source"] == "DashboardLineage"
+    # cleanup dropped our DashboardLineage on the dashboard target before re-adding
+    assert ("dashboard", dashboard_fqn, "DashboardLineage") in om.deletes
+
+    lineage_rows = [r for r in report.rows() if r["entity_type"] == "Lineage"]
+    assert lineage_rows and lineage_rows[0]["action"] == report_mod.ACTION_UPDATED
+
+
+def test_data_app_lineage_skipped_when_write_lineage_off():
+    """With write_lineage off the data-app branch emits nothing, even though the
+    pass is entered for column lineage."""
+    svc, proj, pid = "keboola-stack", "P", "4214"
+    om = _LineageOM({})
+    run = _ProjectRun(
+        ctx=ProjectContext(project_id=pid, project_name=proj, storage_token="t", storage_url="https://s"),
+        reader=_DataAppReader("01app", "in.c-main.a"),  # ty: ignore[invalid-argument-type]  (duck-typed double)
+        entities=EntityBuilder(svc, proj, pid, "https://ui"),
+        pipelines=PipelineBuilder(svc, proj, pid, "https://ui"),
+        dashboards=DashboardBuilder(svc, proj, pid, "https://ui", "connection.keboola.com"),
+    )
+    run.dashboard_fqn_by_config["01app"] = fqn_mod.dashboard_fqn(svc, proj, "01app")
+    report = component_mod.RunReport(run_id="rid")
+    config = SimpleNamespace(write_lineage=False, write_column_lineage=True, write_data_apps=True)
+
+    comp = component_mod.Component.__new__(component_mod.Component)
+    comp._lineage_pass(config, om, run, report)  # ty: ignore[invalid-argument-type]
+
+    assert om.put_edges == []
+
+
 # ----------------------------------------- IMPORTANT 3: om_version_override drives the gate
 
 
