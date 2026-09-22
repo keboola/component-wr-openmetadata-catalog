@@ -33,7 +33,7 @@ OWNED_TABLE_FIELDS = (
     "schemaDefinition",
 )
 OWNED_PIPELINE_FIELDS = ("displayName", "description", "tasks", "sourceUrl")
-OWNED_DASHBOARD_FIELDS = ("displayName", "description", "sourceUrl", "extension")
+OWNED_DASHBOARD_FIELDS = ("displayName", "description", "sourceUrl", "extension", "owners")
 
 # Lineage edge sources this component owns; a Manual edge is never in this set.
 OUR_LINEAGE_SOURCES = ("PipelineLineage", "QueryLineage", "ViewLineage")

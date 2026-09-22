@@ -679,7 +679,9 @@ class Component(ComponentBase):
             if not run.dashboards.is_data_app(component_id):
                 continue
             for cfg in component.get("configurations") or []:
-                built = run.dashboards.build_dashboard(cfg, available, app_states, synced_at)
+                built = run.dashboards.build_dashboard(
+                    cfg, available, app_states, synced_at, owner_resolver=lambda e: self._resolve_owner(om, run, e)
+                )
                 run.dashboard_fqn_by_config[built.config_id] = built.fqn
                 self._upsert(
                     om,
@@ -830,6 +832,15 @@ class Component(ComponentBase):
             run.id_cache[cache_key] = entity.get("id") if entity else None
         return run.id_cache[cache_key]
 
+    def _resolve_owner(self, om: OMClient, run: _ProjectRun, email: str | None) -> str | None:
+        """OM user id for an owner e-mail, cached per run (best-effort, None if no match)."""
+        if not email:
+            return None
+        cache_key = f"user:{email}"
+        if cache_key not in run.id_cache:
+            run.id_cache[cache_key] = om.find_user_id_by_email(email)
+        return run.id_cache[cache_key]
+
     def _tombstone_pass(self, om: OMClient, run: _ProjectRun, report: RunReport) -> None:
         """Reconcile stale OM tables — scoped to the buckets this run enumerated.
 
@@ -890,7 +901,7 @@ class Component(ComponentBase):
     def _upsert(self, om, run, kind, entity_type, entity_fqn, desired, owned_fields, snapshot, report, merger) -> bool:
         """Create-or-merge one entity; returns True on success (for advance-after-success)."""
         try:
-            fields_by_kind = {"tables": "columns,tableConstraints", "dashboards": "extension"}
+            fields_by_kind = {"tables": "columns,tableConstraints", "dashboards": "extension,owners"}
             current = om.get_by_fqn(kind, entity_fqn, fields=fields_by_kind.get(kind))
             base = snapshot.base_fields(entity_fqn)
             decision = merger.merge(

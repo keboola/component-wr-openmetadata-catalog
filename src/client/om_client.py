@@ -253,6 +253,34 @@ class OMClient:
 
     # ---------------------------------------------------------------- reads
 
+    def find_user_id_by_email(self, email: str) -> str | None:
+        """Best-effort OM user id for an email address (``None`` if not found).
+
+        Queries the user search index and returns the id of the user whose email
+        matches exactly (case-insensitive). Any failure — search unavailable, no
+        match — returns ``None``, so a data app whose owner has no OM user is
+        written without a native owner (the kbcOwner custom property still keeps
+        the email). Auth failures stay fatal, consistent with the write paths.
+        """
+        try:
+            response = self._request(
+                "GET",
+                "/search/query",
+                params={"q": email, "index": "user_search_index", "from": 0, "size": 10},
+            )
+            hits = ((response.json() or {}).get("hits") or {}).get("hits") or []
+        except OMAuthError:
+            raise
+        except Exception:  # user lookup is best-effort (search may be unavailable)
+            logger.debug("OM user search failed for %r; no native owner set", email, exc_info=True)
+            return None
+        target = email.strip().lower()
+        for hit in hits:
+            source = hit.get("_source") or {}
+            if (source.get("email") or "").strip().lower() == target and source.get("id"):
+                return source["id"]
+        return None
+
     def get_by_fqn(self, kind: str, fqn: str, *, fields: str | None = None) -> dict | None:
         params = {"fields": fields} if fields else None
         try:

@@ -101,3 +101,34 @@ def test_status_labels():
 def test_description_always_emitted_empty_when_absent():
     # empty string (not omitted) so a re-run overwrites any stale description
     assert _builder().build_dashboard({"id": "9", "name": "App"}).body["description"] == ""
+
+
+def test_owners_set_when_resolver_finds_user():
+    config = {"id": "1", "currentVersion": {"creatorToken": {"description": "jakub.smagin@keboola.com"}}}
+    body = _builder().build_dashboard(config, owner_resolver=lambda email: "om-user-42").body
+    assert body["owners"] == [{"id": "om-user-42", "type": "user"}]
+
+
+def test_no_owners_when_resolver_returns_none():
+    # owner e-mail present, but no matching OM user -> no native owner (kbcOwner still set)
+    config = {"id": "1", "currentVersion": {"creatorToken": {"description": "jakub.smagin@keboola.com"}}}
+    body = _builder().build_dashboard(config, available_properties={"kbcOwner"}, owner_resolver=lambda email: None).body
+    assert "owners" not in body
+    assert body["extension"]["kbcOwner"] == "jakub.smagin@keboola.com"
+
+
+def test_no_owners_without_resolver():
+    config = {"id": "1", "currentVersion": {"creatorToken": {"description": "jakub.smagin@keboola.com"}}}
+    assert "owners" not in _builder().build_dashboard(config).body
+
+
+def test_resolver_not_called_when_no_owner_email():
+    calls = []
+
+    def resolver(email):
+        calls.append(email)
+        return "x"
+
+    body = _builder().build_dashboard({"id": "1"}, owner_resolver=resolver).body
+    assert "owners" not in body
+    assert calls == []  # no owner e-mail -> resolver skipped

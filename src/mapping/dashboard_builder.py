@@ -15,6 +15,7 @@ so they are correct even when the job runs on-platform with an internal ``KBC_UR
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from mapping import fqn
@@ -113,6 +114,21 @@ class DashboardBuilder:
     def _hyperlink(url: str | None, display_text: str) -> dict | None:
         return {"url": url, "displayText": display_text} if url else None
 
+    @classmethod
+    def _owners(cls, config: dict, owner_resolver: Callable[[str], str | None] | None) -> list[dict] | None:
+        """Native OM ``owners`` for the app's owner e-mail, when a matching OM user exists.
+
+        The owner e-mail (the last configuration editor) is resolved to an OM user id
+        by ``owner_resolver``. When no resolver is given, or the e-mail has no OM user,
+        no native owner is set — the ``kbcOwner`` custom property still records the
+        e-mail. Owner assignment is therefore additive and best-effort.
+        """
+        if owner_resolver is None:
+            return None
+        email = cls._owner(config)
+        owner_id = owner_resolver(email) if email else None
+        return [{"id": owner_id, "type": "user"}] if owner_id else None
+
     @staticmethod
     def _status_label(state: str | None) -> str | None:
         """Map a Data Science deployment state to the Keboola UI Status label."""
@@ -143,6 +159,7 @@ class DashboardBuilder:
         available_properties: set[str] | None = None,
         app_states: dict[str, str] | None = None,
         synced_at: str | None = None,
+        owner_resolver: Callable[[str], str | None] | None = None,
     ) -> BuiltDashboard:
         config_id = str(config.get("id"))
         params = (config.get("configuration") or {}).get("parameters") or {}
@@ -156,6 +173,7 @@ class DashboardBuilder:
                 "description": fqn.sanitize_display_name(config.get("description")) or "",
                 "service": fqn.dashboard_service_fqn(self.service_name),
                 "sourceUrl": app_url or self._config_url(config_id),
+                "owners": self._owners(config, owner_resolver),
                 "extension": self._extension(config, available_properties, app_states, synced_at),
             }
         )

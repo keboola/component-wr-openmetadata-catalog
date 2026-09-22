@@ -196,3 +196,49 @@ def test_list_paginates_via_cursor():
     ids = [e["id"] for e in c.list_entities("tables")]
     assert ids == ["1", "2"]
     assert session.request.call_count == 2
+
+
+def test_find_user_id_by_email_matches_exact_email():
+    session = mock.Mock()
+    session.request.return_value = FakeResponse(
+        200,
+        {
+            "hits": {
+                "hits": [
+                    {"_source": {"id": "u-1", "email": "other@keboola.com"}},
+                    {"_source": {"id": "u-2", "email": "Jakub.Smagin@Keboola.com"}},
+                ]
+            }
+        },
+    )
+    c = _client(session)
+    assert c.find_user_id_by_email("jakub.smagin@keboola.com") == "u-2"  # case-insensitive exact match
+    method, url = session.request.call_args[0]
+    assert method == "GET"
+    assert url.endswith("/api/v1/search/query")
+    assert session.request.call_args.kwargs["params"]["index"] == "user_search_index"
+
+
+def test_find_user_id_by_email_none_when_no_exact_match():
+    session = mock.Mock()
+    # a token match returns a user whose email only contains the query terms -> no exact hit
+    session.request.return_value = FakeResponse(
+        200, {"hits": {"hits": [{"_source": {"id": "u-1", "email": "jakub.smagin@other.com"}}]}}
+    )
+    c = _client(session)
+    assert c.find_user_id_by_email("jakub.smagin@keboola.com") is None
+
+
+def test_find_user_id_by_email_none_on_search_error():
+    session = mock.Mock()
+    session.request.return_value = FakeResponse(500, {"err": "no search index"})
+    c = _client(session)  # backoff_base=0 -> retries fast, then OMClientError -> swallowed
+    assert c.find_user_id_by_email("x@keboola.com") is None
+
+
+def test_find_user_id_by_email_reraises_auth_error():
+    session = mock.Mock()
+    session.request.return_value = FakeResponse(403, {"error": "forbidden"})
+    c = _client(session)
+    with pytest.raises(OMAuthError):
+        c.find_user_id_by_email("x@keboola.com")

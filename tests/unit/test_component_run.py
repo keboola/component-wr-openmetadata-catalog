@@ -515,6 +515,34 @@ def test_data_app_lineage_skipped_when_write_lineage_off():
     assert om.put_edges == []
 
 
+# ------------------------------------------ native owner resolution (best-effort, cached)
+
+
+def test_resolve_owner_caches_lookup_per_email():
+    class _UserOM:
+        def __init__(self):
+            self.calls = 0
+
+        def find_user_id_by_email(self, email):
+            self.calls += 1
+            return "om-user" if email == "known@keboola.com" else None
+
+    om = _UserOM()
+    run = _ProjectRun(
+        ctx=ProjectContext(project_id="1", project_name="P", storage_token="t", storage_url="https://s"),
+        reader=OneBucketStorage(),  # ty: ignore[invalid-argument-type]  (duck-typed double)
+        entities=EntityBuilder("svc", "P", "1", "https://ui"),
+        pipelines=PipelineBuilder("svc", "P", "1", "https://ui"),
+        dashboards=DashboardBuilder("svc", "P", "1", "https://ui"),
+    )
+    comp = component_mod.Component.__new__(component_mod.Component)
+
+    assert comp._resolve_owner(om, run, "known@keboola.com") == "om-user"  # ty: ignore[invalid-argument-type]
+    assert comp._resolve_owner(om, run, "known@keboola.com") == "om-user"  # cached
+    assert comp._resolve_owner(om, run, None) is None  # empty e-mail short-circuits
+    assert om.calls == 1  # one lookup for the one distinct e-mail; the empty one never hit OM
+
+
 # ----------------------------------------- IMPORTANT 3: om_version_override drives the gate
 
 
