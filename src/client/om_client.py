@@ -25,7 +25,7 @@ from keboola.component.exceptions import UserException
 logger = logging.getLogger(__name__)
 
 # Entity kinds whose collection lives under ``/services/``.
-_SERVICE_KINDS = frozenset({"databaseServices", "pipelineServices"})
+_SERVICE_KINDS = frozenset({"databaseServices", "pipelineServices", "dashboardServices"})
 
 _RETRYABLE_STATUS = frozenset({500, 502, 503, 504})
 _JSON_PATCH_CT = "application/json-patch+json"
@@ -218,6 +218,38 @@ class OMClient:
         path = self._path_for(kind, f"/name/{quote(fqn, safe='')}")
         response = self._request("PATCH", path, json_body=json_patch, content_type=_JSON_PATCH_CT)
         return response.json()
+
+    # -------------------------------------------------- custom properties
+
+    def ensure_custom_properties(self, entity_type: str, specs: list[tuple[str, str, str]]) -> set[str]:
+        """Ensure custom properties ``(name, field_type, description)`` exist on ``entity_type``.
+
+        Returns the property names that exist afterwards. Defining a property is an
+        admin-level type change a bot token may be refused; such a failure is logged
+        and the property left out of the returned set, so the caller skips its value
+        instead of 400-ing the entity write.
+        """
+        entity = self._request("GET", f"/metadata/types/name/{entity_type}", params={"fields": "customProperties"}).json()
+        type_id = entity.get("id")
+        existing = {c.get("name") for c in (entity.get("customProperties") or [])}
+        for name, field_type, description in specs:
+            if name in existing:
+                continue
+            try:
+                field_type_id = self._request("GET", f"/metadata/types/name/{field_type}").json().get("id")
+                self._request(
+                    "PUT",
+                    f"/metadata/types/{type_id}",
+                    json_body={
+                        "name": name,
+                        "description": description,
+                        "propertyType": {"id": field_type_id, "type": "type"},
+                    },
+                )
+                existing.add(name)
+            except Exception as exc:  # noqa: BLE001 - defining a property is best-effort (bot may be refused)
+                logger.warning("Could not define custom property %r on %s: %s", name, entity_type, exc)
+        return existing
 
     # ---------------------------------------------------------------- reads
 

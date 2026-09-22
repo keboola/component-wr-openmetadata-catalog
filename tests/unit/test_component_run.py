@@ -26,6 +26,7 @@ from client.storage_reader import SourceBucket, SourceColumn, SourceTable
 from component import ProjectContext, _ProjectRun
 from configuration import Configuration, FailureMode, MergeMode
 from mapping import fqn as fqn_mod
+from mapping.dashboard_builder import DashboardBuilder
 from mapping.entity_builder import EntityBuilder
 from mapping.pipeline_builder import PipelineBuilder
 from merge import SnapshotStore, ThreeWayMerger
@@ -321,6 +322,7 @@ def test_incremental_skip_is_tombstone_safe_and_writes_nothing():
         reader=_OneBucketReader(bucket, tables),  # ty: ignore[invalid-argument-type]  (duck-typed test double)
         entities=EntityBuilder(svc, proj, pid, "https://ui.example"),
         pipelines=PipelineBuilder(svc, proj, pid, "https://ui.example"),
+        dashboards=DashboardBuilder(svc, proj, pid, "https://ui.example"),
     )
     report = component_mod.RunReport(run_id="rid")
 
@@ -392,6 +394,7 @@ def test_pipeline_status_404_is_recorded_not_fatal(monkeypatch):
         reader=OneBucketStorage(),  # ty: ignore[invalid-argument-type]  (duck-typed test double)
         entities=EntityBuilder("svc", "P", "777", "https://ui"),
         pipelines=PipelineBuilder("svc", "P", "777", "https://ui"),
+        dashboards=DashboardBuilder("svc", "P", "777", "https://ui"),
     )
     report = component_mod.RunReport(run_id="rid")
     cfg = {"id": "cfg1", "configuration": {"_lastJobId": "999"}}

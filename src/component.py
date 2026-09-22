@@ -16,6 +16,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, ClassVar
 
 from keboola.component.base import ComponentBase, sync_action
@@ -26,6 +27,7 @@ from keboola.vcr import BaseSanitizer, DefaultSanitizer
 
 import report as report_mod
 from client import ssh_proxy
+from client.data_app_reader import fetch_app_states
 from client.job_queue_reader import JobQueueReader
 from client.manage_client import ManageClient, ManageScopeError
 from client.om_client import OMAuthError, OMClient, OMClientError, OMPreconditionFailed
@@ -35,10 +37,12 @@ from lineage.column_lineage import extract_column_lineage
 from lineage.dialect import dialect_for
 from mapping import fqn as fqn_mod
 from mapping import lineage_builder
+from mapping.dashboard_builder import CUSTOM_PROPERTIES, DashboardBuilder
 from mapping.entity_builder import EntityBuilder
 from mapping.pipeline_builder import PipelineBuilder
 from merge import (
     OUR_LINEAGE_SOURCES,
+    OWNED_DASHBOARD_FIELDS,
     OWNED_PIPELINE_FIELDS,
     OWNED_TABLE_FIELDS,
     SnapshotStore,
@@ -231,6 +235,7 @@ class _ProjectRun:
     reader: StorageReader
     entities: EntityBuilder
     pipelines: PipelineBuilder
+    dashboards: DashboardBuilder
     seen_table_fqns: set[str] = field(default_factory=set)
     # DatabaseSchema FQNs this run actually enumerated (in-scope buckets only) —
     # the tombstone pass reconciles *only* within these, so allowlist/denylist
@@ -417,12 +422,17 @@ class Component(ComponentBase):
             pipelines=PipelineBuilder(
                 config.resolve_service_name(env["stack_id"]), ctx.project_name, ctx.project_id, ui_base
             ),
+            dashboards=DashboardBuilder(
+                config.resolve_service_name(env["stack_id"]), ctx.project_name, ctx.project_id, ui_base, env["stack_id"]
+            ),
         )
         merger = ThreeWayMerger(config.merge_mode)
 
         self._catalog_pass(config, om, run, state, snapshot, report, merger, version_changed)
         if config.write_pipelines:
             self._pipeline_pass(config, om, run, snapshot, report, merger, env)
+        if config.write_data_apps:
+            self._dashboard_pass(om, run, snapshot, report, merger)
         if config.write_lineage or config.write_column_lineage:
             self._lineage_pass(config, om, run, report)
         self._tombstone_pass(om, run, report)
@@ -567,6 +577,8 @@ class Component(ComponentBase):
         )
         for component in run.reader.list_component_configs():
             component_id = str(component.get("id") or component.get("componentId") or "")
+            if run.dashboards.is_data_app(component_id):
+                continue  # data apps are catalogued as Dashboards, not Pipelines
             for cfg in component.get("configurations") or []:
                 if not (run.pipelines.is_flow(component_id) or self._is_producing(cfg)):
                     continue
@@ -619,6 +631,63 @@ class Component(ComponentBase):
                 action=report_mod.ACTION_FAILED,
                 detail=f"pipeline status: {exc}",
             )
+
+    def _dashboard_pass(
+        self,
+        om: OMClient,
+        run: _ProjectRun,
+        snapshot: SnapshotStore,
+        report: RunReport,
+        merger: ThreeWayMerger,
+    ) -> None:
+        """Catalog Keboola data apps (component ``keboola.data-apps``) as OM Dashboards.
+
+        Data apps have no storage mapping, so the pipeline pass skips them. Each is
+        upserted as a Dashboard under one ``CustomDashboard`` service, so its metadata
+        (name, description, deep link to the Keboola config) shows up in OpenMetadata.
+        """
+        self._upsert(
+            om,
+            run,
+            "dashboardServices",
+            "DashboardService",
+            run.dashboards.dashboard_service_body()["name"],
+            run.dashboards.dashboard_service_body(),
+            (),
+            snapshot,
+            report,
+            merger,
+        )
+        try:
+            available = om.ensure_custom_properties("dashboard", CUSTOM_PROPERTIES)
+        except Exception as exc:  # noqa: BLE001 - metadata-type read/define is best-effort
+            logger.warning("Dashboard custom properties unavailable (%s); writing without extension", exc)
+            available = set()
+        stack_id = run.dashboards.stack_id
+        app_states = (
+            fetch_app_states(f"https://data-science.{stack_id.removeprefix('connection.')}", run.ctx.storage_token)
+            if stack_id
+            else {}
+        )
+        synced_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
+        for component in run.reader.list_component_configs():
+            component_id = str(component.get("id") or component.get("componentId") or "")
+            if not run.dashboards.is_data_app(component_id):
+                continue
+            for cfg in component.get("configurations") or []:
+                built = run.dashboards.build_dashboard(cfg, available, app_states, synced_at)
+                self._upsert(
+                    om,
+                    run,
+                    "dashboards",
+                    "Dashboard",
+                    built.fqn,
+                    built.body,
+                    OWNED_DASHBOARD_FIELDS,
+                    snapshot,
+                    report,
+                    merger,
+                )
 
     def _lineage_pass(self, config: Configuration, om: OMClient, run: _ProjectRun, report: RunReport) -> None:
         edges: list[lineage_builder.LineageEdge] = []
@@ -785,7 +854,8 @@ class Component(ComponentBase):
     def _upsert(self, om, run, kind, entity_type, entity_fqn, desired, owned_fields, snapshot, report, merger) -> bool:
         """Create-or-merge one entity; returns True on success (for advance-after-success)."""
         try:
-            current = om.get_by_fqn(kind, entity_fqn, fields="columns,tableConstraints" if kind == "tables" else None)
+            fields_by_kind = {"tables": "columns,tableConstraints", "dashboards": "extension"}
+            current = om.get_by_fqn(kind, entity_fqn, fields=fields_by_kind.get(kind))
             base = snapshot.base_fields(entity_fqn)
             decision = merger.merge(
                 desired=desired, current=current, base=base, owned_fields=owned_fields or tuple(desired.keys())

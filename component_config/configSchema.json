@@ -221,6 +221,16 @@
       },
       "propertyOrder": 170
     },
+    "write_data_apps": {
+      "type": "boolean",
+      "format": "checkbox",
+      "title": "Write Data Apps (Advanced)",
+      "description": "Emit a Dashboard entity for each data app (keboola.data-apps)",
+      "options": {
+        "tooltip": "Disabled by default; opt in to catalog data apps as dashboards."
+      },
+      "propertyOrder": 175
+    },
     "full_refresh": {
       "type": "boolean",
       "format": "checkbox",
