@@ -92,7 +92,7 @@ class Configuration(BaseModel):
     write_column_lineage: bool = True
     write_pipelines: bool = True
     write_pipeline_status: bool = True
-    write_data_apps: bool = False
+    write_data_apps: bool = True
     full_refresh: bool = False
     om_version_override: str | None = None
 
