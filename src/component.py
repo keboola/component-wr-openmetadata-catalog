@@ -625,6 +625,15 @@ class Component(ComponentBase):
         env: dict,
         synced_at: str | None = None,
     ) -> None:
+        # No pipeline-producing family selected -> nothing to build. Return before
+        # touching the PipelineService or ``list_component_configs()``: the latter
+        # fetches ``/components?include=configuration``, a large whole-project
+        # configuration dump (a secret surface and, at scale, tens of MB), so it
+        # must not be pulled when the run catalogs Storage only. (Data apps are
+        # gated separately in ``_dashboard_pass``; config-derived lineage, if any,
+        # is fetched under ``_lineage_pass``.)
+        if not (config.write_transformations or config.write_components or config.write_flows):
+            return
         self._upsert(
             om,
             run,

@@ -1258,6 +1258,52 @@ def test_pipeline_pass_flows_off_excludes_that_kind():
     assert {"t1", "e1"} <= written_config_ids
 
 
+def test_pipeline_pass_all_families_off_skips_component_fetch():
+    """Catalog-only run (no pipeline family enabled) must NOT call
+    ``list_component_configs()`` -- that fetches ``/components?include=configuration``,
+    a large whole-project configuration dump (a secret surface). No pipeline is
+    written either."""
+
+    class _CountingReader(_FamilyReader):
+        calls = 0
+
+        def list_component_configs(self):
+            type(self).calls += 1
+            return super().list_component_configs()
+
+    reader = _CountingReader()
+    om = _PipelineRecordingOM()
+    run = _ProjectRun(
+        ctx=ProjectContext(project_id="4214", project_name="Proj", storage_token="t", storage_url="https://s"),
+        reader=reader,  # ty: ignore[invalid-argument-type]  (duck-typed test double)
+        entities=EntityBuilder("keboola-stack", "Proj", "4214", "https://ui.example"),
+        pipelines=PipelineBuilder("keboola-stack", "Proj", "4214", "https://ui.example"),
+        dashboards=DashboardBuilder("keboola-stack", "Proj", "4214", "https://ui.example"),
+    )
+    config = SimpleNamespace(
+        scope=ProjectScope.THIS_PROJECT,
+        write_transformations=False,
+        transformations=[],
+        write_components=False,
+        components=[],
+        write_flows=False,
+        flows=[],
+        write_pipeline_status=False,
+    )
+    comp = component_mod.Component.__new__(component_mod.Component)
+    comp._pipeline_pass(
+        config,  # ty: ignore[invalid-argument-type]  (duck-typed test double)
+        om,  # ty: ignore[invalid-argument-type]  (duck-typed test double)
+        run,
+        SnapshotStore(),
+        component_mod.RunReport(run_id="rid"),
+        ThreeWayMerger(MergeMode.THREE_WAY_MERGE),
+        env={"url": None},
+    )
+    assert _CountingReader.calls == 0
+    assert om.pipeline_bodies == {}
+
+
 def test_pipeline_pass_selector_narrows_to_subset():
     # A non-empty `transformations` selector is an allowlist within the family.
     om, _ = _run_pipeline_pass({"transformations": ["t1"]})
