@@ -30,6 +30,15 @@ _PYTHON_COMPONENT_IDS = frozenset(
 )
 
 
+def is_flow_component(component_id: str) -> bool:
+    """True when ``component_id`` is a Keboola flow / orchestration component.
+
+    A pure function of the id (no builder state), so the sync actions can reuse
+    it without a project-bound ``PipelineBuilder``.
+    """
+    return component_id in _FLOW_COMPONENT_IDS
+
+
 @dataclass
 class BuiltPipeline:
     body: dict
@@ -67,7 +76,7 @@ class PipelineBuilder:
         }
 
     def is_flow(self, component_id: str) -> bool:
-        return component_id in _FLOW_COMPONENT_IDS
+        return is_flow_component(component_id)
 
     def _component_url(self, component_id: str, config_id: str) -> str:
         return f"{self.ui_base}/admin/projects/{self.project_id}/components/{component_id}/{config_id}"

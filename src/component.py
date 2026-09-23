@@ -30,13 +30,13 @@ from client.job_queue_reader import JobQueueReader
 from client.manage_client import ManageClient, ManageScopeError
 from client.om_client import OMAuthError, OMClient, OMClientError, OMPreconditionFailed
 from client.storage_reader import SourceBucket, SourceTable, StorageReader, resolve_storage_credentials
-from configuration import BranchFilter, Configuration, FailureMode, ProjectScope, Stage
-from lineage.column_lineage import extract_column_lineage
+from configuration import Configuration, FailureMode, ProjectScope
+from lineage.column_lineage import LineageResult, extract_column_lineage
 from lineage.dialect import dialect_for
 from mapping import fqn as fqn_mod
 from mapping import lineage_builder
 from mapping.entity_builder import EntityBuilder
-from mapping.pipeline_builder import PipelineBuilder
+from mapping.pipeline_builder import PipelineBuilder, is_flow_component
 from merge import (
     OUR_LINEAGE_SOURCES,
     OWNED_PIPELINE_FIELDS,
@@ -266,7 +266,6 @@ class Component(ComponentBase):
         try:
             om = self._build_om_client(config, proxy)
             om.probe_version()
-            self._apply_version_override(config, om)
             server_version = om.server_version
             version_changed = state.om_version_seen not in (None, server_version)
             snapshot = self._load_snapshot(config, env, projects, state)
@@ -322,21 +321,10 @@ class Component(ComponentBase):
         verify_ssl = proxy is None  # a loopback tunnel terminates TLS at the bastion
         return OMClient(host, config.bot_token, verify_ssl=verify_ssl)
 
-    @staticmethod
-    def _apply_version_override(config: Configuration, om: OMClient) -> None:
-        """Break-glass: force the server version used for the ``is_2_0_or_newer`` gate.
-
-        Called right after ``om.probe_version()`` so the optional ``om_version_override``
-        wins over the auto-probed ``/system/version`` value. Normally unset; useful when
-        the probe reports a version whose gated 2.0 surface must be forced on/off.
-        """
-        if config.om_version_override:
-            om.server_version = config.om_version_override
-
     # ------------------------------------------------------ project resolve
 
     def _resolve_projects(self, config: Configuration, env: dict) -> tuple[list[ProjectContext], str | None]:
-        if config.project_scope == ProjectScope.ALL_PROJECTS:
+        if config.scope == ProjectScope.ALL_PROJECTS:
             return self._resolve_tier2(config, env)
         return [self._resolve_host_or_row(config, env)], None
 
@@ -360,7 +348,19 @@ class Component(ComponentBase):
         host = (env["url"] or "https://connection.keboola.com").rstrip("/")
         client = ManageClient(host, config.manage_token or "")
         try:
-            minted = client.enumerate_and_mint(config.organization_id)
+            if not config.organization_id:
+                raise ManageScopeError("organization_id is required for Tier-2 enumeration.")
+            enumerated = client.enumerate_projects(config.organization_id)
+            if config.projects:
+                # Narrow to the user-selected projects *before* minting a token — a
+                # project the user excluded from the row's `projects` select must
+                # never get a (short-lived, but blast-radius-bearing) minted token.
+                enumerated = [p for p in enumerated if str(p.get("id")) in config.projects]
+            if not enumerated:
+                raise ManageScopeError("No projects enumerated for the organization.")
+            minted = [
+                client.mint_storage_token(str(p.get("id")), p.get("name") or str(p.get("id"))) for p in enumerated
+            ]
         except ManageScopeError as exc:
             logger.warning("Tier-2 enumeration failed (%s); degrading to the host project.", exc)
             return [self._resolve_host_or_row(config, env)], f"Tier-2 org enumeration unavailable: {exc}"
@@ -405,8 +405,9 @@ class Component(ComponentBase):
         report: RunReport,
         version_changed: bool,
     ) -> None:
-        production_only = config.branch_filter == BranchFilter.PRODUCTION_ONLY
-        reader = StorageReader(ctx.storage_url, ctx.storage_token, production_only=production_only)
+        # Dev-branch buckets are never cataloged: StorageReader is always
+        # production_only (the former branch_filter toggle is gone).
+        reader = StorageReader(ctx.storage_url, ctx.storage_token, production_only=True)
         ui_base = self._ui_base(ctx.storage_url)
         run = _ProjectRun(
             ctx=ctx,
@@ -536,12 +537,7 @@ class Component(ComponentBase):
         # excluded, so the writer never catalogs itself even under the default scope.
         if bucket.id == report_mod.OUTPUT_BUCKET:
             return False
-        stages = {s.value for s in config.stages} or {Stage.IN.value, Stage.OUT.value}
-        if bucket.stage not in stages:
-            return False
-        if config.bucket_allowlist and bucket.id not in config.bucket_allowlist:
-            return False
-        return not (config.bucket_denylist and bucket.id in config.bucket_denylist)
+        return not (config.buckets and bucket.id not in config.buckets)
 
     def _pipeline_pass(
         self,
@@ -567,11 +563,24 @@ class Component(ComponentBase):
         )
         for component in run.reader.list_component_configs():
             component_id = str(component.get("id") or component.get("componentId") or "")
+            is_flow = run.pipelines.is_flow(component_id)
             for cfg in component.get("configurations") or []:
-                if not (run.pipelines.is_flow(component_id) or self._is_producing(cfg)):
+                if not (is_flow or self._is_producing(cfg)):
                     continue
+                cfg_id = str(cfg.get("id"))
+                # Selection narrows *within* the eligibility gate above: an empty
+                # selector means "all", a non-empty one is an explicit allowlist.
+                # It only applies to a single known project — an org-wide row's
+                # selector ids can't map across projects, so all_projects writes
+                # every eligible config/flow (the selectors are hidden in that scope).
+                if config.scope == ProjectScope.THIS_PROJECT:
+                    if is_flow:
+                        if config.flows and cfg_id not in config.flows:
+                            continue
+                    elif config.configurations and cfg_id not in config.configurations:
+                        continue
                 built = run.pipelines.build_pipeline(component_id, cfg)
-                run.pipeline_fqn_by_config[str(cfg.get("id"))] = built.fqn
+                run.pipeline_fqn_by_config[cfg_id] = built.fqn
                 self._upsert(
                     om,
                     run,
@@ -625,23 +634,56 @@ class Component(ComponentBase):
         for component in run.reader.list_component_configs():
             component_id = str(component.get("id") or component.get("componentId") or "")
             for cfg in component.get("configurations") or []:
+                # rows[]-declared storage (some extractors/transforms map storage
+                # per config row, not at the top level) is not read here — Phase A
+                # scope is the top-level configuration.storage only; a follow-up.
                 storage = (cfg.get("configuration") or {}).get("storage") or {}
                 pipeline_fqn = run.pipeline_fqn_by_config.get(str(cfg.get("id")))
+                # Phase B: the column-lineage engine also recovers input/output
+                # tables a transform reads/writes via a DIRECT fully-qualified SQL
+                # ref instead of a declared mapping — computed once here (only
+                # when write_column_lineage is on, since that's what runs the SQL
+                # parse) and reused below for both the column edges and the
+                # inferred-input -> pipeline wiring, so the SQL is never parsed twice.
+                column_result = (
+                    self._column_lineage_for(run, component_id, cfg, storage) if config.write_column_lineage else None
+                )
                 if config.write_lineage:
-                    edges += lineage_builder.declared_edges(
-                        storage,
-                        service_name=run.entities.service_name,
-                        project=run.entities.project,
-                        pipeline_fqn=pipeline_fqn,
-                    )
+                    if pipeline_fqn:
+                        # Normal path (write_pipelines on): the pipeline is a first-class
+                        # lineage node, wired from the DECLARED input/output mapping.
+                        edges += lineage_builder.pipeline_edges(
+                            storage,
+                            service_name=run.entities.service_name,
+                            project=run.entities.project,
+                            pipeline_fqn=pipeline_fqn,
+                        )
+                        edges += self._inferred_input_pipeline_edges(run, storage, pipeline_fqn, column_result)
+                    else:
+                        # No pipeline node (write_pipelines off, or not a pipeline config)
+                        # -> fall back to the coarse table->table cartesian edges so
+                        # lineage still exists without a pipeline to hang it on.
+                        edges += lineage_builder.declared_edges(
+                            storage,
+                            service_name=run.entities.service_name,
+                            project=run.entities.project,
+                        )
                 if config.write_column_lineage:
-                    edges += self._column_edges_for(config, run, component_id, cfg, storage, pipeline_fqn, report)
+                    edges += self._column_edges_for(run, cfg, pipeline_fqn, column_result, report)
         self._refresh_lineage(om, run, report, edges)
 
-    def _column_edges_for(self, config, run, component_id, cfg, storage, pipeline_fqn, report):
+    def _column_lineage_for(
+        self, run: _ProjectRun, component_id: str, cfg: dict, storage: dict
+    ) -> LineageResult | None:
+        """Parse a transform's SQL into a :class:`LineageResult`, or ``None`` for a non-SQL component.
+
+        Threads ``service_name``/``project``/``known_table_fqns`` (Phase B) so a
+        direct fully-qualified ref is cross-checked against the run's cataloged
+        Table FQNs — declared ``in_map``/``out_map`` stay authoritative either way.
+        """
         dialect = dialect_for(component_id=component_id)
         if not dialect.is_sql:
-            return []
+            return None
         statements = self._statements_of(cfg)
         in_map = {
             t.get("destination"): t.get("source")
@@ -653,7 +695,23 @@ class Component(ComponentBase):
             for t in (storage.get("output") or {}).get("tables") or []
             if t.get("source") and t.get("destination")
         }
-        result = extract_column_lineage(statements, in_map=in_map, out_map=out_map, dialect=dialect)
+        # ``column_catalog`` keys are always a superset of ``seen_table_fqns`` in
+        # practice (both are populated together in ``_catalog_pass``); unioned
+        # defensively so a future divergence can never silently narrow the gate.
+        known_table_fqns = set(run.column_catalog.keys()) | run.seen_table_fqns
+        return extract_column_lineage(
+            statements,
+            in_map=in_map,
+            out_map=out_map,
+            dialect=dialect,
+            service_name=run.entities.service_name,
+            project=run.entities.project,
+            known_table_fqns=known_table_fqns,
+        )
+
+    def _column_edges_for(self, run: _ProjectRun, cfg: dict, pipeline_fqn, result: LineageResult | None, report):
+        if result is None:
+            return []
         for note in result.unresolved_notes:
             report.record(
                 project_id=run.ctx.project_id,
@@ -671,6 +729,41 @@ class Component(ComponentBase):
         )
 
     @staticmethod
+    def _inferred_input_pipeline_edges(
+        run: _ProjectRun, storage: dict, pipeline_fqn: str, result: LineageResult | None
+    ) -> list[lineage_builder.LineageEdge]:
+        """Phase B: wire a SQL-inferred input to the pipeline when nothing was declared.
+
+        Only fires when ``storage.input.tables`` is declared EMPTY — a config with a
+        declared input already got its ``input_table -> pipeline`` edge from
+        ``lineage_builder.pipeline_edges`` above, and the declared mapping stays
+        authoritative (this never duplicates or overrides it). The candidate inputs
+        are the *source* side of the column-lineage engine's resolved
+        ``table_edges``, which is already gated on ``known_table_fqns`` (see
+        ``_column_lineage_for`` / ``extract_column_lineage``), so every candidate
+        here is a table this run actually cataloged.
+        """
+        declared_inputs = (storage.get("input") or {}).get("tables") or []
+        if declared_inputs or result is None:
+            return []
+        sids = sorted({sid for sid, _tid in result.table_edges})
+        edges: list[lineage_builder.LineageEdge] = []
+        for sid in sids:
+            in_fqn = fqn_mod.table_fqn_from_storage_id(run.entities.service_name, run.entities.project, sid)
+            if not in_fqn:
+                continue
+            edges.append(
+                lineage_builder.LineageEdge(
+                    from_fqn=in_fqn,
+                    to_fqn=pipeline_fqn,
+                    source=lineage_builder.SOURCE_PIPELINE,
+                    from_type="table",
+                    to_type="pipeline",
+                )
+            )
+        return edges
+
+    @staticmethod
     def _statements_of(cfg: dict) -> list[tuple[str, str]]:
         params = (cfg.get("configuration") or {}).get("parameters") or {}
         statements: list[tuple[str, str]] = []
@@ -683,11 +776,14 @@ class Component(ComponentBase):
         return statements
 
     def _refresh_lineage(self, om, run, report, edges) -> None:
-        # drop our stale edges (never Manual) on affected targets, then add current
-        for target_fqn in {e.to_fqn for e in edges}:
+        # drop our stale edges (never Manual) on affected targets, then add current.
+        # Keyed on each edge's TARGET type: an input->pipeline edge's target is the
+        # pipeline itself, so cleanup there must hit /lineage/.../pipeline/..., not
+        # a hardcoded "table" (which would silently no-op and leave stale edges).
+        for to_type, target_fqn in {(e.to_type, e.to_fqn) for e in edges}:
             for source in OUR_LINEAGE_SOURCES:
                 try:
-                    om.delete_lineage_by_source("table", target_fqn, source)
+                    om.delete_lineage_by_source(to_type, target_fqn, source)
                 except Exception:
                     logger.debug("lineage cleanup skipped for %s/%s", target_fqn, source, exc_info=True)
         for edge in edges:
@@ -730,11 +826,11 @@ class Component(ComponentBase):
 
         Scope-safety (spec risk #4 / §6.2 step 8): reconciliation happens *per
         DatabaseSchema* the run actually enumerated, never over the whole Database.
-        Buckets excluded by the stage / allowlist / denylist filters — or not
-        enumerated at all this run — are never a deletion scope, so a scoped run
-        (e.g. a ``bucket_allowlist`` subset) can never tombstone entities that
-        belong to the rest of the catalog. The delete path stays fail-closed within
-        each schema (skip on a listing error or an implausibly short scope).
+        Buckets excluded by the ``buckets`` selector — or not enumerated at all this
+        run — are never a deletion scope, so a scoped run (e.g. a ``buckets``
+        subset) can never tombstone entities that belong to the rest of the catalog.
+        The delete path stays fail-closed within each schema (skip on a listing
+        error or an implausibly short scope).
         """
         for schema_fqn in sorted(run.seen_schema_fqns):
             seen_in_schema = sorted(f for f in run.seen_table_fqns if f.startswith(f"{schema_fqn}."))
@@ -899,7 +995,6 @@ class Component(ComponentBase):
         om = OMClient(config.om_host, config.bot_token)
         try:
             om.probe_version()
-            self._apply_version_override(config, om)
             version = om.server_version
             # /system/version is unauthenticated (OM JwtFilter.EXCLUDED_ENDPOINTS),
             # so it only checks reachability. Follow with an authenticated call so an
@@ -922,8 +1017,62 @@ class Component(ComponentBase):
         token, url = resolve_storage_credentials(
             row_token=config.storage_token, injected_token=env["token"], injected_url=env["url"]
         )
-        reader = StorageReader(url, token, production_only=config.branch_filter == BranchFilter.PRODUCTION_ONLY)
+        reader = StorageReader(url, token, production_only=True)
         return [SelectElement(value=b.id, label=f"{b.id} ({b.display_name or b.name})") for b in reader.list_buckets()]
+
+    @sync_action("listConfigurations")
+    def list_configurations(self) -> list[SelectElement]:
+        config = Configuration(**self.configuration.parameters)
+        env = self._read_environment()
+        token, url = resolve_storage_credentials(
+            row_token=config.storage_token, injected_token=env["token"], injected_url=env["url"]
+        )
+        reader = StorageReader(url, token, production_only=True)
+        elements: list[SelectElement] = []
+        for component in reader.list_component_configs():
+            component_id = str(component.get("id") or component.get("componentId") or "")
+            if is_flow_component(component_id):
+                continue
+            for cfg in component.get("configurations") or []:
+                if not self._is_producing(cfg):
+                    continue
+                name = cfg.get("name") or str(cfg.get("id"))
+                elements.append(SelectElement(value=str(cfg.get("id")), label=f"{component_id} / {name}"))
+        return elements
+
+    @sync_action("listFlows")
+    def list_flows(self) -> list[SelectElement]:
+        config = Configuration(**self.configuration.parameters)
+        env = self._read_environment()
+        token, url = resolve_storage_credentials(
+            row_token=config.storage_token, injected_token=env["token"], injected_url=env["url"]
+        )
+        reader = StorageReader(url, token, production_only=True)
+        elements: list[SelectElement] = []
+        for component in reader.list_component_configs():
+            component_id = str(component.get("id") or component.get("componentId") or "")
+            if not is_flow_component(component_id):
+                continue
+            for cfg in component.get("configurations") or []:
+                name = cfg.get("name") or str(cfg.get("id"))
+                elements.append(SelectElement(value=str(cfg.get("id")), label=name))
+        return elements
+
+    @sync_action("listProjects")
+    def list_projects(self) -> list[SelectElement]:
+        config = Configuration(**self.configuration.parameters)
+        env = self._read_environment()
+        if not config.manage_token or not config.organization_id:
+            raise UserException(
+                "Listing projects requires both a Management Token (#manage_token) and an Organization ID."
+            )
+        host = (env["url"] or "https://connection.keboola.com").rstrip("/")
+        client = ManageClient(host, config.manage_token)
+        try:
+            projects = client.enumerate_projects(config.organization_id)
+        except ManageScopeError as exc:
+            raise UserException(str(exc)) from exc
+        return [SelectElement(value=str(p.get("id")), label=f"{p.get('id')} ({p.get('name')})") for p in projects]
 
 
 if __name__ == "__main__":

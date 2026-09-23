@@ -3,6 +3,6 @@
     "om_host": "http://localhost:8585",
     "#bot_token": "DUMMY_BOT_TOKEN",
     "#storage_token": "DUMMY_STORAGE_TOKEN",
-    "project_scope": "all_projects"
+    "scope": "all_projects"
   }
 }

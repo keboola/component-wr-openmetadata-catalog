@@ -1,61 +1,64 @@
 {
   "type": "object",
-  "title": "Project",
+  "title": "Source",
   "properties": {
+    "scope": {
+      "type": "string",
+      "title": "Scope",
+      "enum": [
+        "this_project",
+        "all_projects"
+      ],
+      "default": "this_project",
+      "description": "What this row catalogs",
+      "options": {
+        "enum_titles": [
+          "This project",
+          "All organization projects"
+        ],
+        "tooltip": "This project catalogs a single project via a Storage token (or the forwarded host-project token). All organization projects enumerates the org with a Management token and writes every project it finds."
+      },
+      "propertyOrder": 10
+    },
     "#storage_token": {
       "type": "string",
       "title": "Storage Token",
       "format": "password",
       "description": "Read-only Storage token for this project",
       "options": {
-        "tooltip": "Leave empty for the host project (the config's own project uses the forwarded token). Required for any other project: create a read-only Storage token in that project and paste it here."
-      },
-      "propertyOrder": 10
-    },
-    "project_name_override": {
-      "type": "string",
-      "title": "Project Name Override",
-      "description": "Human-readable OpenMetadata Database name",
-      "options": {
-        "tooltip": "Defaults to the project name resolved from the token."
+        "dependencies": {
+          "scope": "this_project"
+        },
+        "tooltip": "Leave empty to catalog the config's own (host) project via the forwarded token. Required for any other project: create a read-only Storage token in that project and paste it here."
       },
       "propertyOrder": 20
     },
-    "stages": {
-      "type": "array",
-      "title": "Bucket Stages",
-      "format": "select",
-      "uniqueItems": true,
-      "description": "Which bucket stages to catalog",
-      "items": {
-        "type": "string",
-        "enum": [
-          "in",
-          "out"
-        ],
-        "options": {
-          "enum_titles": [
-            "Input (in)",
-            "Output (out)"
-          ]
-        }
-      },
+    "project_name_override": {
+      "type": "string",
+      "title": "Project Name Override (Optional)",
+      "description": "Optional human-readable OpenMetadata Database name",
       "options": {
-        "tooltip": "Defaults to both input and output stages."
+        "dependencies": {
+          "scope": "this_project"
+        },
+        "tooltip": "Defaults to the project name resolved from the token."
       },
       "propertyOrder": 30
     },
-    "bucket_allowlist": {
+    "buckets": {
       "type": "array",
-      "title": "Bucket Allowlist",
+      "title": "Buckets",
       "format": "select",
       "uniqueItems": true,
-      "description": "Only catalog these buckets (empty = all)",
+      "description": "Buckets to catalog (empty = all)",
       "items": {
         "type": "string",
         "enum": []
       },
       "options": {
+        "dependencies": {
+          "scope": "this_project"
+        },
         "tags": true,
         "async": {
           "label": "Load Buckets",
@@ -66,26 +69,212 @@
       },
       "propertyOrder": 40
     },
-    "bucket_denylist": {
+    "#manage_token": {
+      "type": "string",
+      "title": "Management Token",
+      "format": "password",
+      "description": "Management API token with manage:storage-tokens scope",
+      "options": {
+        "dependencies": {
+          "scope": "all_projects"
+        },
+        "tooltip": "Org-wide credential used only to enumerate projects and mint short-lived read-only Storage tokens. Host the config in a locked-down admin project."
+      },
+      "propertyOrder": 50
+    },
+    "organization_id": {
+      "type": "string",
+      "title": "Organization ID",
+      "description": "Keboola organization to enumerate",
+      "options": {
+        "dependencies": {
+          "scope": "all_projects"
+        },
+        "tooltip": "Enumeration is bound to this single organization via GET /manage/organizations/{id}/projects; the component never lists all organizations."
+      },
+      "propertyOrder": 60
+    },
+    "projects": {
       "type": "array",
-      "title": "Bucket Denylist",
+      "title": "Projects",
       "format": "select",
       "uniqueItems": true,
-      "description": "Exclude these buckets",
+      "description": "Projects to enumerate and write (empty = all)",
       "items": {
         "type": "string",
         "enum": []
       },
       "options": {
+        "dependencies": {
+          "scope": "all_projects"
+        },
         "tags": true,
         "async": {
-          "label": "Load Buckets",
-          "action": "listBuckets",
+          "label": "Load Projects",
+          "action": "listProjects",
           "autoload": true,
           "cache": true
         }
       },
-      "propertyOrder": 50
+      "propertyOrder": 70
+    },
+    "write_pipelines": {
+      "type": "boolean",
+      "format": "checkbox",
+      "title": "Write Pipelines",
+      "default": true,
+      "description": "Emit Pipeline entities for component configs and flows",
+      "options": {
+        "tooltip": "Enabled by default. Turn off for a catalog-only run (tables, columns, lineage) with no pipeline entities."
+      },
+      "propertyOrder": 80
+    },
+    "configurations": {
+      "type": "array",
+      "title": "Configurations",
+      "format": "select",
+      "uniqueItems": true,
+      "description": "Component configs to emit as pipelines (empty = all)",
+      "items": {
+        "type": "string",
+        "enum": []
+      },
+      "options": {
+        "dependencies": {
+          "scope": "this_project",
+          "write_pipelines": true
+        },
+        "tags": true,
+        "async": {
+          "label": "Load Configurations",
+          "action": "listConfigurations",
+          "autoload": true,
+          "cache": true
+        },
+        "tooltip": "Only selectable for a single project. An organization-wide row emits every eligible producing config it finds in each project."
+      },
+      "propertyOrder": 90
+    },
+    "flows": {
+      "type": "array",
+      "title": "Flows",
+      "format": "select",
+      "uniqueItems": true,
+      "description": "Flows to emit as pipelines (empty = all)",
+      "items": {
+        "type": "string",
+        "enum": []
+      },
+      "options": {
+        "dependencies": {
+          "scope": "this_project",
+          "write_pipelines": true
+        },
+        "tags": true,
+        "async": {
+          "label": "Load Flows",
+          "action": "listFlows",
+          "autoload": true,
+          "cache": true
+        },
+        "tooltip": "Only selectable for a single project. An organization-wide row emits every eligible flow it finds in each project."
+      },
+      "propertyOrder": 100
+    },
+    "write_pipeline_status": {
+      "type": "boolean",
+      "format": "checkbox",
+      "title": "Write Pipeline Status",
+      "default": true,
+      "description": "Emit run history as pipeline status",
+      "options": {
+        "dependencies": {
+          "write_pipelines": true
+        },
+        "tooltip": "Enabled by default when pipelines are written."
+      },
+      "propertyOrder": 110
+    },
+    "advanced": {
+      "type": "object",
+      "title": "Advanced",
+      "propertyOrder": 200,
+      "options": {
+        "collapsed": true
+      },
+      "properties": {
+        "merge_mode": {
+          "type": "string",
+          "title": "Merge Mode",
+          "enum": [
+            "three_way_merge",
+            "keboola_always_wins"
+          ],
+          "default": "three_way_merge",
+          "description": "How to reconcile OpenMetadata edits with Keboola-sourced values",
+          "options": {
+            "enum_titles": [
+              "Three-way merge",
+              "Keboola overwrites"
+            ],
+            "tooltip": "Three-way merge keeps fields a person edited in OpenMetadata and logs the change; Keboola overwrites replaces them."
+          },
+          "propertyOrder": 10
+        },
+        "failure_mode": {
+          "type": "string",
+          "title": "Failure Mode",
+          "enum": [
+            "collect_and_fail",
+            "fail_fast",
+            "log_only"
+          ],
+          "default": "collect_and_fail",
+          "description": "How entity failures affect the job outcome",
+          "options": {
+            "enum_titles": [
+              "Collect and fail at end",
+              "Fail fast",
+              "Log only"
+            ],
+            "tooltip": "Collect and fail at end records every per-entity failure in the run report and fails the job once all entities are processed. Fail fast stops on the first failure. Log only never fails the job."
+          },
+          "propertyOrder": 20
+        },
+        "write_lineage": {
+          "type": "boolean",
+          "format": "checkbox",
+          "title": "Write Table Lineage",
+          "default": true,
+          "description": "Emit declared table-level lineage",
+          "options": {
+            "tooltip": "Enabled by default."
+          },
+          "propertyOrder": 30
+        },
+        "write_column_lineage": {
+          "type": "boolean",
+          "format": "checkbox",
+          "title": "Write Column Lineage",
+          "default": true,
+          "description": "Emit column-level lineage from transformation SQL",
+          "options": {
+            "tooltip": "Enabled by default."
+          },
+          "propertyOrder": 40
+        },
+        "full_refresh": {
+          "type": "boolean",
+          "format": "checkbox",
+          "title": "Full Refresh",
+          "default": false,
+          "description": "Ignore per-bucket digests and re-push everything this run",
+          "options": {
+            "tooltip": "Disabled by default; incremental digests skip unchanged buckets."
+          },
+          "propertyOrder": 90
+        }
+      }
     }
   }
 }

@@ -2,12 +2,10 @@ import pytest
 from keboola.component.exceptions import UserException
 
 from configuration import (
-    BranchFilter,
     Configuration,
     FailureMode,
     MergeMode,
     ProjectScope,
-    Stage,
 )
 
 
@@ -24,25 +22,26 @@ def test_valid_tier1_config_parses():
     cfg = Configuration(**_tier1_params())
     assert cfg.om_host == "https://om.example.com"
     assert cfg.bot_token == "jwt-abc"
-    assert cfg.project_scope == ProjectScope.ROWS
+    assert cfg.scope == ProjectScope.THIS_PROJECT
     assert cfg.merge_mode == MergeMode.THREE_WAY_MERGE
     assert cfg.failure_mode == FailureMode.COLLECT_AND_FAIL
-    assert cfg.branch_filter == BranchFilter.PRODUCTION_ONLY
     assert cfg.write_lineage is True
     assert cfg.write_column_lineage is True
-    assert cfg.stages == [Stage.IN, Stage.OUT]
-    assert cfg.bucket_allowlist == []
+    assert cfg.buckets == []
+    assert cfg.configurations == []
+    assert cfg.flows == []
+    assert cfg.projects == []
 
 
 def test_valid_tier2_config_parses():
     cfg = Configuration(
         **_tier1_params(
-            project_scope="all_projects",
+            scope="all_projects",
             **{"#manage_token": "manage-xyz"},
             organization_id="123",
         )
     )
-    assert cfg.project_scope == ProjectScope.ALL_PROJECTS
+    assert cfg.scope == ProjectScope.ALL_PROJECTS
     assert cfg.manage_token == "manage-xyz"
     assert cfg.organization_id == "123"
 
@@ -61,19 +60,19 @@ def test_missing_bot_token_raises_userexception():
 
 def test_all_projects_without_manage_token_raises_userexception():
     with pytest.raises(UserException) as exc:
-        Configuration(**_tier1_params(project_scope="all_projects", organization_id="123"))
+        Configuration(**_tier1_params(scope="all_projects", organization_id="123"))
     assert "manage_token" in str(exc.value) or "#manage_token" in str(exc.value)
 
 
 def test_all_projects_without_organization_id_raises_userexception():
     with pytest.raises(UserException) as exc:
-        Configuration(**_tier1_params(project_scope="all_projects", **{"#manage_token": "manage-xyz"}))
+        Configuration(**_tier1_params(scope="all_projects", **{"#manage_token": "manage-xyz"}))
     assert "organization_id" in str(exc.value)
 
 
 def test_all_projects_missing_both_names_both_in_message():
     with pytest.raises(UserException) as exc:
-        Configuration(**_tier1_params(project_scope="all_projects"))
+        Configuration(**_tier1_params(scope="all_projects"))
     message = str(exc.value)
     assert "#manage_token" in message and "organization_id" in message
 
@@ -115,3 +114,21 @@ def test_service_name_override_wins():
 def test_storage_token_row_field_alias():
     cfg = Configuration(**_tier1_params(**{"#storage_token": "row-token"}))
     assert cfg.storage_token == "row-token"
+
+
+def test_selector_fields_parse_non_empty():
+    cfg = Configuration(
+        **_tier1_params(
+            buckets=["in.c-main"],
+            configurations=["123", "456"],
+            flows=["789"],
+            scope="all_projects",
+            **{"#manage_token": "manage-xyz"},
+            organization_id="123",
+            projects=["111", "222"],
+        )
+    )
+    assert cfg.buckets == ["in.c-main"]
+    assert cfg.configurations == ["123", "456"]
+    assert cfg.flows == ["789"]
+    assert cfg.projects == ["111", "222"]

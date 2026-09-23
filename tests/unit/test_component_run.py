@@ -3,9 +3,9 @@
 Kept under ``tests/unit`` (the done-bar runs ``pytest tests/unit``) and fully
 self-contained (network clients faked, a temporary ``KBC_DATADIR``):
 
-* Issue B — the tombstone pass is scope-safe: with a ``bucket_allowlist`` it
+* Issue B — the tombstone pass is scope-safe: with a ``buckets`` selector it
   reconciles ONLY within the enumerated buckets, never deleting entities of
-  allowlist-excluded buckets, while still removing an in-scope table that no
+  selector-excluded buckets, while still removing an in-scope table that no
   longer exists in Keboola.
 * Failure modes — ``collect_and_fail`` / ``fail_fast`` (both exit 1) and
   ``log_only`` (exit 0) each have unit coverage.
@@ -24,8 +24,9 @@ import report as report_mod
 from client.om_client import OMClient, OMNotFound
 from client.storage_reader import SourceBucket, SourceColumn, SourceTable
 from component import ProjectContext, _ProjectRun
-from configuration import Configuration, FailureMode, MergeMode
+from configuration import FailureMode, MergeMode
 from mapping import fqn as fqn_mod
+from mapping import lineage_builder
 from mapping.entity_builder import EntityBuilder
 from mapping.pipeline_builder import PipelineBuilder
 from merge import SnapshotStore, ThreeWayMerger
@@ -75,7 +76,7 @@ class FakeOM:
         self.is_2_0_or_newer = False
         self.fail_tables = fail_tables
         # Mirror the real client's contract: probe_version() records server_version,
-        # which run() reads back (so om_version_override can override it).
+        # which run() reads back to gate the >=2.0 write paths.
         self.server_version = "1.13.4"
 
     def probe_version(self):
@@ -202,7 +203,7 @@ class TombstoneOM(FakeOM):
 
 
 def test_tombstone_is_scope_safe_under_allowlist(tmp_path, monkeypatch, _env):
-    params = {**BASE_PARAMS, "service_name": SERVICE, "bucket_allowlist": ["out.c-keep"]}
+    params = {**BASE_PARAMS, "service_name": SERVICE, "buckets": ["out.c-keep"]}
     monkeypatch.setenv("KBC_DATADIR", _make_datadir(tmp_path, params))
     om = TombstoneOM()
     monkeypatch.setattr(component_mod, "OMClient", lambda *a, **k: om)
@@ -326,7 +327,7 @@ def test_incremental_skip_is_tombstone_safe_and_writes_nothing():
 
     comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
     comp._config = SimpleNamespace(failure_mode=FailureMode.COLLECT_AND_FAIL)  # ty: ignore[invalid-assignment]
-    config = SimpleNamespace(full_refresh=False, stages=[], bucket_allowlist=[], bucket_denylist=[])
+    config = SimpleNamespace(full_refresh=False, buckets=[])
 
     # config/om are duck-typed test doubles (SimpleNamespace / _RecordingOM).
     comp._catalog_pass(
@@ -409,31 +410,292 @@ def test_pipeline_status_404_is_recorded_not_fatal(monkeypatch):
     assert "pipeline status" in failed[0]["detail"]
 
 
-# ----------------------------------------- IMPORTANT 3: om_version_override drives the gate
+# ----------------------------------- IMPORTANT 3: version is always the probed value
 
 
-def _config_with(**extra) -> Configuration:
-    return Configuration(**{"om_host": "https://om.example.com", "#bot_token": "t", **extra})
-
-
-def test_om_version_override_drives_2_0_gate():
-    """With om_version_override set, the is_2_0_or_newer gate follows the override,
-    not the probed /system/version value."""
+def test_server_version_always_follows_the_probe():
+    """There is no override any more: ``server_version`` (and the >=2.0 gate) is
+    always whatever ``probe_version()`` recorded from ``/system/version``."""
     om = OMClient("https://om.example.com", "tok")
     om.server_version = "1.13.4"  # as if just probed
     assert om.is_2_0_or_newer is False
 
-    component_mod.Component._apply_version_override(_config_with(om_version_override="2.1.0"), om)
-
-    assert om.server_version == "2.1.0"
-    assert om.is_2_0_or_newer is True  # the gate now follows the override
+    om.server_version = "2.1.0"  # as if a later probe recorded a newer version
+    assert om.is_2_0_or_newer is True
 
 
-def test_om_version_override_absent_keeps_probe():
-    om = OMClient("https://om.example.com", "tok")
-    om.server_version = "1.13.4"  # as if just probed
+# ------------------------------------- Phase A: pipeline-node lineage wiring
 
-    component_mod.Component._apply_version_override(_config_with(), om)
 
-    assert om.server_version == "1.13.4"  # untouched
-    assert om.is_2_0_or_newer is False
+class _LineageRecordingOM:
+    """OM double for ``_lineage_pass``/``_refresh_lineage`` coverage: resolves
+    FQNs from a fixed id table and records every put/delete call."""
+
+    def __init__(self, known_ids: dict[str, str]):
+        self.known_ids = known_ids
+        self.put_calls: list[dict] = []
+        self.delete_calls: list[tuple[str, str, str]] = []
+
+    def get_by_fqn(self, kind, fqn, fields=None):
+        entity_id = self.known_ids.get(fqn)
+        return {"id": entity_id} if entity_id else None
+
+    def put_lineage(self, request):
+        self.put_calls.append(request)
+
+    def delete_lineage_by_source(self, entity_type, fqn, source):
+        self.delete_calls.append((entity_type, fqn, source))
+
+
+def test_lineage_pass_uses_pipeline_edges_when_pipeline_exists_else_declared_fallback():
+    """Per the Phase A contract: a producing config WITH a pipeline_fqn (the
+    normal path, write_pipelines on) gets pipeline-node edges (input->pipeline,
+    pipeline->output); one WITHOUT a pipeline_fqn (write_pipelines off) falls
+    back to the old table->table ``declared_edges``."""
+    svc, proj, pid = "keboola-stack", "Acme_Project", "4214"
+
+    class _TwoConfigReader:
+        def list_component_configs(self):
+            return [
+                {
+                    "id": "keboola.snowflake-transformation",
+                    "configurations": [
+                        {
+                            "id": "cfg-with-pipeline",
+                            "configuration": {
+                                "storage": {
+                                    "input": {"tables": [{"source": "in.c-main.a"}]},
+                                    "output": {"tables": [{"destination": "out.c-res.x"}]},
+                                }
+                            },
+                        }
+                    ],
+                },
+                {
+                    "id": "keboola.ex-generic",
+                    "configurations": [
+                        {
+                            "id": "cfg-without-pipeline",
+                            "configuration": {
+                                "storage": {
+                                    "input": {"tables": [{"source": "in.c-main.b"}]},
+                                    "output": {"tables": [{"destination": "out.c-res.y"}]},
+                                }
+                            },
+                        }
+                    ],
+                },
+            ]
+
+    run = _ProjectRun(
+        ctx=ProjectContext(project_id=pid, project_name=proj, storage_token="t", storage_url="https://s"),
+        reader=_TwoConfigReader(),  # ty: ignore[invalid-argument-type]  (duck-typed test double)
+        entities=EntityBuilder(svc, proj, pid, "https://ui.example"),
+        pipelines=PipelineBuilder(svc, proj, pid, "https://ui.example"),
+    )
+    pipeline_fqn_value = "keboola-stack.Acme_Project__cfg-with-pipeline"
+    run.pipeline_fqn_by_config["cfg-with-pipeline"] = pipeline_fqn_value
+    # "cfg-without-pipeline" is deliberately absent -> as if write_pipelines was off.
+
+    known_ids = {
+        fqn_mod.table_fqn_from_storage_id(svc, proj, "in.c-main.a"): "id-in-a",
+        fqn_mod.table_fqn_from_storage_id(svc, proj, "out.c-res.x"): "id-out-x",
+        fqn_mod.table_fqn_from_storage_id(svc, proj, "in.c-main.b"): "id-in-b",
+        fqn_mod.table_fqn_from_storage_id(svc, proj, "out.c-res.y"): "id-out-y",
+        pipeline_fqn_value: "id-pipeline",
+    }
+    om = _LineageRecordingOM(known_ids)
+    report = component_mod.RunReport(run_id="rid")
+    config = SimpleNamespace(write_lineage=True, write_column_lineage=False)
+
+    comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
+    comp._lineage_pass(config, om, run, report)  # ty: ignore[invalid-argument-type]
+
+    edges_by_ids = {(r["edge"]["fromEntity"]["id"], r["edge"]["toEntity"]["id"]): r["edge"] for r in om.put_calls}
+    assert len(om.put_calls) == 3  # 2 pipeline-node edges + 1 declared fallback edge
+
+    # config WITH a pipeline -> input->pipeline and pipeline->output edges
+    in_edge = edges_by_ids[("id-in-a", "id-pipeline")]
+    assert in_edge["fromEntity"]["type"] == "table"
+    assert in_edge["toEntity"]["type"] == "pipeline"
+    out_edge = edges_by_ids[("id-pipeline", "id-out-x")]
+    assert out_edge["fromEntity"]["type"] == "pipeline"
+    assert out_edge["toEntity"]["type"] == "table"
+
+    # config WITHOUT a pipeline -> the old table->table declared_edges fallback
+    fallback_edge = edges_by_ids[("id-in-b", "id-out-y")]
+    assert fallback_edge["fromEntity"]["type"] == "table"
+    assert fallback_edge["toEntity"]["type"] == "table"
+
+
+# --------------------------- Phase B: SQL-inferred input -> pipeline wiring
+
+
+def _direct_sql_config(cfg_id: str, out_declared: dict, script: list[str], in_declared: list | None = None) -> dict:
+    """A component-config fixture: declared storage + inline transformation SQL."""
+    return {
+        "id": cfg_id,
+        "configuration": {
+            "storage": {
+                "input": {"tables": in_declared or []},
+                "output": out_declared,
+            },
+            "parameters": {"blocks": [{"codes": [{"name": "code1", "script": script}]}]},
+        },
+    }
+
+
+def test_lineage_pass_infers_input_pipeline_edge_from_direct_sql_when_declared_input_empty():
+    """The tr-fact_pull_request upstream-fix scenario (Phase B): a config
+    declares an OUTPUT mapping but an EMPTY ``storage.input.tables`` because
+    its SQL reads the upstream table via a direct fully-qualified ref instead
+    of a declared input. The column-lineage engine's ``known_table_fqns``
+    gate recovers that ref as a real input, and ``_lineage_pass`` wires it to
+    the pipeline the same way a declared input would be
+    (``input_table -> pipeline``, reusing the Phase-A edge shape)."""
+    svc, proj, pid = "keboola-stack", "Acme_Project", "4214"
+
+    class _DirectSqlReader:
+        def list_component_configs(self):
+            return [
+                {
+                    "id": "keboola.snowflake-transformation",
+                    "configurations": [
+                        _direct_sql_config(
+                            "cfg-direct-sql",
+                            out_declared={"tables": [{"source": "result", "destination": "out.c-sales.result"}]},
+                            script=['INSERT INTO "result" SELECT "id", "amount" FROM "PROJDB"."in.c-main"."orders"'],
+                        )
+                    ],
+                }
+            ]
+
+    run = _ProjectRun(
+        ctx=ProjectContext(project_id=pid, project_name=proj, storage_token="t", storage_url="https://s"),
+        reader=_DirectSqlReader(),  # ty: ignore[invalid-argument-type]  (duck-typed test double)
+        entities=EntityBuilder(svc, proj, pid, "https://ui.example"),
+        pipelines=PipelineBuilder(svc, proj, pid, "https://ui.example"),
+    )
+    pipeline_fqn_value = "keboola-stack.Acme_Project__cfg-direct-sql"
+    run.pipeline_fqn_by_config["cfg-direct-sql"] = pipeline_fqn_value
+
+    in_fqn = fqn_mod.table_fqn_from_storage_id(svc, proj, "in.c-main.orders")
+    out_fqn = fqn_mod.table_fqn_from_storage_id(svc, proj, "out.c-sales.result")
+    run.column_catalog[in_fqn] = {"id", "amount"}
+    run.column_catalog[out_fqn] = {"id", "amount"}
+
+    known_ids = {in_fqn: "id-in-orders", out_fqn: "id-out-result", pipeline_fqn_value: "id-pipeline"}
+    om = _LineageRecordingOM(known_ids)
+    report = component_mod.RunReport(run_id="rid")
+    config = SimpleNamespace(write_lineage=True, write_column_lineage=True)
+
+    comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
+    comp._lineage_pass(config, om, run, report)  # ty: ignore[invalid-argument-type]
+
+    edges_by_ids = {(r["edge"]["fromEntity"]["id"], r["edge"]["toEntity"]["id"]): r["edge"] for r in om.put_calls}
+
+    # the SQL-inferred input -> pipeline edge (storage.input.tables was declared empty)
+    in_edge = edges_by_ids[("id-in-orders", "id-pipeline")]
+    assert in_edge["fromEntity"]["type"] == "table"
+    assert in_edge["toEntity"]["type"] == "pipeline"
+    assert in_edge["lineageDetails"]["source"] == lineage_builder.SOURCE_PIPELINE
+
+    # the declared output -> pipeline edge (Phase A, unaffected by Phase B)
+    out_edge = edges_by_ids[("id-pipeline", "id-out-result")]
+    assert out_edge["fromEntity"]["type"] == "pipeline"
+    assert out_edge["toEntity"]["type"] == "table"
+
+
+def test_lineage_pass_skips_sql_inference_when_declared_input_present():
+    """Inference only fills the gap: when ``storage.input.tables`` is NOT
+    empty, the declared mapping stays authoritative and no
+    ``inferred_input -> pipeline`` edge is added — even for a table the SQL
+    ALSO reads via a separate, otherwise-cataloged direct qualified ref."""
+    svc, proj, pid = "keboola-stack", "Acme_Project", "4214"
+
+    class _MixedReader:
+        def list_component_configs(self):
+            return [
+                {
+                    "id": "keboola.snowflake-transformation",
+                    "configurations": [
+                        _direct_sql_config(
+                            "cfg-mixed",
+                            out_declared={"tables": [{"source": "result", "destination": "out.c-sales.result"}]},
+                            in_declared=[{"source": "in.c-main.declared", "destination": "declared"}],
+                            script=[
+                                'INSERT INTO "result" SELECT "id" FROM "declared"',
+                                'INSERT INTO "result" SELECT "id" FROM "PROJDB"."in.c-main"."extra"',
+                            ],
+                        )
+                    ],
+                }
+            ]
+
+    run = _ProjectRun(
+        ctx=ProjectContext(project_id=pid, project_name=proj, storage_token="t", storage_url="https://s"),
+        reader=_MixedReader(),  # ty: ignore[invalid-argument-type]  (duck-typed test double)
+        entities=EntityBuilder(svc, proj, pid, "https://ui.example"),
+        pipelines=PipelineBuilder(svc, proj, pid, "https://ui.example"),
+    )
+    pipeline_fqn_value = "keboola-stack.Acme_Project__cfg-mixed"
+    run.pipeline_fqn_by_config["cfg-mixed"] = pipeline_fqn_value
+
+    declared_fqn = fqn_mod.table_fqn_from_storage_id(svc, proj, "in.c-main.declared")
+    extra_fqn = fqn_mod.table_fqn_from_storage_id(svc, proj, "in.c-main.extra")
+    out_fqn = fqn_mod.table_fqn_from_storage_id(svc, proj, "out.c-sales.result")
+    run.column_catalog[declared_fqn] = {"id"}
+    run.column_catalog[extra_fqn] = {"id"}
+    run.column_catalog[out_fqn] = {"id"}
+
+    known_ids = {
+        declared_fqn: "id-in-declared",
+        extra_fqn: "id-in-extra",
+        out_fqn: "id-out-result",
+        pipeline_fqn_value: "id-pipeline",
+    }
+    om = _LineageRecordingOM(known_ids)
+    report = component_mod.RunReport(run_id="rid")
+    config = SimpleNamespace(write_lineage=True, write_column_lineage=True)
+
+    comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
+    comp._lineage_pass(config, om, run, report)  # ty: ignore[invalid-argument-type]
+
+    put_pairs = {(r["edge"]["fromEntity"]["id"], r["edge"]["toEntity"]["id"]) for r in om.put_calls}
+    assert ("id-in-declared", "id-pipeline") in put_pairs  # Phase A: declared input, unaffected
+    assert ("id-in-extra", "id-pipeline") not in put_pairs  # Phase B inference stays off: declared list non-empty
+
+
+def test_refresh_lineage_deletes_stale_edges_keyed_on_target_type():
+    """``_refresh_lineage``'s stale-edge cleanup must delete by each edge's
+    TARGET type, not a hardcoded "table": an input->pipeline edge's target is
+    the pipeline, a pipeline->output edge's target is the table."""
+    svc, proj, pid = "keboola-stack", "Acme_Project", "4214"
+    storage = {
+        "input": {"tables": [{"source": "in.c-main.a"}]},
+        "output": {"tables": [{"destination": "out.c-res.x"}]},
+    }
+    pipeline_fqn_value = "keboola-stack.Acme_Project__cfg1"
+    edges = lineage_builder.pipeline_edges(storage, service_name=svc, project=proj, pipeline_fqn=pipeline_fqn_value)
+    assert len(edges) == 2  # sanity: one input->pipeline, one pipeline->output edge
+
+    in_table_fqn = fqn_mod.table_fqn_from_storage_id(svc, proj, "in.c-main.a")
+    out_table_fqn = fqn_mod.table_fqn_from_storage_id(svc, proj, "out.c-res.x")
+    known_ids = {in_table_fqn: "id-in-a", out_table_fqn: "id-out-x", pipeline_fqn_value: "id-pipeline"}
+    om = _LineageRecordingOM(known_ids)
+    run = _ProjectRun(
+        ctx=ProjectContext(project_id=pid, project_name=proj, storage_token="t", storage_url="https://s"),
+        reader=OneBucketStorage(),  # ty: ignore[invalid-argument-type]  (unused by _refresh_lineage)
+        entities=EntityBuilder(svc, proj, pid, "https://ui.example"),
+        pipelines=PipelineBuilder(svc, proj, pid, "https://ui.example"),
+    )
+    report = component_mod.RunReport(run_id="rid")
+    comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
+
+    comp._refresh_lineage(om, run, report, edges)
+
+    delete_targets = {(entity_type, fqn) for entity_type, fqn, _source in om.delete_calls}
+    assert ("pipeline", pipeline_fqn_value) in delete_targets
+    assert ("table", out_table_fqn) in delete_targets
+    # never the pre-fix hardcoded "table" for the pipeline target
+    assert ("table", pipeline_fqn_value) not in delete_targets

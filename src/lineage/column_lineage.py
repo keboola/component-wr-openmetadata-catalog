@@ -22,6 +22,7 @@ from sqlglot.lineage import lineage as sqlglot_lineage
 
 from lineage.dialect import DialectInfo
 from lineage.resolution import CoverageMetrics, Resolution
+from mapping import fqn as fqn_mod
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,28 @@ class _WorkspaceGraph:
         self.table_edges: set[tuple[str, str]] = set()
         self.col_edges: set[tuple[str, str, str, str]] = set()
         self.star_tables: set[str] = set()
+        # Phase B: workspace keys that carried a QUALIFIED ref (``db.name`` —
+        # a direct fully-qualified SQL ref, not a bare workspace alias),
+        # tracked separately by role so a table read via direct SQL is never
+        # mistaken for an inferred *output* (and vice versa) once both maps
+        # are built (see ``_build_inferred_map`` / ``extract_column_lineage``).
+        self.qualified_sources: set[str] = set()
+        self.qualified_targets: set[str] = set()
+
+
+def _table_key(tbl: exp.Table) -> str:
+    """Workspace key for a table ref.
+
+    ``QUALIFIED`` (``f"{db}.{name}"``) when the parser reports a ``.db`` part —
+    a direct fully-qualified SQL ref crossing Storage buckets/schemas (Phase
+    B); the bare ``.name`` otherwise, exactly as before — a workspace alias
+    resolved through the config's declared ``in_map``/``out_map`` (Phase A,
+    unchanged). SQLGlot parses a quoted identifier that itself contains a dot
+    (a Keboola bucket id, e.g. ``"in.c-bucket"``) as a single ``.db`` segment
+    with the dot intact, so this key reproduces the Keboola storage id
+    (``stage.c-bucket.table``) verbatim for the Snowflake-validated case.
+    """
+    return f"{tbl.db}.{tbl.name}" if tbl.db else tbl.name
 
 
 def _select_and_target(
@@ -79,16 +102,21 @@ def _select_and_target(
     if isinstance(tree, exp.Create):
         created = tree.this.find(exp.Table) if tree.this else None
         cols = [c.name for c in tree.find_all(exp.ColumnDef)]
-        if created is not None and cols:
-            graph.ws_schema[created.name] = cols
+        tgt_key = _table_key(created) if created is not None else None
+        if created is not None and created.db:
+            graph.qualified_targets.add(tgt_key)
+        if tgt_key is not None and cols:
+            graph.ws_schema[tgt_key] = cols
         if isinstance(tree.expression, exp.Select | exp.Union):
-            return tree.expression, (created.name if created is not None else None), cols
+            return tree.expression, tgt_key, cols
         return None, None, []
 
     if isinstance(tree, exp.Insert):
         target = tree.this
         table = target.find(exp.Table) if target else None
-        tgt_tbl = table.name if table is not None else None
+        tgt_tbl = _table_key(table) if table is not None else None
+        if table is not None and table.db:
+            graph.qualified_targets.add(tgt_tbl)
         explicit = [i.name for i in target.find_all(exp.Identifier)][1:] if target is not None else []
         if isinstance(tree.expression, exp.Select):
             return tree.expression, tgt_tbl, explicit
@@ -131,7 +159,9 @@ def _trace_projection(
     for leaf in node.walk():
         src = leaf.source
         if isinstance(src, exp.Table):
-            src_tbl = src.name
+            src_tbl = _table_key(src)
+            if src.db:
+                graph.qualified_sources.add(src_tbl)
             src_col = leaf.name.split(".")[-1].strip('"')
             graph.table_edges.add((src_tbl, tgt_tbl or ""))
             if src_col == "*":
@@ -151,20 +181,69 @@ def _trace_projection(
         result.unresolved_notes.append(f"{note_prefix}.{name}: no physical source table")
 
 
+def _build_inferred_map(
+    qualified_keys: set[str],
+    service_name: str,
+    project: str,
+    known_table_fqns: set[str] | None,
+) -> dict[str, str]:
+    """Phase B: promote a QUALIFIED workspace key to a storage id, but only
+    when the run actually cataloged it.
+
+    A qualified ref's key already *is* the Keboola storage id verbatim
+    (``db.name`` == ``stage.c-bucket.table`` for the Snowflake-validated
+    case — schema == bucket id), so ``storage_id = key``. Cross-checking its
+    derived Table FQN against ``known_table_fqns`` is what filters out CTEs,
+    workspace scratch tables and cross-project/non-cataloged refs that happen
+    to carry a dotted ``.db`` part but were never a real Storage table this
+    run saw. ``known_table_fqns=None`` disables Phase B entirely (returns
+    ``{}``), keeping every pre-Phase-B caller's behaviour unchanged.
+    """
+    if known_table_fqns is None:
+        return {}
+    inferred: dict[str, str] = {}
+    for key in sorted(qualified_keys):
+        storage_id = key
+        candidate_fqn = fqn_mod.table_fqn_from_storage_id(service_name, project, storage_id)
+        if candidate_fqn is not None and candidate_fqn in known_table_fqns:
+            inferred[key] = storage_id
+    return inferred
+
+
 def extract_column_lineage(
     statements: list[tuple[str, str]],
     *,
     in_map: dict[str, str],
     out_map: dict[str, str],
     dialect: DialectInfo,
+    service_name: str = "",
+    project: str = "",
+    known_table_fqns: set[str] | None = None,
 ) -> LineageResult:
     """Extract resolved column/table lineage for one transformation config.
 
     Args:
         statements: ordered ``(code_name, sql)`` pairs.
-        in_map: workspace input alias -> storage source table id.
-        out_map: workspace output alias -> storage destination table id.
+        in_map: workspace input alias -> storage source table id (declared;
+            always wins over an inferred entry on the same key).
+        out_map: workspace output alias -> storage destination table id
+            (declared; always wins over an inferred entry on the same key).
         dialect: resolved :class:`DialectInfo`.
+        service_name: OM service name — required (with ``project``) to
+            resolve a qualified ref's Table FQN for the ``known_table_fqns``
+            check; ignored when ``known_table_fqns`` is ``None``.
+        project: Keboola project name — see ``service_name``.
+        known_table_fqns: the run's cataloged Table FQNs. When given, a
+            transformation that reads/writes a table via a DIRECT
+            fully-qualified SQL ref (Snowflake: ``"PROJDB"."in.c-bucket"."t"``,
+            schema == bucket id — the validated dialect; other warehouses may
+            name schemas differently and are not yet mapped, so a qualified
+            ref there simply never matches and is recorded as unresolved,
+            never raised) is recovered as an input/output the same as a
+            declared one, provided the ref resolves onto a table this run
+            actually cataloged. ``None`` (the default) disables this
+            inference outright — pure declared-mapping resolution, matching
+            every pre-Phase-B call site.
     """
     result = LineageResult()
     if not dialect.is_sql:
@@ -194,7 +273,16 @@ def extract_column_lineage(
                     continue
                 _trace_projection(proj, name, select, tgt_tbl, dialect, graph, result, code_name)
 
-    _resolve_to_storage(graph, in_map, out_map, result)
+    # Declared wins on a key collision: the inferred map is the base dict, the
+    # declared one is spread second so its entries overwrite the inferred
+    # ones (spec: "declared mappings stay authoritative; inference only fills
+    # gaps").
+    inferred_in_map = _build_inferred_map(graph.qualified_sources, service_name, project, known_table_fqns)
+    inferred_out_map = _build_inferred_map(graph.qualified_targets, service_name, project, known_table_fqns)
+    effective_in_map = {**inferred_in_map, **in_map}
+    effective_out_map = {**inferred_out_map, **out_map}
+
+    _resolve_to_storage(graph, effective_in_map, effective_out_map, result)
     return result
 
 

@@ -6,12 +6,13 @@ Runs Component against a temporary KBC_DATADIR with the network clients faked.
 import csv
 import io
 import json
+from typing import ClassVar
 
 import pytest
 from keboola.component.exceptions import UserException
 
 import component as component_mod
-from client.manage_client import ManageScopeError
+from client.manage_client import ManageScopeError, MintedProject
 from client.om_client import OMAuthError, OMConnectionError
 from client.storage_reader import SourceBucket, SourceColumn, SourceTable
 
@@ -232,7 +233,7 @@ def test_second_run_loads_base_and_updates_changed_owned_field(tmp_path, monkeyp
 
 
 def test_all_projects_without_manage_token_raises(tmp_path, monkeypatch, _env):
-    params = {**BASE_PARAMS, "project_scope": "all_projects"}
+    params = {**BASE_PARAMS, "scope": "all_projects"}
     monkeypatch.setenv("KBC_DATADIR", _make_datadir(tmp_path, params))
     monkeypatch.setattr(component_mod, "OMClient", FakeOM)
     monkeypatch.setattr(component_mod, "StorageReader", FakeStorage)
@@ -241,7 +242,7 @@ def test_all_projects_without_manage_token_raises(tmp_path, monkeypatch, _env):
 
 
 def test_tier2_scope_failure_degrades(tmp_path, monkeypatch, _env):
-    params = {**BASE_PARAMS, "project_scope": "all_projects", "#manage_token": "mng", "organization_id": "123"}
+    params = {**BASE_PARAMS, "scope": "all_projects", "#manage_token": "mng", "organization_id": "123"}
     monkeypatch.setenv("KBC_DATADIR", _make_datadir(tmp_path, params))
     monkeypatch.setattr(component_mod, "OMClient", FakeOM)
     monkeypatch.setattr(component_mod, "StorageReader", FakeStorage)
@@ -250,7 +251,7 @@ def test_tier2_scope_failure_degrades(tmp_path, monkeypatch, _env):
         def __init__(self, *a, **k):
             pass
 
-        def enumerate_and_mint(self, org):
+        def enumerate_projects(self, org):
             assert org == "123"  # the configured org id is passed through, path-scoped
             raise ManageScopeError("insufficient scope")
 
@@ -261,6 +262,78 @@ def test_tier2_scope_failure_degrades(tmp_path, monkeypatch, _env):
 
     content = (tmp_path / "data" / "out" / "tables" / "catalog_run_report.csv").read_text()
     assert "degraded" in content
+
+
+class FakeManage:
+    """Fake Tier-2 Management client: ``enumerate_projects`` + ``mint_storage_token``
+    called separately (``_resolve_tier2`` no longer calls ``enumerate_and_mint``)."""
+
+    ENUMERATED: ClassVar[list[dict[str, str]]] = [{"id": "1", "name": "Proj One"}, {"id": "2", "name": "Proj Two"}]
+
+    def __init__(self, *a, **k):
+        self.minted_for: list[str] = []
+
+    def enumerate_projects(self, org):
+        assert org == "123"
+        return list(self.ENUMERATED)
+
+    def mint_storage_token(self, project_id, project_name):
+        self.minted_for.append(project_id)
+        return MintedProject(
+            project_id=project_id,
+            project_name=project_name,
+            storage_token=f"tok-{project_id}",
+            storage_url="https://connection.keboola.com",
+        )
+
+
+def test_tier2_scope_mints_and_catalogs_all_projects_by_default(tmp_path, monkeypatch, _env):
+    """An empty ``projects`` selector (the default) means 'all org projects':
+    every enumerated project is minted a token and cataloged."""
+    params = {**BASE_PARAMS, "scope": "all_projects", "#manage_token": "mng", "organization_id": "123"}
+    monkeypatch.setenv("KBC_DATADIR", _make_datadir(tmp_path, params))
+    monkeypatch.setattr(component_mod, "OMClient", FakeOM)
+    monkeypatch.setattr(component_mod, "StorageReader", FakeStorage)
+
+    fake_manage = FakeManage()
+    monkeypatch.setattr(component_mod, "ManageClient", lambda *a, **k: fake_manage)
+
+    component_mod.Component().run()
+
+    assert fake_manage.minted_for == ["1", "2"]
+    report_rows = list(
+        csv.DictReader(io.StringIO((tmp_path / "data" / "out" / "tables" / "catalog_run_report.csv").read_text()))
+    )
+    project_ids = {r["project_id"] for r in report_rows if r["entity_type"] == "Table"}
+    assert project_ids == {"1", "2"}
+
+
+def test_tier2_scope_projects_filter_restricts_minted_tokens(tmp_path, monkeypatch, _env):
+    """A non-empty ``projects`` selector is an explicit allowlist: a token is
+    minted (and the project cataloged) ONLY for the selected project ids —
+    excluded projects never get a minted token at all."""
+    params = {
+        **BASE_PARAMS,
+        "scope": "all_projects",
+        "#manage_token": "mng",
+        "organization_id": "123",
+        "projects": ["2"],
+    }
+    monkeypatch.setenv("KBC_DATADIR", _make_datadir(tmp_path, params))
+    monkeypatch.setattr(component_mod, "OMClient", FakeOM)
+    monkeypatch.setattr(component_mod, "StorageReader", FakeStorage)
+
+    fake_manage = FakeManage()
+    monkeypatch.setattr(component_mod, "ManageClient", lambda *a, **k: fake_manage)
+
+    component_mod.Component().run()
+
+    assert fake_manage.minted_for == ["2"]
+    report_rows = list(
+        csv.DictReader(io.StringIO((tmp_path / "data" / "out" / "tables" / "catalog_run_report.csv").read_text()))
+    )
+    project_ids = {r["project_id"] for r in report_rows if r["entity_type"] == "Table"}
+    assert project_ids == {"2"}
 
 
 def test_collect_and_fail_raises_at_end(tmp_path, monkeypatch, _env):

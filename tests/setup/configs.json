@@ -59,7 +59,7 @@
         "write_pipeline_status": false,
         "write_lineage": false,
         "write_column_lineage": false,
-        "bucket_allowlist": [
+        "buckets": [
           "in.c-ESG-dummy",
           "in.c-TESTUPPERS",
           "in.c-de-test",
@@ -140,7 +140,7 @@
         "write_pipeline_status": false,
         "write_lineage": false,
         "write_column_lineage": false,
-        "bucket_allowlist": [
+        "buckets": [
           "in.c-ESG-dummy",
           "in.c-TESTUPPERS",
           "in.c-de-test",
@@ -222,7 +222,7 @@
         "write_pipeline_status": false,
         "write_lineage": false,
         "write_column_lineage": false,
-        "bucket_allowlist": [
+        "buckets": [
           "in.c-ESG-dummy",
           "in.c-TESTUPPERS",
           "in.c-de-test",
@@ -303,7 +303,7 @@
         "write_pipeline_status": false,
         "write_lineage": false,
         "write_column_lineage": false,
-        "bucket_allowlist": [
+        "buckets": [
           "in.c-ESG-dummy",
           "in.c-TESTUPPERS",
           "in.c-de-test",
@@ -385,7 +385,7 @@
         "write_pipeline_status": false,
         "write_lineage": false,
         "write_column_lineage": false,
-        "bucket_allowlist": [
+        "buckets": [
           "in.c-ESG-dummy",
           "in.c-TESTUPPERS",
           "in.c-de-test",
@@ -467,7 +467,7 @@
         "write_pipeline_status": false,
         "write_lineage": false,
         "write_column_lineage": false,
-        "bucket_allowlist": [
+        "buckets": [
           "in.c-ESG-dummy",
           "in.c-TESTUPPERS",
           "in.c-de-test",
@@ -595,7 +595,7 @@
         "write_pipeline_status": false,
         "write_lineage": false,
         "write_column_lineage": false,
-        "bucket_allowlist": [
+        "buckets": [
           "in.c-ESG-dummy",
           "in.c-TESTUPPERS",
           "in.c-de-test",
@@ -678,31 +678,30 @@
   },
   {
     "name": "18_run_tier2_missing_manage_token",
-    "description": "FAIL run (exit 1, config validation, NO HTTP): project_scope=all_projects with no #manage_token -> Configuration raises UserException -> exit 1 (the user chose Tier-2 but supplied no credential, spec 5.4/6.3). Merge-safe: #manage_token is deliberately NOT in the default secrets.json, so the merge cannot satisfy it. Empty cassette expected.",
+    "description": "FAIL run (exit 1, config validation, NO HTTP): scope=all_projects with no #manage_token -> Configuration raises UserException -> exit 1 (the user chose Tier-2 but supplied no credential, spec 5.4/6.3). Merge-safe: #manage_token is deliberately NOT in the default secrets.json, so the merge cannot satisfy it. Empty cassette expected.",
     "config": {
       "parameters": {
         "om_host": "http://localhost:8585",
         "#bot_token": "DUMMY_BOT_TOKEN",
         "#storage_token": "DUMMY_STORAGE_TOKEN",
-        "project_scope": "all_projects"
+        "scope": "all_projects"
       }
     }
   },
   {
     "name": "19_run_tier2_all_projects",
-    "description": "PASS run (Tier-2): project_scope=all_projects + #manage_token -> GET /manage/organizations[/{id}/projects] enumerate + POST /manage/projects/{id}/tokens mint a short-lived read-only Storage token per project -> catalog each project into ONE coherent OM catalog. Minted token is redacted from the cassette (body field 'token'). CONDITIONAL: needs a real manage:storage-tokens manage token (+ organization_id). If unavailable at record time, this ONE case is recorded later / against a mock; everything else is recorded now. Do NOT block the phase on it.",
+    "description": "PASS run (Tier-2): scope=all_projects + #manage_token -> GET /manage/organizations[/{id}/projects] enumerate + POST /manage/projects/{id}/tokens mint a short-lived read-only Storage token per project -> catalog each project into ONE coherent OM catalog. Minted token is redacted from the cassette (body field 'token'). CONDITIONAL: needs a real manage:storage-tokens manage token (+ organization_id). If unavailable at record time, this ONE case is recorded later / against a mock; everything else is recorded now. Do NOT block the phase on it.",
     "config": {
       "parameters": {
         "om_host": "http://localhost:8585",
         "#bot_token": "DUMMY_BOT_TOKEN",
-        "project_scope": "all_projects",
         "#manage_token": "DUMMY_MANAGE_TOKEN",
         "organization_id": "3697",
         "write_pipelines": false,
         "write_pipeline_status": false,
         "write_lineage": false,
         "write_column_lineage": false,
-        "bucket_allowlist": [
+        "buckets": [
           "in.c-ESG-dummy",
           "in.c-TESTUPPERS",
           "in.c-de-test",
@@ -767,24 +766,25 @@
           "out.c-mareks_out_for_snflk",
           "out.c-postgres-cdc-test-perm",
           "out.c-typeform-LxWl3ZmU"
-        ]
+        ],
+        "scope": "all_projects"
       }
     }
   },
   {
     "name": "20_run_tier2_degrade",
-    "description": "PASS run (exit 0, Tier-2 graceful degradation): project_scope=all_projects + #manage_token whose scope is insufficient -> enumerate/mint fails on 401/403 -> the component degrades to the HOST project (forward_token), emits a prominent warning + a catalog_run_report row action=degraded, and still exits 0 (spec 5.4). CONDITIONAL: needs a scope-limited manage token (or a mocked 403); record later if unavailable. RECORD NOTE: also needs a real KBC_TOKEN for the host-project fallback.",
+    "description": "PASS run (exit 0, Tier-2 graceful degradation): scope=all_projects + #manage_token whose scope is insufficient -> enumerate/mint fails on 401/403 -> the component degrades to the HOST project (forward_token), emits a prominent warning + a catalog_run_report row action=degraded, and still exits 0 (spec 5.4). CONDITIONAL: needs a scope-limited manage token (or a mocked 403); record later if unavailable. RECORD NOTE: also needs a real KBC_TOKEN for the host-project fallback.",
     "config": {
       "parameters": {
         "om_host": "http://localhost:8585",
         "#bot_token": "DUMMY_BOT_TOKEN",
-        "project_scope": "all_projects",
         "#manage_token": "DUMMY_SCOPE_LIMITED_MANAGE_TOKEN",
         "organization_id": "DUMMY_ORG_ID",
         "write_pipelines": false,
         "write_pipeline_status": false,
         "write_lineage": false,
-        "write_column_lineage": false
+        "write_column_lineage": false,
+        "scope": "all_projects"
       }
     }
   },

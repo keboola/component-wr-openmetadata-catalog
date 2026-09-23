@@ -107,6 +107,57 @@ def declared_edges(
     return edges
 
 
+def pipeline_edges(
+    storage: dict,
+    *,
+    service_name: str,
+    project: str,
+    pipeline_fqn: str | None,
+) -> list[LineageEdge]:
+    """Phase A: wire the Pipeline itself as a lineage node from DECLARED storage.
+
+    One edge per declared input (``input_table -> pipeline``) and per declared
+    output (``pipeline -> output_table``) — N+M edges, never a cartesian
+    product. This is what makes a pipeline's Lineage tab show the tables it
+    reads/writes; undeclared inputs recovered by parsing SQL are Phase B, out
+    of scope here. Returns ``[]`` when there is no pipeline (``write_pipelines``
+    off, or the config isn't a pipeline) — callers fall back to
+    :func:`declared_edges` in that case.
+    """
+    if not pipeline_fqn:
+        return []
+    inputs = (storage.get("input") or {}).get("tables") or []
+    outputs = (storage.get("output") or {}).get("tables") or []
+    edges: list[LineageEdge] = []
+    for t in inputs:
+        in_fqn = fqn.table_fqn_from_storage_id(service_name, project, t.get("source", ""))
+        if not in_fqn:
+            continue
+        edges.append(
+            LineageEdge(
+                from_fqn=in_fqn,
+                to_fqn=pipeline_fqn,
+                source=SOURCE_PIPELINE,
+                from_type="table",
+                to_type="pipeline",
+            )
+        )
+    for t in outputs:
+        out_fqn = fqn.table_fqn_from_storage_id(service_name, project, t.get("destination", ""))
+        if not out_fqn:
+            continue
+        edges.append(
+            LineageEdge(
+                from_fqn=pipeline_fqn,
+                to_fqn=out_fqn,
+                source=SOURCE_PIPELINE,
+                from_type="pipeline",
+                to_type="table",
+            )
+        )
+    return edges
+
+
 def view_edge(view_fqn: str, source_fqn: str) -> LineageEdge:
     """ViewLineage edge for a linked/shared bucket (base table -> view)."""
     return LineageEdge(from_fqn=source_fqn, to_fqn=view_fqn, source=SOURCE_VIEW)

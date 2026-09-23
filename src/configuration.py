@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 class ProjectScope(StrEnum):
     """Which multi-project seam to use (spec 5.4)."""
 
-    ROWS = "rows"
+    THIS_PROJECT = "this_project"
     ALL_PROJECTS = "all_projects"
 
 
@@ -38,20 +38,6 @@ class FailureMode(StrEnum):
     COLLECT_AND_FAIL = "collect_and_fail"
     FAIL_FAST = "fail_fast"
     LOG_ONLY = "log_only"
-
-
-class BranchFilter(StrEnum):
-    """Which ``KBC.createdBy.branch.id`` scope to catalog."""
-
-    PRODUCTION_ONLY = "production_only"
-    ALL_BRANCHES = "all_branches"
-
-
-class Stage(StrEnum):
-    """Keboola bucket stages this component can catalog."""
-
-    IN = "in"
-    OUT = "out"
 
 
 class Ssh(BaseModel):
@@ -79,21 +65,19 @@ class Configuration(BaseModel):
     bot_token: str = Field(alias="#bot_token")
     service_name: str | None = None
 
-    # --- Scope / multi-project (root) ---
-    project_scope: ProjectScope = ProjectScope.ROWS
+    # --- Scope / multi-project (row) ---
+    scope: ProjectScope = ProjectScope.THIS_PROJECT
     manage_token: str | None = Field(default=None, alias="#manage_token")
     organization_id: str | None = None
 
-    # --- Behaviour (root, Advanced) ---
+    # --- Behaviour (row, Advanced) ---
     merge_mode: MergeMode = MergeMode.THREE_WAY_MERGE
     failure_mode: FailureMode = FailureMode.COLLECT_AND_FAIL
-    branch_filter: BranchFilter = BranchFilter.PRODUCTION_ONLY
     write_lineage: bool = True
     write_column_lineage: bool = True
     write_pipelines: bool = True
     write_pipeline_status: bool = True
     full_refresh: bool = False
-    om_version_override: str | None = None
 
     # --- SSH (root) ---
     use_ssh_tunnel: bool = False
@@ -102,9 +86,10 @@ class Configuration(BaseModel):
     # --- Row-level ---
     storage_token: str | None = Field(default=None, alias="#storage_token")
     project_name_override: str | None = None
-    stages: list[Stage] = Field(default_factory=lambda: [Stage.IN, Stage.OUT])
-    bucket_allowlist: list[str] = Field(default_factory=list)
-    bucket_denylist: list[str] = Field(default_factory=list)
+    buckets: list[str] = Field(default_factory=list)
+    configurations: list[str] = Field(default_factory=list)
+    flows: list[str] = Field(default_factory=list)
+    projects: list[str] = Field(default_factory=list)
 
     def __init__(self, **data: object) -> None:
         try:
@@ -116,7 +101,7 @@ class Configuration(BaseModel):
     @model_validator(mode="after")
     def _check_cross_fields(self) -> Configuration:
         """Cross-field rules that map to config-error exit codes (spec 6.3)."""
-        if self.project_scope == ProjectScope.ALL_PROJECTS:
+        if self.scope == ProjectScope.ALL_PROJECTS:
             missing: list[str] = []
             if not self.manage_token:
                 missing.append("a Management API token (#manage_token)")
@@ -124,8 +109,8 @@ class Configuration(BaseModel):
                 missing.append("an organization_id")
             if missing:
                 raise UserException(
-                    f"project_scope='all_projects' requires {' and '.join(missing)}. "
-                    "Provide the missing value(s) or switch project_scope to 'rows'."
+                    f"scope='all_projects' requires {' and '.join(missing)}. "
+                    "Provide the missing value(s) or switch scope to 'this_project'."
                 )
         if self.use_ssh_tunnel and self.ssh is None:
             raise UserException("use_ssh_tunnel is enabled but the 'ssh' configuration block is missing.")

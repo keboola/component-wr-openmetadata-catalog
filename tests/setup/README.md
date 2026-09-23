@@ -54,7 +54,7 @@ Then verify replay: `uv run pytest tests/test_functional.py -v`, and run the
 The run-mode catalog/merge/Tier-2 cases —
 `05, 06, 07, 09, 11, 12, 16, 19` — record against a **64-bucket subset**
 of project **4214** (`[CF] New Features Testing`), pinned in their config as
-`parameters.bucket_allowlist` and mirrored in `tests/setup/subset_buckets_4214.json`.
+`parameters.buckets` and mirrored in `tests/setup/subset_buckets_4214.json`.
 
 **Why:** the full project has 713 buckets / ~5 449 tables; a full-catalog run
 records to a **~159 MB** cassette, over **GitHub's 100 MB per-file limit**. The
@@ -63,8 +63,8 @@ cassette is ≤ ~6 MB) while staying representative — diverse connectors, type
 columns, previously length-less string columns, and the duplicate-sanitised-column
 bucket `in.c-keboola-ex-airbyte-wrapper-1221443127` (exercises the column de-dup fix).
 
-Keep `configs.json`'s `bucket_allowlist` and `subset_buckets_4214.json` in sync;
-re-scaffolding without the allowlist would silently regenerate 159 MB cassettes.
+Keep `configs.json`'s `buckets` selector and `subset_buckets_4214.json` in sync;
+re-scaffolding without the selector would silently regenerate 159 MB cassettes.
 
 ## Dropped cases: 08 (pipelines + lineage) and 10 (column-lineage only)
 

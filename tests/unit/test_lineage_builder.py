@@ -15,6 +15,7 @@ from mapping.lineage_builder import (
     SOURCE_VIEW,
     column_edges,
     declared_edges,
+    pipeline_edges,
     to_add_lineage_request,
     view_edge,
 )
@@ -85,6 +86,66 @@ def test_column_edges_group_by_table_pair_and_carry_temp_tables():
     assert edge.temp_lineage_tables == ["stg"]
     to_cols = {c["toColumn"] for c in edge.columns_lineage}
     assert "keboola-stack.Acme_Project.out_c-res.result.total" in to_cols
+
+
+def test_pipeline_edges_are_input_to_pipeline_plus_pipeline_to_output():
+    # 2 inputs + 1 output + a pipeline -> N+M edges, never a cartesian product.
+    storage = {
+        "input": {"tables": [{"source": "in.c-main.a"}, {"source": "in.c-main.b"}]},
+        "output": {"tables": [{"destination": "out.c-res.x"}]},
+    }
+    pipeline_fqn_value = "keboola-stack.Acme_Project__99"
+    edges = pipeline_edges(storage, service_name=SVC, project=PROJ, pipeline_fqn=pipeline_fqn_value)
+
+    assert len(edges) == 3
+    in_edges = [e for e in edges if e.to_type == "pipeline"]
+    out_edges = [e for e in edges if e.from_type == "pipeline"]
+    assert len(in_edges) == 2
+    assert len(out_edges) == 1
+
+    assert {e.from_fqn for e in in_edges} == {
+        "keboola-stack.Acme_Project.in_c-main.a",
+        "keboola-stack.Acme_Project.in_c-main.b",
+    }
+    assert all(e.to_fqn == pipeline_fqn_value for e in in_edges)
+    assert all(e.from_type == "table" for e in in_edges)
+    assert all(e.to_type == "pipeline" for e in in_edges)
+    assert all(e.source == SOURCE_PIPELINE for e in in_edges)
+
+    (out_edge,) = out_edges
+    assert out_edge.from_fqn == pipeline_fqn_value
+    assert out_edge.to_fqn == "keboola-stack.Acme_Project.out_c-res.x"
+    assert out_edge.from_type == "pipeline"
+    assert out_edge.to_type == "table"
+    assert out_edge.source == SOURCE_PIPELINE
+
+
+def test_pipeline_edges_empty_input_only_emits_output_edge():
+    # The reported tr-fact_pull_request case: no declared inputs, one output ->
+    # ONLY the pipeline -> output edge (Downstream populated, Upstream stays empty
+    # until Phase B's SQL inference).
+    storage = {
+        "input": {"tables": []},
+        "output": {"tables": [{"destination": "ai-adoption.c-main.fact_pull_request"}]},
+    }
+    pipeline_fqn_value = "keboola-stack.Acme_Project__tr-fact_pull_request"
+    edges = pipeline_edges(storage, service_name=SVC, project=PROJ, pipeline_fqn=pipeline_fqn_value)
+
+    assert len(edges) == 1
+    (edge,) = edges
+    assert edge.from_fqn == pipeline_fqn_value
+    assert edge.to_fqn == "keboola-stack.Acme_Project.ai-adoption_c-main.fact_pull_request"
+    assert edge.from_type == "pipeline"
+    assert edge.to_type == "table"
+    assert edge.source == SOURCE_PIPELINE
+
+
+def test_pipeline_edges_without_pipeline_fqn_is_empty():
+    storage = {
+        "input": {"tables": [{"source": "in.c-main.a"}]},
+        "output": {"tables": [{"destination": "out.c-res.x"}]},
+    }
+    assert pipeline_edges(storage, service_name=SVC, project=PROJ, pipeline_fqn=None) == []
 
 
 def test_declared_edges_skip_self_reference():

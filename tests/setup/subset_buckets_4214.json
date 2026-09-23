@@ -1,5 +1,5 @@
 {
-  "_comment": "64-bucket subset of project 4214 ([CF] New Features Testing) used as bucket_allowlist for the run-mode VCR cases. Full-713 catalog records to 159MB > GitHub's 100MB file limit; this subset keeps each cassette <100MB while covering diverse connectors, PK/typed/length-less columns, and the dup-column bucket in.c-keboola-ex-airbyte-wrapper-1221443127.",
+  "_comment": "64-bucket subset of project 4214 ([CF] New Features Testing) used as the `buckets` selector for the run-mode VCR cases. Full-713 catalog records to 159MB > GitHub's 100MB file limit; this subset keeps each cassette <100MB while covering diverse connectors, PK/typed/length-less columns, and the dup-column bucket in.c-keboola-ex-airbyte-wrapper-1221443127.",
   "buckets": [
     "in.c-ESG-dummy",
     "in.c-TESTUPPERS",
