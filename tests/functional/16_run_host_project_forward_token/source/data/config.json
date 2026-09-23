@@ -5,6 +5,7 @@
     "write_pipelines": false,
     "write_pipeline_status": false,
     "write_lineage": false,
+    "write_data_apps": false,
     "write_column_lineage": false,
     "bucket_allowlist": [
       "in.c-ESG-dummy",

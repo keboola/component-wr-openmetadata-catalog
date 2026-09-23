@@ -16,6 +16,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, ClassVar
 
 from keboola.component.base import ComponentBase, sync_action
@@ -26,6 +27,7 @@ from keboola.vcr import BaseSanitizer, DefaultSanitizer
 
 import report as report_mod
 from client import ssh_proxy
+from client.data_app_reader import fetch_app_states
 from client.job_queue_reader import JobQueueReader
 from client.manage_client import ManageClient, ManageScopeError
 from client.om_client import OMAuthError, OMClient, OMClientError, OMPreconditionFailed
@@ -35,10 +37,13 @@ from lineage.column_lineage import extract_column_lineage
 from lineage.dialect import dialect_for
 from mapping import fqn as fqn_mod
 from mapping import lineage_builder
+from mapping.dashboard_builder import CUSTOM_PROPERTIES, DashboardBuilder
 from mapping.entity_builder import EntityBuilder
 from mapping.pipeline_builder import PipelineBuilder
 from merge import (
+    OUR_DASHBOARD_LINEAGE_SOURCES,
     OUR_LINEAGE_SOURCES,
+    OWNED_DASHBOARD_FIELDS,
     OWNED_PIPELINE_FIELDS,
     OWNED_TABLE_FIELDS,
     SnapshotStore,
@@ -231,6 +236,7 @@ class _ProjectRun:
     reader: StorageReader
     entities: EntityBuilder
     pipelines: PipelineBuilder
+    dashboards: DashboardBuilder
     seen_table_fqns: set[str] = field(default_factory=set)
     # DatabaseSchema FQNs this run actually enumerated (in-scope buckets only) —
     # the tombstone pass reconciles *only* within these, so allowlist/denylist
@@ -241,6 +247,9 @@ class _ProjectRun:
     # column an endpoint table lacks (empty-stub tables map to an empty set).
     column_catalog: dict[str, set[str]] = field(default_factory=dict)
     pipeline_fqn_by_config: dict[str, str] = field(default_factory=dict)
+    # Data-app config id -> its Dashboard FQN, recorded by the dashboard pass so the
+    # lineage pass can attach table -> dashboard edges to the entity it just wrote.
+    dashboard_fqn_by_config: dict[str, str] = field(default_factory=dict)
     id_cache: dict[str, str | None] = field(default_factory=dict)
     failures: int = 0
 
@@ -417,12 +426,17 @@ class Component(ComponentBase):
             pipelines=PipelineBuilder(
                 config.resolve_service_name(env["stack_id"]), ctx.project_name, ctx.project_id, ui_base
             ),
+            dashboards=DashboardBuilder(
+                config.resolve_service_name(env["stack_id"]), ctx.project_name, ctx.project_id, ui_base, env["stack_id"]
+            ),
         )
         merger = ThreeWayMerger(config.merge_mode)
 
         self._catalog_pass(config, om, run, state, snapshot, report, merger, version_changed)
         if config.write_pipelines:
             self._pipeline_pass(config, om, run, snapshot, report, merger, env)
+        if config.write_data_apps:
+            self._dashboard_pass(om, run, snapshot, report, merger)
         if config.write_lineage or config.write_column_lineage:
             self._lineage_pass(config, om, run, report)
         self._tombstone_pass(om, run, report)
@@ -567,6 +581,8 @@ class Component(ComponentBase):
         )
         for component in run.reader.list_component_configs():
             component_id = str(component.get("id") or component.get("componentId") or "")
+            if run.dashboards.is_data_app(component_id):
+                continue  # data apps are catalogued as Dashboards, not Pipelines
             for cfg in component.get("configurations") or []:
                 if not (run.pipelines.is_flow(component_id) or self._is_producing(cfg)):
                     continue
@@ -620,12 +636,75 @@ class Component(ComponentBase):
                 detail=f"pipeline status: {exc}",
             )
 
+    def _dashboard_pass(
+        self,
+        om: OMClient,
+        run: _ProjectRun,
+        snapshot: SnapshotStore,
+        report: RunReport,
+        merger: ThreeWayMerger,
+    ) -> None:
+        """Catalog Keboola data apps (component ``keboola.data-apps``) as OM Dashboards.
+
+        Data apps have no storage mapping, so the pipeline pass skips them. Each is
+        upserted as a Dashboard under one ``CustomDashboard`` service, so its metadata
+        (name, description, deep link to the Keboola config) shows up in OpenMetadata.
+        """
+        self._upsert(
+            om,
+            run,
+            "dashboardServices",
+            "DashboardService",
+            run.dashboards.dashboard_service_body()["name"],
+            run.dashboards.dashboard_service_body(),
+            (),
+            snapshot,
+            report,
+            merger,
+        )
+        try:
+            available = om.ensure_custom_properties("dashboard", CUSTOM_PROPERTIES)
+        except Exception as exc:  # noqa: BLE001 - metadata-type read/define is best-effort
+            logger.warning("Dashboard custom properties unavailable (%s); writing without extension", exc)
+            available = set()
+        stack_id = run.dashboards.stack_id
+        app_states = (
+            fetch_app_states(f"https://data-science.{stack_id.removeprefix('connection.')}", run.ctx.storage_token)
+            if stack_id
+            else {}
+        )
+        synced_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
+        for component in run.reader.list_component_configs():
+            component_id = str(component.get("id") or component.get("componentId") or "")
+            if not run.dashboards.is_data_app(component_id):
+                continue
+            for cfg in component.get("configurations") or []:
+                built = run.dashboards.build_dashboard(
+                    cfg, available, app_states, synced_at, owner_resolver=lambda e: self._resolve_owner(om, run, e)
+                )
+                run.dashboard_fqn_by_config[built.config_id] = built.fqn
+                self._upsert(
+                    om,
+                    run,
+                    "dashboards",
+                    "Dashboard",
+                    built.fqn,
+                    built.body,
+                    OWNED_DASHBOARD_FIELDS,
+                    snapshot,
+                    report,
+                    merger,
+                )
+
     def _lineage_pass(self, config: Configuration, om: OMClient, run: _ProjectRun, report: RunReport) -> None:
         edges: list[lineage_builder.LineageEdge] = []
         for component in run.reader.list_component_configs():
             component_id = str(component.get("id") or component.get("componentId") or "")
             for cfg in component.get("configurations") or []:
                 storage = (cfg.get("configuration") or {}).get("storage") or {}
+                if run.dashboards.is_data_app(component_id):
+                    edges += self._data_app_edges_for(config, run, cfg, storage)
+                    continue  # a data app is a Dashboard: upstream table -> app, no table -> table
                 pipeline_fqn = run.pipeline_fqn_by_config.get(str(cfg.get("id")))
                 if config.write_lineage:
                     edges += lineage_builder.declared_edges(
@@ -670,6 +749,25 @@ class Component(ComponentBase):
             column_catalog=run.column_catalog,
         )
 
+    def _data_app_edges_for(self, config, run, cfg, storage) -> list[lineage_builder.LineageEdge]:
+        """Upstream table -> data-app (Dashboard) edges for one data-app config.
+
+        Gated on both ``write_data_apps`` (the Dashboard must exist — the dashboard
+        pass wrote it and recorded its FQN) and ``write_lineage``. Returns nothing if
+        the config produced no Dashboard this run.
+        """
+        if not (config.write_data_apps and config.write_lineage):
+            return []
+        dashboard_fqn = run.dashboard_fqn_by_config.get(str(cfg.get("id")))
+        if not dashboard_fqn:
+            return []
+        return lineage_builder.data_app_edges(
+            storage,
+            service_name=run.entities.service_name,
+            project=run.entities.project,
+            dashboard_fqn=dashboard_fqn,
+        )
+
     @staticmethod
     def _statements_of(cfg: dict) -> list[tuple[str, str]]:
         params = (cfg.get("configuration") or {}).get("parameters") or {}
@@ -683,11 +781,15 @@ class Component(ComponentBase):
         return statements
 
     def _refresh_lineage(self, om, run, report, edges) -> None:
-        # drop our stale edges (never Manual) on affected targets, then add current
-        for target_fqn in {e.to_fqn for e in edges}:
-            for source in OUR_LINEAGE_SOURCES:
+        # drop our stale edges (never Manual) on affected targets, then add current.
+        # Table targets carry table/query/view lineage; dashboard (data-app) targets
+        # carry DashboardLineage — clean each with the sources it can hold.
+        targets = {(e.to_type, e.to_fqn) for e in edges}
+        for to_type, target_fqn in targets:
+            sources = OUR_DASHBOARD_LINEAGE_SOURCES if to_type == "dashboard" else OUR_LINEAGE_SOURCES
+            for source in sources:
                 try:
-                    om.delete_lineage_by_source("table", target_fqn, source)
+                    om.delete_lineage_by_source(to_type, target_fqn, source)
                 except Exception:
                     logger.debug("lineage cleanup skipped for %s/%s", target_fqn, source, exc_info=True)
         for edge in edges:
@@ -717,12 +819,26 @@ class Component(ComponentBase):
                 detail=str(exc),
             )
 
+    _KIND_BY_LINEAGE_TYPE: ClassVar[dict[str, str]] = {"pipeline": "pipelines", "dashboard": "dashboards"}
+    # Reverse of _KIND_BY_LINEAGE_TYPE keyed by the report entity type, for caching a
+    # just-created entity id under the same key _resolve_id looks it up by.
+    _LINEAGE_TYPE_BY_ENTITY: ClassVar[dict[str, str]] = {"Pipeline": "pipeline", "Dashboard": "dashboard"}
+
     def _resolve_id(self, om: OMClient, run: _ProjectRun, fqn: str, entity_type: str) -> str | None:
         cache_key = f"{entity_type}:{fqn}"
         if cache_key not in run.id_cache:
-            kind = "pipelines" if entity_type == "pipeline" else "tables"
+            kind = self._KIND_BY_LINEAGE_TYPE.get(entity_type, "tables")
             entity = om.get_by_fqn(kind, fqn)
             run.id_cache[cache_key] = entity.get("id") if entity else None
+        return run.id_cache[cache_key]
+
+    def _resolve_owner(self, om: OMClient, run: _ProjectRun, email: str | None) -> str | None:
+        """OM user id for an owner e-mail, cached per run (best-effort, None if no match)."""
+        if not email:
+            return None
+        cache_key = f"user:{email}"
+        if cache_key not in run.id_cache:
+            run.id_cache[cache_key] = om.find_user_id_by_email(email)
         return run.id_cache[cache_key]
 
     def _tombstone_pass(self, om: OMClient, run: _ProjectRun, report: RunReport) -> None:
@@ -785,7 +901,8 @@ class Component(ComponentBase):
     def _upsert(self, om, run, kind, entity_type, entity_fqn, desired, owned_fields, snapshot, report, merger) -> bool:
         """Create-or-merge one entity; returns True on success (for advance-after-success)."""
         try:
-            current = om.get_by_fqn(kind, entity_fqn, fields="columns,tableConstraints" if kind == "tables" else None)
+            fields_by_kind = {"tables": "columns,tableConstraints", "dashboards": "extension,owners"}
+            current = om.get_by_fqn(kind, entity_fqn, fields=fields_by_kind.get(kind))
             base = snapshot.base_fields(entity_fqn)
             decision = merger.merge(
                 desired=desired, current=current, base=base, owned_fields=owned_fields or tuple(desired.keys())
@@ -795,7 +912,8 @@ class Component(ComponentBase):
                 created = om.put_entity(kind, desired)
                 status_code = 200
                 if created.get("id"):
-                    run.id_cache[f"{'pipeline' if entity_type == 'Pipeline' else 'table'}:{entity_fqn}"] = created["id"]
+                    lineage_type = self._LINEAGE_TYPE_BY_ENTITY.get(entity_type, "table")
+                    run.id_cache[f"{lineage_type}:{entity_fqn}"] = created["id"]
             elif decision.patch:
                 self._apply_patch(om, kind, entity_fqn, decision.patch)
                 status_code = 200

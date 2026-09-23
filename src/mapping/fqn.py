@@ -100,3 +100,22 @@ def pipeline_name(project: str, config_or_flow_id: str) -> str:
 def pipeline_fqn(service_name: str, project: str, config_or_flow_id: str) -> str:
     """FQN of a Pipeline ← component config or flow (spec 2.1)."""
     return f"{sanitize_name(service_name)}.{pipeline_name(project, config_or_flow_id)}"
+
+
+def dashboard_service_fqn(service_name: str) -> str:
+    """FQN of the DashboardService (data apps) — a single sanitised segment."""
+    return sanitize_name(service_name)
+
+
+def dashboard_name(project: str, config_id: str) -> str:
+    """Entity ``name`` for a Dashboard ← Keboola data-app config.
+
+    Two-level OM Dashboard FQNs (``dashboardService.dashboardName``) encode the
+    project and config id into one dot-free segment, mirroring ``pipeline_name``.
+    """
+    return f"{sanitize_name(project)}__{sanitize_name(str(config_id))}"
+
+
+def dashboard_fqn(service_name: str, project: str, config_id: str) -> str:
+    """FQN of a Dashboard ← Keboola data-app config."""
+    return f"{sanitize_name(service_name)}.{dashboard_name(project, config_id)}"
