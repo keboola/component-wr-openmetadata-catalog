@@ -13,16 +13,26 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 
-_EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+# Deliberately strict so the extracted address is one OpenMetadata's ``email``-typed
+# custom properties (kbcOwner) accept under its RFC 5321 mailbox validation: the
+# local part is dot-separated segments (no leading / trailing / consecutive dots),
+# and the domain must end in a 2+-letter alphabetic TLD. This is what stops a
+# creator-token description like ``"see owner@keboola.com."`` (trailing period) or a
+# bare ``"host@1.2.3.4"`` from yielding an address OM rejects with a 400 — which,
+# under the default ``failure_mode=collect_and_fail``, would fail the whole job.
+_EMAIL = re.compile(r"[\w+-]+(?:\.[\w+-]+)*@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}")
 
 
 def extract_email(text: str | None) -> str | None:
-    """First e-mail-shaped substring in ``text``, or ``None``.
+    """First valid e-mail-shaped substring in ``text``, or ``None``.
 
     Some sources wrap the address in surrounding text (a creator-token
     description like ``"kbagent-cli [martin@keboola.com]"``); every custom
     property that carries an owner e-mail is ``email``-typed, so the free text
-    around the address must be stripped rather than passed through raw.
+    around the address must be stripped rather than passed through raw, and an
+    address OM would reject (trailing punctuation, a numeric "TLD", leading /
+    consecutive dots) must not be emitted at all -- ``None`` is safer than a
+    value that 400s.
     """
     if not text:
         return None

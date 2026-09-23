@@ -38,6 +38,27 @@ def test_extract_email_none_input_returns_none():
     assert enrichment.extract_email(None) is None
 
 
+def test_extract_email_accepts_multichar_tld():
+    # A real gTLD (seen in the wild: *.consulting) must still be accepted.
+    assert enrichment.extract_email("jiri.soukup@keboola.consulting") == "jiri.soukup@keboola.consulting"
+
+
+def test_extract_email_strips_trailing_period():
+    # "…@keboola.com." (address ends a sentence) must not keep the trailing dot,
+    # or OM's email-typed custom property (kbcOwner) 400s -> failed entity.
+    assert enrichment.extract_email("owner is owner@keboola.com.") == "owner@keboola.com"
+
+
+def test_extract_email_ignores_ip_like_host():
+    # A numeric "TLD" is not a valid mailbox domain; emit None rather than a 400-bait value.
+    assert enrichment.extract_email("host@10.20.30.40") is None
+
+
+def test_extract_email_skips_leading_dot_local_part():
+    # Leading dot in the local part is invalid; the valid sub-address is extracted instead.
+    assert enrichment.extract_email(".owner@keboola.com") == "owner@keboola.com"
+
+
 # --------------------------------------------------------------------- creator_token_email
 
 
