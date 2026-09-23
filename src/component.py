@@ -37,20 +37,29 @@ from lineage.column_lineage import LineageResult, extract_column_lineage
 from lineage.dialect import dialect_for
 from mapping import fqn as fqn_mod
 from mapping import lineage_builder
-from mapping.dashboard_builder import CUSTOM_PROPERTIES, DashboardBuilder
-from mapping.entity_builder import EntityBuilder
+from mapping.dashboard_builder import CUSTOM_PROPERTIES as DASHBOARD_CUSTOM_PROPERTIES
+from mapping.dashboard_builder import DashboardBuilder
+from mapping.entity_builder import (
+    DATABASE_CUSTOM_PROPERTIES,
+    SCHEMA_CUSTOM_PROPERTIES,
+    TABLE_CUSTOM_PROPERTIES,
+    EntityBuilder,
+)
+from mapping.pipeline_builder import CUSTOM_PROPERTIES as PIPELINE_CUSTOM_PROPERTIES
 from mapping.pipeline_builder import PipelineBuilder, is_flow_component
 from merge import (
     OUR_DASHBOARD_LINEAGE_SOURCES,
     OUR_LINEAGE_SOURCES,
     OWNED_DASHBOARD_FIELDS,
+    OWNED_DATABASE_FIELDS,
     OWNED_PIPELINE_FIELDS,
+    OWNED_SCHEMA_FIELDS,
     OWNED_TABLE_FIELDS,
     SnapshotStore,
     ThreeWayMerger,
 )
 from report import RunReport
-from sync import StateManager, TombstonePlanner, bucket_digest, should_process_bucket
+from sync import StateManager, TombstonePlanner, bucket_digest, digest_fields, should_process_bucket
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +281,10 @@ class Component(ComponentBase):
 
         projects, degraded_reason = self._resolve_projects(config, env)
         proxy = ssh_proxy.maybe_open_tunnel(config)
+        # One snapshot time for the whole run, shared by every entity's
+        # kbcSyncedAt custom property (across all passes and all projects) —
+        # the same run-level snapshot the dashboard pass already stamped.
+        synced_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
         try:
             om = self._build_om_client(config, proxy)
             om.probe_version()
@@ -287,7 +300,7 @@ class Component(ComponentBase):
                     detail=degraded_reason,
                 )
             for project in projects:
-                self._process_project(config, om, project, env, state, snapshot, report, version_changed)
+                self._process_project(config, om, project, env, state, snapshot, report, version_changed, synced_at)
             state.om_version_seen = server_version
         finally:
             if proxy is not None:
@@ -413,34 +426,49 @@ class Component(ComponentBase):
         snapshot: SnapshotStore,
         report: RunReport,
         version_changed: bool,
+        synced_at: str | None = None,
     ) -> None:
         # Dev-branch buckets are never cataloged: StorageReader is always
         # production_only (the former branch_filter toggle is gone).
         reader = StorageReader(ctx.storage_url, ctx.storage_token, production_only=True)
         ui_base = self._ui_base(ctx.storage_url)
+        service_name = config.resolve_service_name(env["stack_id"])
         run = _ProjectRun(
             ctx=ctx,
             reader=reader,
-            entities=EntityBuilder(
-                config.resolve_service_name(env["stack_id"]), ctx.project_name, ctx.project_id, ui_base
-            ),
-            pipelines=PipelineBuilder(
-                config.resolve_service_name(env["stack_id"]), ctx.project_name, ctx.project_id, ui_base
-            ),
-            dashboards=DashboardBuilder(
-                config.resolve_service_name(env["stack_id"]), ctx.project_name, ctx.project_id, ui_base, env["stack_id"]
-            ),
+            entities=EntityBuilder(service_name, ctx.project_name, ctx.project_id, ui_base, env["stack_id"]),
+            pipelines=PipelineBuilder(service_name, ctx.project_name, ctx.project_id, ui_base, env["stack_id"]),
+            dashboards=DashboardBuilder(service_name, ctx.project_name, ctx.project_id, ui_base, env["stack_id"]),
         )
         merger = ThreeWayMerger(config.merge_mode)
 
-        self._catalog_pass(config, om, run, state, snapshot, report, merger, version_changed)
+        self._catalog_pass(config, om, run, state, snapshot, report, merger, version_changed, synced_at)
         if config.write_pipelines:
-            self._pipeline_pass(config, om, run, snapshot, report, merger, env)
+            self._pipeline_pass(config, om, run, snapshot, report, merger, env, synced_at)
         if config.write_data_apps:
-            self._dashboard_pass(om, run, snapshot, report, merger)
+            self._dashboard_pass(om, run, snapshot, report, merger, synced_at)
         if config.write_lineage or config.write_column_lineage:
             self._lineage_pass(config, om, run, report)
         self._tombstone_pass(om, run, report)
+
+    @staticmethod
+    def _ensure_custom_properties(
+        om: OMClient, entity_type: str, specs: list[tuple[str, str, str]], label: str
+    ) -> set[str]:
+        """Guarded ``ensure_custom_properties`` — never fails the run.
+
+        Defining a custom-property type is an admin-level change a bot token
+        may be refused; such a failure (or any other type-registration error)
+        is logged and yields an empty ``available`` set, so the caller's
+        builder omits the whole ``extension`` rather than 400-ing the entity
+        write. Shared by every pass (catalog/pipeline/dashboard) that
+        registers one entity type's custom properties.
+        """
+        try:
+            return om.ensure_custom_properties(entity_type, specs)
+        except Exception as exc:  # noqa: BLE001 - metadata-type read/define is best-effort
+            logger.warning("%s custom properties unavailable (%s); writing without extension", label, exc)
+            return set()
 
     def _catalog_pass(
         self,
@@ -452,7 +480,17 @@ class Component(ComponentBase):
         report: RunReport,
         merger: ThreeWayMerger,
         version_changed: bool,
+        synced_at: str | None = None,
     ) -> None:
+        available_database = self._ensure_custom_properties(om, "database", DATABASE_CUSTOM_PROPERTIES, "Database")
+        available_schema = self._ensure_custom_properties(
+            om, "databaseSchema", SCHEMA_CUSTOM_PROPERTIES, "DatabaseSchema"
+        )
+        available_table = self._ensure_custom_properties(om, "table", TABLE_CUSTOM_PROPERTIES, "Table")
+
+        def resolve_owner(email: str) -> str | None:
+            return self._resolve_owner(om, run, email)
+
         self._upsert(
             om,
             run,
@@ -471,8 +509,8 @@ class Component(ComponentBase):
             "databases",
             "Database",
             fqn_mod.database_fqn(run.entities.service_name, run.entities.project),
-            run.entities.database_body(),
-            ("displayName", "sourceUrl"),
+            run.entities.database_body(available=available_database, synced_at=synced_at),
+            OWNED_DATABASE_FIELDS,
             snapshot,
             report,
             merger,
@@ -486,7 +524,7 @@ class Component(ComponentBase):
             schema_fqn = fqn_mod.schema_fqn(run.entities.service_name, run.entities.project, bucket.path or bucket.name)
             run.seen_schema_fqns.add(schema_fqn)
             tables = list(run.reader.iter_tables(bucket.id))
-            digest = bucket_digest(vars(bucket), [vars(t) for t in tables])
+            digest = bucket_digest(digest_fields(bucket), [digest_fields(t) for t in tables])
             if not should_process_bucket(
                 previous_digest=state.bucket_digest(run.ctx.project_id, bucket.id),
                 current_digest=digest,
@@ -515,15 +553,19 @@ class Component(ComponentBase):
                 "databaseSchemas",
                 "Schema",
                 schema_fqn,
-                run.entities.schema_body(bucket),
-                ("displayName", "description", "sourceUrl"),
+                run.entities.schema_body(
+                    bucket, available=available_schema, synced_at=synced_at, owner_resolver=resolve_owner
+                ),
+                OWNED_SCHEMA_FIELDS,
                 snapshot,
                 report,
                 merger,
             )
             bucket_ok = True
             for table in tables:
-                built = run.entities.table_body(bucket, table)
+                built = run.entities.table_body(
+                    bucket, table, available=available_table, synced_at=synced_at, owner_resolver=resolve_owner
+                )
                 run.seen_table_fqns.add(built.fqn)
                 self._record_column_catalog(run, built.fqn, table)
                 ok = self._upsert(
@@ -562,6 +604,7 @@ class Component(ComponentBase):
         report: RunReport,
         merger: ThreeWayMerger,
         env: dict,
+        synced_at: str | None = None,
     ) -> None:
         self._upsert(
             om,
@@ -575,6 +618,11 @@ class Component(ComponentBase):
             report,
             merger,
         )
+        available = self._ensure_custom_properties(om, "pipeline", PIPELINE_CUSTOM_PROPERTIES, "Pipeline")
+
+        def resolve_owner(email: str) -> str | None:
+            return self._resolve_owner(om, run, email)
+
         for component in run.reader.list_component_configs():
             component_id = str(component.get("id") or component.get("componentId") or "")
             if run.dashboards.is_data_app(component_id):
@@ -595,7 +643,9 @@ class Component(ComponentBase):
                             continue
                     elif config.configurations and cfg_id not in config.configurations:
                         continue
-                built = run.pipelines.build_pipeline(component_id, cfg)
+                built = run.pipelines.build_pipeline(
+                    component_id, cfg, available_properties=available, synced_at=synced_at, owner_resolver=resolve_owner
+                )
                 run.pipeline_fqn_by_config[cfg_id] = built.fqn
                 self._upsert(
                     om,
@@ -652,6 +702,7 @@ class Component(ComponentBase):
         snapshot: SnapshotStore,
         report: RunReport,
         merger: ThreeWayMerger,
+        synced_at: str | None = None,
     ) -> None:
         """Catalog Keboola data apps (component ``keboola.data-apps``) as OM Dashboards.
 
@@ -671,18 +722,13 @@ class Component(ComponentBase):
             report,
             merger,
         )
-        try:
-            available = om.ensure_custom_properties("dashboard", CUSTOM_PROPERTIES)
-        except Exception as exc:  # noqa: BLE001 - metadata-type read/define is best-effort
-            logger.warning("Dashboard custom properties unavailable (%s); writing without extension", exc)
-            available = set()
+        available = self._ensure_custom_properties(om, "dashboard", DASHBOARD_CUSTOM_PROPERTIES, "Dashboard")
         stack_id = run.dashboards.stack_id
         app_states = (
             fetch_app_states(f"https://data-science.{stack_id.removeprefix('connection.')}", run.ctx.storage_token)
             if stack_id
             else {}
         )
-        synced_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
         for component in run.reader.list_component_configs():
             component_id = str(component.get("id") or component.get("componentId") or "")
             if not run.dashboards.is_data_app(component_id):
@@ -996,11 +1042,53 @@ class Component(ComponentBase):
 
     # ---------------------------------------------------------- merge upsert
 
+    # Fields requested on the PRIMARY existence-check GET, per kind. Kept
+    # exactly as each kind's call was before this feature (tables:
+    # "columns,tableConstraints"; databaseSchemas/databases: none) EXCEPT
+    # where a kind's call already carries "extension,owners" un-exercised by
+    # any recorded fixture (pipelines/dashboards, both gated behind
+    # write_pipelines/write_data_apps, which every functional cassette pins
+    # off) — changing an EXISTING kind's query string here would silently
+    # invalidate its already-recorded interactions (a stale ``fields=`` never
+    # matches on VCR replay, since request matching includes ``query``).
+    # databaseSchemas/databases/tables instead get extension/owners via the
+    # separate, best-effort ``_with_extension_owners`` call below.
+    _PRIMARY_FIELDS_BY_KIND: ClassVar[dict[str, str]] = {
+        "tables": "columns,tableConstraints",
+        "pipelines": "extension,owners",
+        "dashboards": "extension,owners",
+    }
+
+    @staticmethod
+    def _with_extension_owners(om: OMClient, kind: str, entity_fqn: str, current: dict) -> dict:
+        """Best-effort fetch of ``extension``/``owners`` for an EXISTING entity.
+
+        A separate call from the primary existence-check GET (whose
+        ``fields=`` must stay stable — see ``_PRIMARY_FIELDS_BY_KIND``), so a
+        failure here (OM unreachable, or a not-yet-re-recorded VCR fixture)
+        never blocks the primary create/update decision: these two fields
+        just look OM-empty for this one call, which only costs an extra
+        (harmless, idempotent) reconciling PATCH rather than a merge no-op.
+        """
+        try:
+            extra = om.get_by_fqn(kind, entity_fqn, fields="extension,owners")
+        except Exception:  # noqa: BLE001 - merge-comparison read is best-effort
+            return current
+        if extra:
+            current = {**current, **{k: v for k, v in extra.items() if k in ("extension", "owners")}}
+        return current
+
     def _upsert(self, om, run, kind, entity_type, entity_fqn, desired, owned_fields, snapshot, report, merger) -> bool:
         """Create-or-merge one entity; returns True on success (for advance-after-success)."""
         try:
-            fields_by_kind = {"tables": "columns,tableConstraints", "dashboards": "extension,owners"}
-            current = om.get_by_fqn(kind, entity_fqn, fields=fields_by_kind.get(kind))
+            current = om.get_by_fqn(kind, entity_fqn, fields=self._PRIMARY_FIELDS_BY_KIND.get(kind))
+            primary_fields = self._PRIMARY_FIELDS_BY_KIND.get(kind) or ""
+            if (
+                current is not None
+                and "extension" not in primary_fields
+                and ("extension" in desired or "owners" in desired)
+            ):
+                current = self._with_extension_owners(om, kind, entity_fqn, current)
             base = snapshot.base_fields(entity_fqn)
             decision = merger.merge(
                 desired=desired, current=current, base=base, owned_fields=owned_fields or tuple(desired.keys())

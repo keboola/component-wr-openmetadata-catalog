@@ -24,14 +24,15 @@ import report as report_mod
 from client.om_client import OMClient, OMNotFound
 from client.storage_reader import SourceBucket, SourceColumn, SourceTable
 from component import ProjectContext, _ProjectRun
-from configuration import FailureMode, MergeMode
+from configuration import FailureMode, MergeMode, ProjectScope
+from mapping import entity_builder, lineage_builder
 from mapping import fqn as fqn_mod
-from mapping import lineage_builder
+from mapping import pipeline_builder as pipeline_builder_mod
 from mapping.dashboard_builder import DashboardBuilder
 from mapping.entity_builder import EntityBuilder
 from mapping.pipeline_builder import PipelineBuilder
 from merge import SnapshotStore, ThreeWayMerger
-from sync import StateManager, bucket_digest
+from sync import StateManager, bucket_digest, digest_fields
 
 BASE_PARAMS = {
     "om_host": "https://om.example.com",
@@ -325,8 +326,10 @@ def test_incremental_skip_is_tombstone_safe_and_writes_nothing():
     ]
     # State pre-seeded with the MATCHING digest -> should_process_bucket() is False.
     # run_count=1 so the periodic full-refresh cadence (run_count % 20 == 0) does not
-    # force a reprocess this run.
-    digest = bucket_digest(vars(bucket), [vars(t) for t in tables])
+    # force a reprocess this run. Seeded via digest_fields() (not raw vars()) so it
+    # matches what production computes — vars() would also carry the provenance-only
+    # created_by_metadata field, which digest_fields() deliberately excludes.
+    digest = bucket_digest(digest_fields(bucket), [digest_fields(t) for t in tables])
     state = StateManager({"projects": {pid: {"bucket_digests": {bucket.id: digest}}}, "run_count": 1})
 
     om = _RecordingOM()
@@ -372,6 +375,226 @@ def test_incremental_skip_is_tombstone_safe_and_writes_nothing():
 
     # 4) advance-after-success: the stored digest is untouched (no write happened).
     assert state.bucket_digest(pid, bucket.id) == digest
+
+
+# ------------------------- custom properties (extension/owners) wiring, generalized
+# from the Dashboard-only treatment to Tables, Pipelines, DatabaseSchemas, Databases.
+#
+# ``_upsert`` issues up to TWO ``get_by_fqn`` reads per entity (see
+# ``component.py``'s ``_PRIMARY_FIELDS_BY_KIND`` / ``_with_extension_owners``):
+# a PRIMARY existence-check whose ``fields=`` must stay byte-for-byte identical to
+# what it was before this feature (an already-recorded VCR cassette's request
+# matches on ``query`` too, so appending ``,extension,owners`` there would
+# invalidate every prior table/schema/database interaction), plus a SEPARATE,
+# best-effort second call for ``fields="extension,owners"`` -- but only when (a)
+# the entity already exists (nothing to compare against on a create), and (b) the
+# primary call didn't already carry "extension" (pipelines/dashboards do, so they
+# never get a second call). The two test functions below cover each path: create
+# (no second call, for any kind) and update (second call, for the three kinds
+# whose primary fields lack "extension").
+
+
+class _CustomPropsRecordingOM:
+    """OM double recording ``ensure_custom_properties()`` calls and every
+    ``get_by_fqn`` call's ``(kind, fields)`` -- everything the wiring tests below
+    need to assert on, on top of the plain create-path recording ``_RecordingOM``
+    already provides.
+
+    ``existing=True`` simulates every entity already existing in OM (a placeholder
+    ``{"id": "existing-<kind>"}`` returned from every ``get_by_fqn`` call), which
+    flips ``_upsert``'s create/update decision to PATCH -- the precondition for
+    ``_with_extension_owners``'s second call to fire at all. ``existing=False``
+    (the default) simulates a from-scratch catalog: ``current is None`` on the
+    primary call short-circuits that second call for every kind.
+    """
+
+    def __init__(self, *, fail_entity_type: str | None = None, existing: bool = False):
+        self.put_calls: list[tuple[str, str | None]] = []
+        self.patch_calls: list[tuple[str, str]] = []
+        self.ensure_calls: list[tuple[str, list]] = []
+        self.fields_calls: list[tuple[str, str | None]] = []
+        self.is_2_0_or_newer = False
+        self._fail_entity_type = fail_entity_type
+        self._existing = existing
+
+    def ensure_custom_properties(self, entity_type, specs):
+        self.ensure_calls.append((entity_type, specs))
+        if entity_type == self._fail_entity_type:
+            raise RuntimeError("boom")
+        return {name for name, *_ in specs}
+
+    def get_by_fqn(self, kind, fqn, fields=None):
+        self.fields_calls.append((kind, fields))
+        return {"id": f"existing-{kind}"} if self._existing else None
+
+    def put_entity(self, kind, body):
+        self.put_calls.append((kind, body.get("name")))
+        return {"id": f"id-{body.get('name')}"}
+
+    def patch_entity(self, kind, fqn, patch):
+        self.patch_calls.append((kind, fqn))
+        return {"id": "x"}
+
+    def find_user_id_by_email(self, email):
+        return None  # owner resolution itself is covered elsewhere; not this test's concern
+
+    def calls_by_kind(self) -> dict[str, list]:
+        """Groups ``fields_calls`` by kind, preserving each kind's call order (so a
+        test can assert e.g. tables' primary call then its second extension/owners
+        call, in sequence)."""
+        grouped: dict[str, list] = {}
+        for kind, fields in self.fields_calls:
+            grouped.setdefault(kind, []).append(fields)
+        return grouped
+
+
+class _CustomPropsReader:
+    """Reader double feeding one bucket/table (catalog pass) and one producing
+    component config (pipeline pass) — mirrors ``_OneBucketReader``/``OneBucketStorage``
+    but also serves ``list_component_configs()``."""
+
+    def __init__(self, bucket, tables, components):
+        self._bucket = bucket
+        self._tables = tables
+        self._components = components
+
+    def list_buckets(self):
+        return [self._bucket]
+
+    def iter_tables(self, bucket_id):
+        return iter(list(self._tables))
+
+    def list_component_configs(self):
+        return list(self._components)
+
+
+def _run_custom_props_passes(om, *, fail_entity_type: str | None = None):
+    """Builds one bucket/table/component fixture and runs ``_catalog_pass`` +
+    ``_pipeline_pass`` against it with ``om`` -- shared by both the create-path and
+    update-path wiring tests below."""
+    svc, proj, pid = "keboola-stack", "Proj", "4214"
+    bucket = SourceBucket(id="in.c-x", name="c-x", stage="in", path="in.c-x")
+    tables = [SourceTable(id="in.c-x.orders", name="orders", columns=[SourceColumn(name="id")])]
+    component = {
+        "id": "keboola.snowflake-transformation",
+        "configurations": [
+            {
+                "id": "123",
+                "name": "T",
+                "currentVersion": {"creatorToken": {"description": "owner@keboola.com"}},
+                "configuration": {
+                    "storage": {"output": {"tables": [{"source": "out", "destination": "in.c-x.orders"}]}},
+                    "parameters": {"blocks": []},
+                },
+            }
+        ],
+    }
+
+    reader = _CustomPropsReader(bucket, tables, [component])
+    run = _ProjectRun(
+        ctx=ProjectContext(project_id=pid, project_name=proj, storage_token="t", storage_url="https://s"),
+        reader=reader,  # ty: ignore[invalid-argument-type]  (duck-typed test double)
+        entities=EntityBuilder(svc, proj, pid, "https://ui.example"),
+        pipelines=PipelineBuilder(svc, proj, pid, "https://ui.example"),
+        dashboards=DashboardBuilder(svc, proj, pid, "https://ui.example"),
+    )
+    report = component_mod.RunReport(run_id="rid")
+    state = StateManager({"run_count": 1})
+
+    comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
+    comp._config = SimpleNamespace(failure_mode=FailureMode.COLLECT_AND_FAIL)  # ty: ignore[invalid-assignment]
+    catalog_config = SimpleNamespace(full_refresh=True, buckets=[])
+    pipeline_config = SimpleNamespace(
+        scope=ProjectScope.THIS_PROJECT, flows=[], configurations=[], write_pipeline_status=False
+    )
+
+    # config/om are duck-typed test doubles (SimpleNamespace / _CustomPropsRecordingOM).
+    comp._catalog_pass(
+        catalog_config,  # ty: ignore[invalid-argument-type]
+        om,
+        run,
+        state,
+        SnapshotStore(),
+        report,
+        ThreeWayMerger(MergeMode.THREE_WAY_MERGE),
+        version_changed=False,
+    )
+    comp._pipeline_pass(
+        pipeline_config,  # ty: ignore[invalid-argument-type]
+        om,
+        run,
+        SnapshotStore(),
+        report,
+        ThreeWayMerger(MergeMode.THREE_WAY_MERGE),
+        env={"url": None},
+    )
+    return run, report
+
+
+def test_ensure_custom_properties_and_fields_wiring_create():
+    """CREATE path (nothing exists in OM yet): ``_catalog_pass`` ensures
+    database/databaseSchema/table custom properties and ``_pipeline_pass`` ensures
+    pipeline custom properties, each with its builder's own CUSTOM_PROPERTIES list.
+    Every kind's PRIMARY ``get_by_fqn`` requests its own fields shape (tables:
+    "columns,tableConstraints"; databaseSchemas/databases: none; pipelines already
+    "extension,owners") and, because ``current`` comes back ``None`` (nothing to
+    compare a create against), the second ``_with_extension_owners`` call never
+    fires for ANY kind -- exactly one ``get_by_fqn`` call per kind. A failing
+    ``ensure_custom_properties`` for one entity type (best-effort, like the
+    existing Dashboard precedent) must not raise out of either pass — the run
+    keeps writing."""
+    # "database" deliberately fails -> proves the ensure-custom-properties call is
+    # best-effort, same precedent as the existing Dashboard pass.
+    om = _CustomPropsRecordingOM(fail_entity_type="database")
+    _, report = _run_custom_props_passes(om)
+
+    ensure_by_type = dict(om.ensure_calls)
+    assert set(ensure_by_type) == {"database", "databaseSchema", "table", "pipeline"}
+    assert {n for n, *_ in ensure_by_type["database"]} == {n for n, *_ in entity_builder.DATABASE_CUSTOM_PROPERTIES}
+    assert {n for n, *_ in ensure_by_type["databaseSchema"]} == {n for n, *_ in entity_builder.SCHEMA_CUSTOM_PROPERTIES}
+    assert {n for n, *_ in ensure_by_type["table"]} == {n for n, *_ in entity_builder.TABLE_CUSTOM_PROPERTIES}
+    assert {n for n, *_ in ensure_by_type["pipeline"]} == {n for n, *_ in pipeline_builder_mod.CUSTOM_PROPERTIES}
+
+    calls = om.calls_by_kind()
+    assert calls["tables"] == ["columns,tableConstraints"]
+    assert calls["databaseSchemas"] == [None]
+    assert calls["databases"] == [None]
+    assert calls["pipelines"] == ["extension,owners"]
+
+    # every entity was a fresh create (never a patch) against this bare OM double.
+    assert om.patch_calls == []
+    created_kinds = {kind for kind, _ in om.put_calls}
+    assert {"databases", "databaseSchemas", "tables", "pipelines"} <= created_kinds
+
+    # best-effort: the "database" ensure_custom_properties raised, but neither pass
+    # raised out — the run kept going and recorded rows for the table and pipeline.
+    assert any(r["entity_type"] == "Table" for r in report.rows())
+    assert any(r["entity_type"] == "Pipeline" for r in report.rows())
+
+
+def test_upsert_second_call_fetches_extension_owners_on_update():
+    """UPDATE path (every entity already exists in OM): for kinds whose PRIMARY
+    fields shape does NOT already include "extension"/"owners" (tables,
+    databaseSchemas, databases), ``_upsert`` issues a SEPARATE, best-effort
+    ``get_by_fqn(kind, fqn, fields="extension,owners")`` call right after the
+    primary existence check -- so the merge can compare against OM's current
+    extension/owners without ever changing the primary call's (already-recorded-
+    by-VCR) query string. Pipelines already carry "extension,owners" on their
+    PRIMARY call, so no second call fires for them."""
+    om = _CustomPropsRecordingOM(existing=True)
+    _run_custom_props_passes(om)
+
+    calls = om.calls_by_kind()
+    assert calls["tables"] == ["columns,tableConstraints", "extension,owners"]
+    assert calls["databaseSchemas"] == [None, "extension,owners"]
+    assert calls["databases"] == [None, "extension,owners"]
+    assert calls["pipelines"] == ["extension,owners"]
+
+    # current is not None for every kind above -> every write went through the
+    # merge/PATCH path, never treated as a fresh create.
+    assert om.put_calls == []
+    patched_kinds = {kind for kind, _ in om.patch_calls}
+    assert {"tables", "databaseSchemas", "databases", "pipelines"} <= patched_kinds
 
 
 # ------------------------------------------ IMPORTANT 1: pipeline-status is best-effort

@@ -4,21 +4,63 @@ Builds the OpenMetadata ``createOrUpdate`` bodies (plain dicts, no OM SDK) for
 the DatabaseService, Database, DatabaseSchema and Table entities from parsed
 Keboola Storage objects. Deep links (``sourceUrl``) are derived from the stack
 UI base + project/bucket/table ids — never a hardcoded stack URL.
+
+Structured metadata (Storage ids, sizing/import facts, sharing/backend, a
+public deep link) is additionally written as OpenMetadata **custom
+properties** in each entity's ``extension`` — the same typed-field treatment
+``mapping.dashboard_builder`` uses for data-app Dashboards, generalised here to
+Table/DatabaseSchema/Database. A native ``owners`` entry is set only when a
+creator e-mail is *actually present* in the Storage metadata the reader
+fetches (``KBC.createdBy.*``) — verified today to hold only a component/config
+id, never an e-mail, so Table/DatabaseSchema owners are omitted in practice;
+Database (Project) never gets an owner (no such metadata exists at that
+level).
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from client.storage_reader import SourceBucket, SourceColumn, SourceTable
-from mapping import fqn
+from mapping import enrichment, fqn
 from mapping.datatype import map_datatype
 from mapping.table_type import VIEW, detect_table_type
 
 logger = logging.getLogger(__name__)
 
 _SERVICE_TYPE = "CustomDatabase"
+
+# Custom properties defined on the OpenMetadata Table/DatabaseSchema/Database
+# types: (name, field type, description). om_types used across this component
+# are only ever "string", "email", "hyperlink-cp".
+TABLE_CUSTOM_PROPERTIES = [
+    ("kbcTableId", "string", "Keboola Storage table id"),
+    ("kbcBucketId", "string", "Keboola Storage bucket id"),
+    ("kbcStage", "string", "Keboola Storage bucket stage (in/out/sys)"),
+    ("kbcRowsCount", "string", "Row count as of the last catalog sync"),
+    ("kbcDataSizeBytes", "string", "Table data size in bytes as of the last catalog sync"),
+    ("kbcLastImport", "string", "Last import date"),
+    ("kbcIsAlias", "string", "Whether the table is an alias (linked/shared) table"),
+    ("kbcTableUrl", "hyperlink-cp", "Keboola Storage table URL"),
+    ("kbcSyncedAt", "string", "Catalog snapshot time (UTC) — the fields above are as of this time"),
+]
+
+SCHEMA_CUSTOM_PROPERTIES = [
+    ("kbcBucketId", "string", "Keboola Storage bucket id"),
+    ("kbcStage", "string", "Keboola Storage bucket stage (in/out/sys)"),
+    ("kbcBackend", "string", "Bucket backend (e.g. snowflake, bigquery)"),
+    ("kbcSharing", "string", "Bucket sharing mode, when shared"),
+    ("kbcBucketUrl", "hyperlink-cp", "Keboola Storage bucket URL"),
+    ("kbcSyncedAt", "string", "Catalog snapshot time (UTC) — the fields above are as of this time"),
+]
+
+DATABASE_CUSTOM_PROPERTIES = [
+    ("kbcProjectId", "string", "Keboola project id"),
+    ("kbcProjectUrl", "hyperlink-cp", "Keboola project storage URL"),
+    ("kbcSyncedAt", "string", "Catalog snapshot time (UTC) — the fields above are as of this time"),
+]
 
 
 @dataclass
@@ -34,11 +76,14 @@ class BuiltTable:
 class EntityBuilder:
     """Builds catalog entity bodies for one project."""
 
-    def __init__(self, service_name: str, project: str, project_id: str | None, ui_base: str) -> None:
+    def __init__(
+        self, service_name: str, project: str, project_id: str | None, ui_base: str, stack_id: str | None = None
+    ) -> None:
         self.service_name = service_name
         self.project = project
         self.project_id = project_id or "unknown"
         self.ui_base = ui_base.rstrip("/")
+        self.stack_id = stack_id
 
     # --------------------------------------------------------------- helpers
 
@@ -51,9 +96,45 @@ class EntityBuilder:
     def _table_url(self, bucket_id: str, table_id: str) -> str:
         return f"{self.ui_base}/admin/projects/{self.project_id}/storage/{bucket_id}/table/{table_id}"
 
+    def _public_base(self) -> str:
+        """Public Keboola connection base URL (``KBC_STACKID``, falls back to ``ui_base``)."""
+        return enrichment.connection_base(self.stack_id, self.ui_base)
+
+    def _kbc_project_url(self) -> str:
+        return f"{self._public_base()}/admin/projects/{self.project_id}/storage"
+
+    def _kbc_bucket_url(self, bucket_id: str) -> str:
+        return f"{self._public_base()}/admin/projects/{self.project_id}/storage/{bucket_id}"
+
+    def _kbc_table_url(self, bucket_id: str, table_id: str) -> str:
+        return f"{self._public_base()}/admin/projects/{self.project_id}/storage/{bucket_id}/table/{table_id}"
+
     @staticmethod
     def _drop_none(body: dict) -> dict:
         return {k: v for k, v in body.items() if v is not None}
+
+    @staticmethod
+    def _creator_email(created_by_metadata: dict[str, str]) -> str | None:
+        """Owner e-mail from Storage ``KBC.createdBy.*`` metadata, if any value is e-mail-shaped.
+
+        Verified system metadata (``KBC.createdBy.component.id`` /
+        ``KBC.createdBy.configuration.id`` / ``KBC.createdBy.branch.id``)
+        records which COMPONENT/CONFIG created the object, never a user
+        e-mail — so this returns ``None`` for tables/buckets today. It stays a
+        real check (not a hardcoded omission) so a future Storage API
+        addition of an e-mail-shaped creator key is picked up without a code
+        change; until then the owner is omitted, never fabricated.
+        """
+        for value in created_by_metadata.values():
+            email = enrichment.extract_email(value)
+            if email:
+                return email
+        return None
+
+    def _owners_from_metadata(
+        self, created_by_metadata: dict[str, str], owner_resolver: Callable[[str], str | None] | None
+    ) -> list[dict] | None:
+        return enrichment.native_owners(self._creator_email(created_by_metadata), owner_resolver)
 
     # ---------------------------------------------------------------- E1-E3
 
@@ -64,17 +145,54 @@ class EntityBuilder:
             "description": "Keboola Connection stack catalogued by keboola.wr-openmetadata-catalog.",
         }
 
-    def database_body(self, display_name: str | None = None) -> dict:
+    def _database_extension(self, available: set[str] | None, synced_at: str | None) -> dict | None:
+        values = {
+            "kbcProjectId": self.project_id,
+            "kbcProjectUrl": enrichment.hyperlink(self._kbc_project_url(), "Open project"),
+            "kbcSyncedAt": synced_at,
+        }
+        extension = {k: v for k, v in values.items() if v is not None and (available is None or k in available)}
+        return extension or None
+
+    def database_body(
+        self,
+        display_name: str | None = None,
+        *,
+        available: set[str] | None = None,
+        synced_at: str | None = None,
+    ) -> dict:
+        # Database (Project) never gets a native owner — Storage exposes no
+        # project-level creator metadata to check.
         return self._drop_none(
             {
                 "name": fqn.sanitize_name(self.project),
                 "displayName": fqn.sanitize_display_name(display_name or self.project),
                 "service": fqn.database_service_fqn(self.service_name),
                 "sourceUrl": self._project_url(),
+                "extension": self._database_extension(available, synced_at),
             }
         )
 
-    def schema_body(self, bucket: SourceBucket) -> dict:
+    def _schema_extension(self, bucket: SourceBucket, available: set[str] | None, synced_at: str | None) -> dict | None:
+        values = {
+            "kbcBucketId": bucket.id,
+            "kbcStage": bucket.stage,
+            "kbcBackend": bucket.backend,
+            "kbcSharing": bucket.sharing,
+            "kbcBucketUrl": enrichment.hyperlink(self._kbc_bucket_url(bucket.id), "Open bucket"),
+            "kbcSyncedAt": synced_at,
+        }
+        extension = {k: v for k, v in values.items() if v is not None and (available is None or k in available)}
+        return extension or None
+
+    def schema_body(
+        self,
+        bucket: SourceBucket,
+        *,
+        available: set[str] | None = None,
+        synced_at: str | None = None,
+        owner_resolver: Callable[[str], str | None] | None = None,
+    ) -> dict:
         bucket_path = bucket.path or bucket.name
         return self._drop_none(
             {
@@ -83,6 +201,8 @@ class EntityBuilder:
                 "description": fqn.sanitize_display_name(bucket.description),
                 "database": fqn.database_fqn(self.service_name, self.project),
                 "sourceUrl": self._bucket_url(bucket.id),
+                "extension": self._schema_extension(bucket, available, synced_at),
+                "owners": self._owners_from_metadata(bucket.created_by_metadata, owner_resolver),
             }
         )
 
@@ -143,7 +263,36 @@ class EntityBuilder:
             col["name"] = candidate
         return columns
 
-    def table_body(self, bucket: SourceBucket, table: SourceTable) -> BuiltTable:
+    def _table_extension(
+        self,
+        bucket: SourceBucket,
+        table: SourceTable,
+        available: set[str] | None,
+        synced_at: str | None,
+    ) -> dict | None:
+        values = {
+            "kbcTableId": table.id,
+            "kbcBucketId": bucket.id,
+            "kbcStage": bucket.stage,
+            "kbcRowsCount": str(table.row_count) if table.row_count is not None else None,
+            "kbcDataSizeBytes": str(table.data_size_bytes) if table.data_size_bytes is not None else None,
+            "kbcLastImport": table.last_import_date,
+            "kbcIsAlias": "true" if table.is_alias else "false",
+            "kbcTableUrl": enrichment.hyperlink(self._kbc_table_url(bucket.id, table.id), "Open table"),
+            "kbcSyncedAt": synced_at,
+        }
+        extension = {k: v for k, v in values.items() if v is not None and (available is None or k in available)}
+        return extension or None
+
+    def table_body(
+        self,
+        bucket: SourceBucket,
+        table: SourceTable,
+        *,
+        available: set[str] | None = None,
+        synced_at: str | None = None,
+        owner_resolver: Callable[[str], str | None] | None = None,
+    ) -> BuiltTable:
         bucket_path = bucket.path or bucket.name
         table_type = detect_table_type(
             stage=bucket.stage,
@@ -164,6 +313,8 @@ class EntityBuilder:
             "columns": columns,
             "databaseSchema": fqn.schema_fqn(self.service_name, self.project, bucket_path),
             "sourceUrl": self._table_url(bucket.id, table.id),
+            "extension": self._table_extension(bucket, table, available, synced_at),
+            "owners": self._owners_from_metadata(table.created_by_metadata, owner_resolver),
         }
         if table.primary_key:
             body["tableConstraints"] = [{"constraintType": "PRIMARY_KEY", "columns": list(table.primary_key)}]

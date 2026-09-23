@@ -14,13 +14,10 @@ so they are correct even when the job runs on-platform with an internal ``KBC_UR
 
 from __future__ import annotations
 
-import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from mapping import fqn
-
-_EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+from mapping import enrichment, fqn
 
 _SERVICE_TYPE = "CustomDashboard"
 DATA_APP_COMPONENT_ID = "keboola.data-apps"
@@ -76,10 +73,7 @@ class DashboardBuilder:
 
     def _connection_base(self) -> str:
         """Public Keboola connection base URL from ``KBC_STACKID`` (falls back to ui_base)."""
-        if self.stack_id:
-            host = self.stack_id if self.stack_id.startswith("connection.") else f"connection.{self.stack_id}"
-            return f"https://{host}"
-        return self.ui_base
+        return enrichment.connection_base(self.stack_id, self.ui_base)
 
     def _config_url(self, config_id: str) -> str:
         return f"{self._connection_base()}/admin/projects/{self.project_id}/data-apps/{config_id}"
@@ -91,28 +85,15 @@ class DashboardBuilder:
         region = self.stack_id.removeprefix("connection.")
         return f"https://{slug}-{app_id}.hub.{region}"
 
-    @staticmethod
-    def _owner(config: dict) -> str | None:
-        """Owner e-mail extracted from the creator-token description.
+    # Owner e-mail extracted from the creator-token description — shared with
+    # every other builder that catalogs a Keboola configuration (pipelines,
+    # flows); see ``mapping.enrichment.creator_token_email``.
+    _owner = staticmethod(enrichment.creator_token_email)
 
-        The token description is usually an e-mail, but can wrap one in text
-        (``"kbagent-cli [martin@keboola.com]"``); the ``kbcOwner`` custom property
-        is e-mail-typed, so extract the address and skip descriptions without one.
-        """
-        version = config.get("currentVersion") or {}
-        token = version.get("creatorToken") or config.get("creatorToken") or {}
-        match = _EMAIL.search(token.get("description") or "")
-        return match.group(0) if match else None
+    # Last-change timestamp — shared with ``mapping.pipeline_builder``.
+    _last_change = staticmethod(enrichment.config_last_change)
 
-    @staticmethod
-    def _last_change(config: dict) -> str | None:
-        version = config.get("currentVersion") or {}
-        timestamp = version.get("created") or config.get("created")
-        return timestamp.replace("T", " ")[:16] if timestamp else None
-
-    @staticmethod
-    def _hyperlink(url: str | None, display_text: str) -> dict | None:
-        return {"url": url, "displayText": display_text} if url else None
+    _hyperlink = staticmethod(enrichment.hyperlink)
 
     @classmethod
     def _owners(cls, config: dict, owner_resolver: Callable[[str], str | None] | None) -> list[dict] | None:
@@ -123,11 +104,7 @@ class DashboardBuilder:
         no native owner is set — the ``kbcOwner`` custom property still records the
         e-mail. Owner assignment is therefore additive and best-effort.
         """
-        if owner_resolver is None:
-            return None
-        email = cls._owner(config)
-        owner_id = owner_resolver(email) if email else None
-        return [{"id": owner_id, "type": "user"}] if owner_id else None
+        return enrichment.native_owners(cls._owner(config), owner_resolver)
 
     @staticmethod
     def _status_label(state: str | None) -> str | None:

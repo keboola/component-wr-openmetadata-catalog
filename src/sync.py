@@ -19,6 +19,24 @@ from dataclasses import dataclass
 
 DEFAULT_FULL_REFRESH_EVERY = 20
 
+# Provenance fields excluded from the incremental digest: they are metadata
+# ABOUT the object (who/what created it), not catalog CONTENT, and — for
+# ``created_by_metadata`` specifically — are set once at Storage-object
+# creation and never change. Digesting them would force every bucket/table to
+# reprocess the instant such a field was introduced, for no real content
+# reason.
+_DIGEST_EXCLUDED_FIELDS = frozenset({"created_by_metadata"})
+
+
+def digest_fields(obj: object) -> dict:
+    """``vars(obj)`` minus fields that are provenance metadata, not catalog content.
+
+    Use this (not raw ``vars()``) wherever a ``SourceBucket``/``SourceTable``
+    is fed into :func:`bucket_digest`, so a future metadata-only field never
+    silently perturbs the incremental digest.
+    """
+    return {k: v for k, v in vars(obj).items() if k not in _DIGEST_EXCLUDED_FIELDS}
+
 
 def bucket_digest(bucket_fields: dict, table_fields: list[dict]) -> str:
     """Content digest of a bucket's catalog-relevant structure."""

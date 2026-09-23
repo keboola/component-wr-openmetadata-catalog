@@ -22,7 +22,12 @@ from dataclasses import dataclass, field
 
 from configuration import MergeMode
 
-# Owned fields per entity kind (fields this component authors).
+# Owned fields per entity kind (fields this component authors). ``extension``
+# (typed custom properties) and ``owners`` (native OM owners) are owned
+# wherever the corresponding builder populates them (spec: generalize the
+# Dashboard-only owners/extension treatment to Tables, Pipelines,
+# DatabaseSchemas and Databases) — Database (Project) never gets an owner, so
+# ``OWNED_DATABASE_FIELDS`` omits "owners".
 OWNED_TABLE_FIELDS = (
     "displayName",
     "description",
@@ -31,9 +36,13 @@ OWNED_TABLE_FIELDS = (
     "tableConstraints",
     "sourceUrl",
     "schemaDefinition",
+    "extension",
+    "owners",
 )
-OWNED_PIPELINE_FIELDS = ("displayName", "description", "tasks", "sourceUrl")
+OWNED_PIPELINE_FIELDS = ("displayName", "description", "tasks", "sourceUrl", "extension", "owners")
 OWNED_DASHBOARD_FIELDS = ("displayName", "description", "sourceUrl", "extension", "owners")
+OWNED_SCHEMA_FIELDS = ("displayName", "description", "sourceUrl", "extension", "owners")
+OWNED_DATABASE_FIELDS = ("displayName", "sourceUrl", "extension")
 
 # Lineage edge sources this component owns; a Manual edge is never in this set.
 OUR_LINEAGE_SOURCES = ("PipelineLineage", "QueryLineage", "ViewLineage")

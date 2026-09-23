@@ -3,15 +3,37 @@
 Component configs -> Pipeline + Tasks (``taskSQL``, ``downstreamTasks``); flows
 / orchestrations -> Pipeline + Tasks with phase ordering; Job Queue run history
 -> a ``PUT /pipelines/{fqn}/status`` body.
+
+Structured metadata (component/config id, a public deep link, last change,
+owner e-mail) is additionally written as OpenMetadata **custom properties** in
+the ``extension``, mirroring ``mapping.dashboard_builder``'s treatment of
+data-app Dashboards — a component config or flow always carries a real
+creator e-mail (``currentVersion.creatorToken.description``), so this is the
+main native-``owners`` win of the generalised treatment. Flows share the same
+extension/owner logic as component configs (both are Keboola *configurations*
+with the same creator-token shape).
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
-from mapping import fqn
+from mapping import enrichment, fqn
 
 _SERVICE_TYPE = "CustomPipeline"
+
+# Custom properties defined on the OpenMetadata Pipeline type: (name, field
+# type, description). om_types used across this component are only ever
+# "string", "email", "hyperlink-cp".
+CUSTOM_PROPERTIES = [
+    ("kbcComponentId", "string", "Keboola component id"),
+    ("kbcConfigId", "string", "Keboola configuration (or flow) id"),
+    ("kbcConfigUrl", "hyperlink-cp", "Keboola configuration URL"),
+    ("kbcLastChange", "string", "Last configuration change"),
+    ("kbcOwner", "email", "Pipeline owner (last configuration editor)"),
+    ("kbcSyncedAt", "string", "Catalog snapshot time (UTC) — the fields above are as of this time"),
+]
 
 _FLOW_COMPONENT_IDS = frozenset({"keboola.orchestrator", "keboola.flow"})
 _SQL_COMPONENT_IDS = frozenset(
@@ -62,11 +84,14 @@ def _task_type(component_id: str) -> str:
 class PipelineBuilder:
     """Builds Pipeline bodies for one project."""
 
-    def __init__(self, service_name: str, project: str, project_id: str | None, ui_base: str) -> None:
+    def __init__(
+        self, service_name: str, project: str, project_id: str | None, ui_base: str, stack_id: str | None = None
+    ) -> None:
         self.service_name = service_name
         self.project = project
         self.project_id = project_id or "unknown"
         self.ui_base = ui_base.rstrip("/")
+        self.stack_id = stack_id
 
     def pipeline_service_body(self) -> dict:
         return {
@@ -84,20 +109,70 @@ class PipelineBuilder:
     def _flow_url(self, flow_id: str) -> str:
         return f"{self.ui_base}/admin/projects/{self.project_id}/flows/{flow_id}"
 
+    def _public_base(self) -> str:
+        """Public Keboola connection base URL (``KBC_STACKID``, falls back to ``ui_base``)."""
+        return enrichment.connection_base(self.stack_id, self.ui_base)
+
+    def _kbc_component_url(self, component_id: str, config_id: str) -> str:
+        return f"{self._public_base()}/admin/projects/{self.project_id}/components/{component_id}/{config_id}"
+
+    def _kbc_flow_url(self, flow_id: str) -> str:
+        return f"{self._public_base()}/admin/projects/{self.project_id}/flows/{flow_id}"
+
+    @staticmethod
+    def _extension(
+        component_id: str,
+        config_id: str,
+        config: dict,
+        config_url: str,
+        available: set[str] | None,
+        synced_at: str | None,
+    ) -> dict | None:
+        values = {
+            "kbcComponentId": component_id,
+            "kbcConfigId": config_id,
+            "kbcConfigUrl": enrichment.hyperlink(config_url, "Open configuration"),
+            "kbcLastChange": enrichment.config_last_change(config),
+            "kbcOwner": enrichment.creator_token_email(config),
+            "kbcSyncedAt": synced_at,
+        }
+        extension = {k: v for k, v in values.items() if v is not None and (available is None or k in available)}
+        return extension or None
+
+    @staticmethod
+    def _owners(config: dict, owner_resolver: Callable[[str], str | None] | None) -> list[dict] | None:
+        return enrichment.native_owners(enrichment.creator_token_email(config), owner_resolver)
+
     # --------------------------------------------------------------- E13/E14
 
-    def build_pipeline(self, component_id: str, config: dict) -> BuiltPipeline:
+    def build_pipeline(
+        self,
+        component_id: str,
+        config: dict,
+        *,
+        available_properties: set[str] | None = None,
+        synced_at: str | None = None,
+        owner_resolver: Callable[[str], str | None] | None = None,
+    ) -> BuiltPipeline:
         """Dispatch to the flow or component-config builder."""
         if self.is_flow(component_id):
-            return self._flow_pipeline(component_id, config)
-        return self._config_pipeline(component_id, config)
+            return self._flow_pipeline(component_id, config, available_properties, synced_at, owner_resolver)
+        return self._config_pipeline(component_id, config, available_properties, synced_at, owner_resolver)
 
-    def _config_pipeline(self, component_id: str, config: dict) -> BuiltPipeline:
+    def _config_pipeline(
+        self,
+        component_id: str,
+        config: dict,
+        available: set[str] | None = None,
+        synced_at: str | None = None,
+        owner_resolver: Callable[[str], str | None] | None = None,
+    ) -> BuiltPipeline:
         config_id = str(config.get("id"))
         configuration = config.get("configuration") or {}
         tasks = self._blocks_to_tasks(component_id, configuration)
         if not tasks:
             tasks = self._rows_to_tasks(component_id, config.get("rows") or [])
+        config_url = self._kbc_component_url(component_id, config_id)
         body = _drop_none(
             {
                 "name": fqn.pipeline_name(self.project, config_id),
@@ -106,6 +181,8 @@ class PipelineBuilder:
                 "service": fqn.database_service_fqn(self.service_name),
                 "sourceUrl": self._component_url(component_id, config_id),
                 "tasks": tasks or None,
+                "extension": self._extension(component_id, config_id, config, config_url, available, synced_at),
+                "owners": self._owners(config, owner_resolver),
             }
         )
         return BuiltPipeline(
@@ -161,10 +238,18 @@ class PipelineBuilder:
             )
         return tasks
 
-    def _flow_pipeline(self, component_id: str, config: dict) -> BuiltPipeline:
+    def _flow_pipeline(
+        self,
+        component_id: str,
+        config: dict,
+        available: set[str] | None = None,
+        synced_at: str | None = None,
+        owner_resolver: Callable[[str], str | None] | None = None,
+    ) -> BuiltPipeline:
         flow_id = str(config.get("id"))
         configuration = config.get("configuration") or {}
         tasks = self._flow_to_tasks(configuration)
+        config_url = self._kbc_flow_url(flow_id)
         body = _drop_none(
             {
                 "name": fqn.pipeline_name(self.project, flow_id),
@@ -173,6 +258,8 @@ class PipelineBuilder:
                 "service": fqn.database_service_fqn(self.service_name),
                 "sourceUrl": self._flow_url(flow_id),
                 "tasks": tasks or None,
+                "extension": self._extension(component_id, flow_id, config, config_url, available, synced_at),
+                "owners": self._owners(config, owner_resolver),
             }
         )
         return BuiltPipeline(

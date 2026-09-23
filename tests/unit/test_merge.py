@@ -5,7 +5,9 @@ from merge import (
     ACTION_SKIPPED_UNCHANGED,
     ACTION_UPDATED,
     OUR_LINEAGE_SOURCES,
+    OWNED_DATABASE_FIELDS,
     OWNED_PIPELINE_FIELDS,
+    OWNED_SCHEMA_FIELDS,
     OWNED_TABLE_FIELDS,
     SnapshotStore,
     ThreeWayMerger,
@@ -72,6 +74,25 @@ def test_table_and_pipeline_owned_fields_defined():
     assert "columns" in OWNED_TABLE_FIELDS
     assert "tableConstraints" in OWNED_TABLE_FIELDS
     assert "tasks" in OWNED_PIPELINE_FIELDS
+
+
+def test_table_and_pipeline_owned_fields_include_extension_and_owners():
+    # Generalizing the Dashboard-only owners/extension treatment to Tables and
+    # Pipelines (owned append-only; existing membership checks above keep passing).
+    assert "extension" in OWNED_TABLE_FIELDS
+    assert "owners" in OWNED_TABLE_FIELDS
+    assert "extension" in OWNED_PIPELINE_FIELDS
+    assert "owners" in OWNED_PIPELINE_FIELDS
+
+
+def test_schema_owned_fields_defined():
+    assert set(OWNED_SCHEMA_FIELDS) == {"displayName", "description", "sourceUrl", "extension", "owners"}
+
+
+def test_database_owned_fields_defined_without_owners():
+    # Database (Project) never gets a native owner -> "owners" is deliberately absent.
+    assert set(OWNED_DATABASE_FIELDS) == {"displayName", "sourceUrl", "extension"}
+    assert "owners" not in OWNED_DATABASE_FIELDS
 
 
 def test_pipeline_merge_updates_tasks():

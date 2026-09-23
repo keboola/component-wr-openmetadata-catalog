@@ -82,6 +82,29 @@ def test_list_buckets_parses_and_filters_dev_branch():
     assert buckets[0].description == "Sales bucket"
 
 
+def test_list_buckets_collects_created_by_metadata():
+    routes = {
+        "/v2/storage/buckets": [
+            {
+                "id": "out.c-sales",
+                "name": "c-sales",
+                "stage": "out",
+                "metadata": [
+                    {"key": "KBC.createdBy.component.id", "value": "keboola.ex-adform-metadata"},
+                    {"key": "KBC.createdBy.configuration.id", "value": "123"},
+                    {"key": "KBC.description", "value": "not a createdBy key"},
+                ],
+            },
+        ]
+    }
+    reader = _reader(routes)
+    (bucket,) = reader.list_buckets()
+    assert bucket.created_by_metadata == {
+        "KBC.createdBy.component.id": "keboola.ex-adform-metadata",
+        "KBC.createdBy.configuration.id": "123",
+    }
+
+
 def test_list_buckets_includes_dev_when_all_branches():
     routes = {
         "/v2/storage/buckets": [
@@ -130,6 +153,26 @@ def test_get_table_typed_and_legacy_columns_and_pk():
     assert cols["id"].definition == {"type": "NUMBER", "length": "38,0"}
     assert cols["note"].legacy == {"basetype": "STRING"}
     assert cols["note"].description == "free text"
+
+
+def test_get_table_collects_created_by_metadata():
+    body = {
+        "id": "out.c-sales.orders",
+        "name": "orders",
+        "columns": ["id"],
+        "metadata": [
+            {"key": "KBC.createdBy.component.id", "value": "keboola.ex-generic"},
+            {"key": "KBC.createdBy.configuration.id", "value": "456"},
+        ],
+    }
+    session = mock.Mock()
+    session.get.return_value = FakeResponse(200, body)
+    reader = StorageReader("https://connection.keboola.com", "t", session=session)
+    table = reader.get_table("out.c-sales.orders")
+    assert table.created_by_metadata == {
+        "KBC.createdBy.component.id": "keboola.ex-generic",
+        "KBC.createdBy.configuration.id": "456",
+    }
 
 
 def test_missing_token_401_raises_userexception():

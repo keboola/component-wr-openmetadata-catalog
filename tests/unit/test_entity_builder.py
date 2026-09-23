@@ -1,13 +1,19 @@
 import logging
 
 from client.storage_reader import SourceBucket, SourceColumn, SourceTable
-from mapping.entity_builder import EntityBuilder
+from mapping.entity_builder import (
+    DATABASE_CUSTOM_PROPERTIES,
+    SCHEMA_CUSTOM_PROPERTIES,
+    TABLE_CUSTOM_PROPERTIES,
+    EntityBuilder,
+)
 
 UI = "https://connection.keboola.com"
+STACK = "connection.us-east4.gcp.keboola.com"
 
 
-def _builder():
-    return EntityBuilder("keboola-stack", "Acme_Project", "1234", UI)
+def _builder(stack_id=None):
+    return EntityBuilder("keboola-stack", "Acme_Project", "1234", UI, stack_id)
 
 
 def test_database_service_and_database_bodies():
@@ -133,3 +139,264 @@ def test_external_table_detected():
     table = SourceTable(id="in.c-ext.events", name="events", columns=[SourceColumn(name="id")])
     built = _builder().table_body(bucket, table)
     assert built.table_type == "External"
+
+
+# --------------------------------------------------------------------- custom property constants
+
+
+def test_table_custom_properties_names_and_types():
+    names = {n for n, *_ in TABLE_CUSTOM_PROPERTIES}
+    assert names == {
+        "kbcTableId",
+        "kbcBucketId",
+        "kbcStage",
+        "kbcRowsCount",
+        "kbcDataSizeBytes",
+        "kbcLastImport",
+        "kbcIsAlias",
+        "kbcTableUrl",
+        "kbcSyncedAt",
+    }
+    types = {n: t for n, t, *_ in TABLE_CUSTOM_PROPERTIES}
+    assert types["kbcTableUrl"] == "hyperlink-cp"
+    assert types["kbcTableId"] == "string"
+
+
+def test_schema_custom_properties_names_and_types():
+    names = {n for n, *_ in SCHEMA_CUSTOM_PROPERTIES}
+    assert names == {"kbcBucketId", "kbcStage", "kbcBackend", "kbcSharing", "kbcBucketUrl", "kbcSyncedAt"}
+    types = {n: t for n, t, *_ in SCHEMA_CUSTOM_PROPERTIES}
+    assert types["kbcBucketUrl"] == "hyperlink-cp"
+
+
+def test_database_custom_properties_names_and_types():
+    names = {n for n, *_ in DATABASE_CUSTOM_PROPERTIES}
+    assert names == {"kbcProjectId", "kbcProjectUrl", "kbcSyncedAt"}
+    types = {n: t for n, t, *_ in DATABASE_CUSTOM_PROPERTIES}
+    assert types["kbcProjectUrl"] == "hyperlink-cp"
+
+
+# --------------------------------------------------------------------- table_body extension
+
+
+def test_table_body_extension_full_population():
+    bucket = SourceBucket(id="out.c-sales", name="c-sales", stage="out", path="out.c-sales")
+    table = SourceTable(
+        id="out.c-sales.orders",
+        name="orders",
+        columns=[SourceColumn(name="id")],
+        row_count=42,
+        data_size_bytes=1024,
+        last_import_date="2026-04-14T20:56:16+0200",
+        is_alias=False,
+    )
+    body = _builder(STACK).table_body(bucket, table, synced_at="2026-09-22 10:00 UTC").body
+    ext = body["extension"]
+    assert ext["kbcTableId"] == "out.c-sales.orders"
+    assert ext["kbcBucketId"] == "out.c-sales"
+    assert ext["kbcStage"] == "out"
+    assert ext["kbcRowsCount"] == "42"
+    assert ext["kbcDataSizeBytes"] == "1024"
+    assert ext["kbcLastImport"] == "2026-04-14T20:56:16+0200"
+    assert ext["kbcIsAlias"] == "false"
+    assert ext["kbcSyncedAt"] == "2026-09-22 10:00 UTC"
+    assert ext["kbcTableUrl"] == {
+        "url": (
+            "https://connection.us-east4.gcp.keboola.com/admin/projects/1234/storage/out.c-sales/table/"
+            "out.c-sales.orders"
+        ),
+        "displayText": "Open table",
+    }
+
+
+def test_table_body_extension_filtered_by_available():
+    bucket = SourceBucket(id="out.c-sales", name="c-sales", stage="out", path="out.c-sales")
+    table = SourceTable(id="out.c-sales.orders", name="orders", columns=[SourceColumn(name="id")])
+    body = _builder().table_body(bucket, table, available={"kbcTableId", "kbcBucketId"}).body
+    assert set(body["extension"].keys()) == {"kbcTableId", "kbcBucketId"}
+
+
+def test_table_body_extension_omits_missing_source_fields():
+    bucket = SourceBucket(id="out.c-sales", name="c-sales", stage="out", path="out.c-sales")
+    table = SourceTable(id="out.c-sales.orders", name="orders", columns=[SourceColumn(name="id")])
+    # row_count / data_size_bytes / last_import_date default to None -> omitted
+    ext = _builder().table_body(bucket, table).body["extension"]
+    assert "kbcRowsCount" not in ext
+    assert "kbcDataSizeBytes" not in ext
+    assert "kbcLastImport" not in ext
+    # kbcIsAlias is always present (derived, never None) regardless of the others
+    assert ext["kbcIsAlias"] == "false"
+
+
+def test_table_url_custom_property_falls_back_to_ui_base_without_stack_id():
+    bucket = SourceBucket(id="out.c-sales", name="c-sales", stage="out", path="out.c-sales")
+    table = SourceTable(id="out.c-sales.orders", name="orders", columns=[SourceColumn(name="id")])
+    ext = _builder().table_body(bucket, table).body["extension"]
+    assert ext["kbcTableUrl"]["url"] == f"{UI}/admin/projects/1234/storage/out.c-sales/table/out.c-sales.orders"
+
+
+# --------------------------------------------------------------------- table_body owners
+
+
+def test_table_body_owner_set_via_resolver_with_email_shaped_metadata():
+    # Synthetic fixture: created_by_metadata never really holds an e-mail (it holds
+    # component/config ids), but the extraction path must still work if it ever did.
+    bucket = SourceBucket(id="out.c-sales", name="c-sales", stage="out", path="out.c-sales")
+    table = SourceTable(
+        id="out.c-sales.orders",
+        name="orders",
+        columns=[SourceColumn(name="id")],
+        created_by_metadata={"KBC.createdBy.component.id": "someone@keboola.com"},
+    )
+    body = _builder().table_body(bucket, table, owner_resolver=lambda email: "om-user-1").body
+    assert body["owners"] == [{"id": "om-user-1", "type": "user"}]
+
+
+def test_table_body_owner_omitted_with_real_component_config_id_metadata():
+    # The REAL shape: component/config ids, never an e-mail -> no owner e-mail found,
+    # so the resolver is never called and "owners" is absent (omit, don't fabricate).
+    calls = []
+
+    def resolver(email):
+        calls.append(email)
+        return "om-user-1"
+
+    bucket = SourceBucket(id="out.c-sales", name="c-sales", stage="out", path="out.c-sales")
+    table = SourceTable(
+        id="out.c-sales.orders",
+        name="orders",
+        columns=[SourceColumn(name="id")],
+        created_by_metadata={
+            "KBC.createdBy.component.id": "keboola.ex-generic",
+            "KBC.createdBy.configuration.id": "123",
+        },
+    )
+    body = _builder().table_body(bucket, table, owner_resolver=resolver).body
+    assert "owners" not in body
+    assert calls == []
+
+
+def test_table_body_owner_omitted_without_resolver():
+    bucket = SourceBucket(id="out.c-sales", name="c-sales", stage="out", path="out.c-sales")
+    table = SourceTable(
+        id="out.c-sales.orders",
+        name="orders",
+        columns=[SourceColumn(name="id")],
+        created_by_metadata={"KBC.createdBy.component.id": "someone@keboola.com"},
+    )
+    body = _builder().table_body(bucket, table).body
+    assert "owners" not in body
+
+
+# --------------------------------------------------------------------- schema_body extension
+
+
+def test_schema_body_extension_full_population():
+    bucket = SourceBucket(
+        id="out.c-sales",
+        name="c-sales",
+        stage="out",
+        path="out.c-sales",
+        backend="snowflake",
+        sharing="organization",
+    )
+    body = _builder(STACK).schema_body(bucket, synced_at="2026-09-22 10:00 UTC")
+    ext = body["extension"]
+    assert ext["kbcBucketId"] == "out.c-sales"
+    assert ext["kbcStage"] == "out"
+    assert ext["kbcBackend"] == "snowflake"
+    assert ext["kbcSharing"] == "organization"
+    assert ext["kbcSyncedAt"] == "2026-09-22 10:00 UTC"
+    assert ext["kbcBucketUrl"] == {
+        "url": "https://connection.us-east4.gcp.keboola.com/admin/projects/1234/storage/out.c-sales",
+        "displayText": "Open bucket",
+    }
+
+
+def test_schema_body_extension_filtered_by_available():
+    bucket = SourceBucket(id="out.c-sales", name="c-sales", stage="out", path="out.c-sales")
+    body = _builder().schema_body(bucket, available={"kbcBucketId"})
+    assert set(body["extension"].keys()) == {"kbcBucketId"}
+
+
+def test_schema_body_extension_omits_missing_source_fields():
+    bucket = SourceBucket(id="out.c-sales", name="c-sales", stage="out", path="out.c-sales")
+    ext = _builder().schema_body(bucket)["extension"]
+    assert "kbcBackend" not in ext
+    assert "kbcSharing" not in ext
+
+
+# --------------------------------------------------------------------- schema_body owners
+
+
+def test_schema_body_owner_set_via_resolver_with_email_shaped_metadata():
+    bucket = SourceBucket(
+        id="out.c-sales",
+        name="c-sales",
+        stage="out",
+        path="out.c-sales",
+        created_by_metadata={"KBC.createdBy.component.id": "owner@keboola.com"},
+    )
+    body = _builder().schema_body(bucket, owner_resolver=lambda email: "om-user-2")
+    assert body["owners"] == [{"id": "om-user-2", "type": "user"}]
+
+
+def test_schema_body_owner_omitted_with_real_component_config_id_metadata():
+    calls = []
+
+    def resolver(email):
+        calls.append(email)
+        return "om-user-2"
+
+    bucket = SourceBucket(
+        id="out.c-sales",
+        name="c-sales",
+        stage="out",
+        path="out.c-sales",
+        created_by_metadata={
+            "KBC.createdBy.component.id": "keboola.ex-generic",
+            "KBC.createdBy.configuration.id": "123",
+        },
+    )
+    body = _builder().schema_body(bucket, owner_resolver=resolver)
+    assert "owners" not in body
+    assert calls == []
+
+
+def test_schema_body_owner_omitted_without_resolver():
+    bucket = SourceBucket(
+        id="out.c-sales",
+        name="c-sales",
+        stage="out",
+        path="out.c-sales",
+        created_by_metadata={"KBC.createdBy.component.id": "owner@keboola.com"},
+    )
+    body = _builder().schema_body(bucket)
+    assert "owners" not in body
+
+
+# --------------------------------------------------------------------- database_body
+
+
+def test_database_body_extension_full_population_and_no_owners_key():
+    body = _builder(STACK).database_body(display_name="Acme Project", synced_at="2026-09-22 10:00 UTC")
+    ext = body["extension"]
+    assert ext["kbcProjectId"] == "1234"
+    assert ext["kbcSyncedAt"] == "2026-09-22 10:00 UTC"
+    assert ext["kbcProjectUrl"] == {
+        "url": "https://connection.us-east4.gcp.keboola.com/admin/projects/1234/storage",
+        "displayText": "Open project",
+    }
+    assert "owners" not in body  # Database (Project) never gets an owner
+
+
+def test_database_body_extension_filtered_by_available():
+    body = _builder().database_body(available={"kbcProjectId"})
+    assert set(body["extension"].keys()) == {"kbcProjectId"}
+    assert "owners" not in body
+
+
+def test_database_body_no_extension_when_no_properties_available():
+    body = _builder().database_body(available=set())
+    assert "extension" not in body
+    assert "owners" not in body

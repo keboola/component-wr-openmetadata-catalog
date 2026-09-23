@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 _BRANCH_METADATA_KEY = "KBC.createdBy.branch.id"
 _DESCRIPTION_KEY = "KBC.description"
+_CREATED_BY_PREFIX = "KBC.createdBy."
 _RETRYABLE_STATUS = frozenset({500, 502, 503, 504})
 
 
@@ -80,6 +81,13 @@ class SourceTable:
     is_alias: bool = False
     source_table: dict | None = None
     branch_id: str | None = None
+    # Storage ``KBC.createdBy.*`` system metadata (component id / configuration
+    # id / branch id — never a user e-mail, verified against the Storage API
+    # docs). Kept as raw key->value so a builder can *check* for an e-mail-
+    # shaped value (forward-compatible) rather than a hardcoded omission; see
+    # ``mapping.entity_builder``. Excluded from the incremental digest (spec:
+    # ``sync.digest_fields``) since it never changes after creation.
+    created_by_metadata: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -95,6 +103,8 @@ class SourceBucket:
     source_bucket: dict | None = None
     backend: str | None = None
     branch_id: str | None = None
+    # See ``SourceTable.created_by_metadata`` — same shape, same caveat.
+    created_by_metadata: dict[str, str] = field(default_factory=dict)
 
 
 def _metadata_value(entries: list | None, key: str) -> str | None:
@@ -102,6 +112,19 @@ def _metadata_value(entries: list | None, key: str) -> str | None:
         if isinstance(entry, dict) and entry.get("key") == key:
             return entry.get("value")
     return None
+
+
+def _metadata_prefixed_values(entries: list | None, prefix: str) -> dict[str, str]:
+    """Raw ``key -> value`` for every metadata entry whose key starts with ``prefix``."""
+    result: dict[str, str] = {}
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        key = entry.get("key")
+        value = entry.get("value")
+        if isinstance(key, str) and key.startswith(prefix) and value is not None:
+            result[key] = value
+    return result
 
 
 class StorageReader:
@@ -270,6 +293,7 @@ class StorageReader:
                     source_bucket=item.get("sourceBucket"),
                     backend=item.get("backend"),
                     branch_id=branch,
+                    created_by_metadata=_metadata_prefixed_values(item.get("metadata"), _CREATED_BY_PREFIX),
                 )
             )
         return buckets
@@ -324,6 +348,7 @@ class StorageReader:
             is_alias=bool(raw.get("isAlias")),
             source_table=raw.get("sourceTable"),
             branch_id=branch,
+            created_by_metadata=_metadata_prefixed_values(raw.get("metadata"), _CREATED_BY_PREFIX),
         )
 
     @staticmethod
