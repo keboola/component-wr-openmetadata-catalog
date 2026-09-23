@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 SOURCE_PIPELINE = "PipelineLineage"
 SOURCE_QUERY = "QueryLineage"
 SOURCE_VIEW = "ViewLineage"
+SOURCE_DASHBOARD = "DashboardLineage"
 
 
 def _is_self_loop(from_fqn: str, to_fqn: str, source: str) -> bool:
@@ -161,6 +162,39 @@ def pipeline_edges(
 def view_edge(view_fqn: str, source_fqn: str) -> LineageEdge:
     """ViewLineage edge for a linked/shared bucket (base table -> view)."""
     return LineageEdge(from_fqn=source_fqn, to_fqn=view_fqn, source=SOURCE_VIEW)
+
+
+def data_app_edges(
+    storage: dict,
+    *,
+    service_name: str,
+    project: str,
+    dashboard_fqn: str,
+) -> list[LineageEdge]:
+    """Upstream table -> data-app (Dashboard) edges from the app's input mapping.
+
+    A data app declares its source tables in ``storage.input.tables``; each maps to
+    a ``DashboardLineage`` edge from that Table to the app's Dashboard, so the
+    catalog shows which tables feed each data app. Duplicate sources (several input
+    mappings of the same table) collapse to one edge.
+    """
+    inputs = (storage.get("input") or {}).get("tables") or []
+    edges: list[LineageEdge] = []
+    seen: set[str] = set()
+    for table in inputs:
+        source_fqn = fqn.table_fqn_from_storage_id(service_name, project, table.get("source", ""))
+        if not source_fqn or source_fqn in seen:
+            continue
+        seen.add(source_fqn)
+        edges.append(
+            LineageEdge(
+                from_fqn=source_fqn,
+                to_fqn=dashboard_fqn,
+                source=SOURCE_DASHBOARD,
+                to_type="dashboard",
+            )
+        )
+    return edges
 
 
 def _column_ref_valid(

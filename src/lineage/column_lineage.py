@@ -92,7 +92,7 @@ def _table_key(tbl: exp.Table) -> str:
     with the dot intact, so this key reproduces the Keboola storage id
     (``stage.c-bucket.table``) verbatim for the Snowflake-validated case.
     """
-    return f"{tbl.db}.{tbl.name}" if tbl.db else tbl.name
+    return f"{tbl.db}.{tbl.name}" if tbl.db else (tbl.name or "")
 
 
 def _select_and_target(
@@ -102,11 +102,13 @@ def _select_and_target(
     if isinstance(tree, exp.Create):
         created = tree.this.find(exp.Table) if tree.this else None
         cols = [c.name for c in tree.find_all(exp.ColumnDef)]
-        tgt_key = _table_key(created) if created is not None else None
-        if created is not None and created.db:
-            graph.qualified_targets.add(tgt_key)
-        if tgt_key is not None and cols:
-            graph.ws_schema[tgt_key] = cols
+        tgt_key: str | None = None
+        if created is not None:
+            tgt_key = _table_key(created)
+            if created.db:
+                graph.qualified_targets.add(tgt_key)
+            if cols:
+                graph.ws_schema[tgt_key] = cols
         if isinstance(tree.expression, exp.Select | exp.Union):
             return tree.expression, tgt_key, cols
         return None, None, []
@@ -114,10 +116,12 @@ def _select_and_target(
     if isinstance(tree, exp.Insert):
         target = tree.this
         table = target.find(exp.Table) if target else None
-        tgt_tbl = _table_key(table) if table is not None else None
-        if table is not None and table.db:
-            graph.qualified_targets.add(tgt_tbl)
         explicit = [i.name for i in target.find_all(exp.Identifier)][1:] if target is not None else []
+        tgt_tbl: str | None = None
+        if table is not None:
+            tgt_tbl = _table_key(table)
+            if table.db:
+                graph.qualified_targets.add(tgt_tbl)
         if isinstance(tree.expression, exp.Select):
             return tree.expression, tgt_tbl, explicit
     return None, None, []

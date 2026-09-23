@@ -25,7 +25,7 @@ from keboola.component.exceptions import UserException
 logger = logging.getLogger(__name__)
 
 # Entity kinds whose collection lives under ``/services/``.
-_SERVICE_KINDS = frozenset({"databaseServices", "pipelineServices"})
+_SERVICE_KINDS = frozenset({"databaseServices", "pipelineServices", "dashboardServices"})
 
 _RETRYABLE_STATUS = frozenset({500, 502, 503, 504})
 _JSON_PATCH_CT = "application/json-patch+json"
@@ -219,7 +219,73 @@ class OMClient:
         response = self._request("PATCH", path, json_body=json_patch, content_type=_JSON_PATCH_CT)
         return response.json()
 
+    # -------------------------------------------------- custom properties
+
+    def ensure_custom_properties(self, entity_type: str, specs: list[tuple[str, str, str]]) -> set[str]:
+        """Ensure custom properties ``(name, field_type, description)`` exist on ``entity_type``.
+
+        Returns the property names that exist afterwards. Defining a property is an
+        admin-level type change a bot token may be refused; such a failure is logged
+        and the property left out of the returned set, so the caller skips its value
+        instead of 400-ing the entity write.
+        """
+        entity = self._request(
+            "GET", f"/metadata/types/name/{entity_type}", params={"fields": "customProperties"}
+        ).json()
+        type_id = entity.get("id")
+        existing = {c.get("name") for c in (entity.get("customProperties") or [])}
+        for name, field_type, description in specs:
+            if name in existing:
+                continue
+            try:
+                field_type_id = self._request("GET", f"/metadata/types/name/{field_type}").json().get("id")
+                self._request(
+                    "PUT",
+                    f"/metadata/types/{type_id}",
+                    json_body={
+                        "name": name,
+                        "description": description,
+                        "propertyType": {"id": field_type_id, "type": "type"},
+                    },
+                )
+                existing.add(name)
+            except Exception as exc:  # noqa: BLE001 - defining a property is best-effort (bot may be refused)
+                logger.warning("Could not define custom property %r on %s: %s", name, entity_type, exc)
+        return existing
+
     # ---------------------------------------------------------------- reads
+
+    def find_user_id_by_email(self, email: str) -> str | None:
+        """Best-effort OM user id for an email address (``None`` if not found).
+
+        Queries the user search index and returns the id of the user whose email
+        matches exactly (case-insensitive). Any failure — search unavailable, no
+        match — returns ``None``, so a data app whose owner has no OM user is
+        written without a native owner (the kbcOwner custom property still keeps
+        the email). Auth failures stay fatal, consistent with the write paths.
+        """
+        try:
+            # Field-qualified query: a plain full-email ``q`` does not match, because
+            # the search analyzer tokenizes the address and the default fields never
+            # hold it whole. ``email:"..."`` matches on the email field; the exact
+            # post-filter below still guards against a partial/near match.
+            response = self._request(
+                "GET",
+                "/search/query",
+                params={"q": f'email:"{email}"', "index": "user_search_index", "from": 0, "size": 10},
+            )
+            hits = ((response.json() or {}).get("hits") or {}).get("hits") or []
+        except OMAuthError:
+            raise
+        except Exception:  # user lookup is best-effort (search may be unavailable)
+            logger.debug("OM user search failed for %r; no native owner set", email, exc_info=True)
+            return None
+        target = email.strip().lower()
+        for hit in hits:
+            source = hit.get("_source") or {}
+            if (source.get("email") or "").strip().lower() == target and source.get("id"):
+                return source["id"]
+        return None
 
     def get_by_fqn(self, kind: str, fqn: str, *, fields: str | None = None) -> dict | None:
         params = {"fields": fields} if fields else None

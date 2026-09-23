@@ -77,6 +77,7 @@ class Configuration(BaseModel):
     write_column_lineage: bool = True
     write_pipelines: bool = True
     write_pipeline_status: bool = True
+    write_data_apps: bool = True
     full_refresh: bool = False
 
     # --- SSH (root) ---

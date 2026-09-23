@@ -26,6 +26,17 @@ SVC = "keboola-stack"
 PROJ = "Acme_Project"
 
 
+def _known_fqns(*storage_ids: str) -> set[str]:
+    """Build a ``known_table_fqns`` set for these fixtures, narrowed to ``set[str]``.
+
+    ``table_fqn_from_storage_id`` returns ``str | None`` for an unparseable id; every
+    storage id in this file is well-formed, so the walrus-filtered comprehension both
+    narrows the type and would silently drop a typo'd fixture id rather than leaking
+    ``None`` into the set.
+    """
+    return {f for sid in storage_ids if (f := fqn_mod.table_fqn_from_storage_id(SVC, PROJ, sid))}
+
+
 def test_sqlglot_splits_quoted_dotted_schema_into_db_and_name_snowflake():
     """De-risking spike (run FIRST): verify the contract's core SQLGlot
     assumption empirically before relying on it anywhere else. A Snowflake
@@ -37,6 +48,7 @@ def test_sqlglot_splits_quoted_dotted_schema_into_db_and_name_snowflake():
     """
     sql = 'INSERT INTO "out"."t" SELECT "a" FROM "PROJDB"."in.c-bucket"."src"'
     (tree,) = sqlglot.parse(sql, dialect="snowflake")
+    assert tree is not None
     tables = list(tree.find_all(exp.Table))
     (source,) = [t for t in tables if t.name == "src"]
     assert source.db == "in.c-bucket"
@@ -56,10 +68,7 @@ def test_direct_ref_resolves_via_inferred_in_map_5922_pattern():
             'INSERT INTO "result" SELECT "a", "b" FROM "PROJDB"."in.c-bucket"."src"',
         )
     ]
-    known_fqns = {
-        fqn_mod.table_fqn_from_storage_id(SVC, PROJ, "in.c-bucket.src"),
-        fqn_mod.table_fqn_from_storage_id(SVC, PROJ, "out.c-x.t"),
-    }
+    known_fqns = _known_fqns("in.c-bucket.src", "out.c-x.t")
     res = extract_column_lineage(
         stmts,
         in_map={},
@@ -91,10 +100,7 @@ def test_direct_ref_target_also_qualified_uses_inferred_out_map():
             'INSERT INTO "out.c-x"."t" SELECT "a", "b" FROM "PROJDB"."in.c-bucket"."src"',
         )
     ]
-    known_fqns = {
-        fqn_mod.table_fqn_from_storage_id(SVC, PROJ, "in.c-bucket.src"),
-        fqn_mod.table_fqn_from_storage_id(SVC, PROJ, "out.c-x.t"),
-    }
+    known_fqns = _known_fqns("in.c-bucket.src", "out.c-x.t")
     res = extract_column_lineage(
         stmts,
         in_map={},
@@ -120,7 +126,7 @@ def test_non_cataloged_qualified_ref_is_not_inferred_as_input():
         )
     ]
     # known_table_fqns deliberately omits scratch.tmp's FQN.
-    known_fqns = {fqn_mod.table_fqn_from_storage_id(SVC, PROJ, "out.c-x.t")}
+    known_fqns = _known_fqns("out.c-x.t")
     res = extract_column_lineage(
         stmts,
         in_map={},
@@ -139,7 +145,7 @@ def test_bare_workspace_alias_with_declared_in_map_unaffected_by_phase_b_params(
     resolves exactly as before, even when the new Phase-B params are supplied
     (Phase-B is additive — it must never change the declared path)."""
     stmts = [("code1", 'INSERT INTO "result" SELECT "id", "amount" FROM "src"')]
-    known_fqns = {fqn_mod.table_fqn_from_storage_id(SVC, PROJ, "in.c-main.orders")}
+    known_fqns = _known_fqns("in.c-main.orders")
     res = extract_column_lineage(
         stmts,
         in_map={"src": "in.c-main.orders"},
@@ -158,7 +164,7 @@ def test_declared_in_map_wins_over_inferred_on_same_qualified_key():
     """Merge precedence: if a qualified key happens to collide with an
     explicit declared ``in_map`` entry, the declared mapping wins."""
     stmts = [("code1", 'INSERT INTO "result" SELECT "a" FROM "PROJDB"."in.c-bucket"."src"')]
-    known_fqns = {fqn_mod.table_fqn_from_storage_id(SVC, PROJ, "in.c-bucket.src")}
+    known_fqns = _known_fqns("in.c-bucket.src")
     res = extract_column_lineage(
         stmts,
         in_map={"in.c-bucket.src": "in.c-bucket.OVERRIDDEN"},

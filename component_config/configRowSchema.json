@@ -263,6 +263,17 @@
           },
           "propertyOrder": 40
         },
+        "write_data_apps": {
+          "type": "boolean",
+          "format": "checkbox",
+          "title": "Write Data Apps",
+          "default": true,
+          "description": "Catalog Keboola data apps as OpenMetadata Dashboards",
+          "options": {
+            "tooltip": "Enabled by default. Emits a Dashboard entity per data app (keboola.data-apps) with upstream table lineage from its input mapping."
+          },
+          "propertyOrder": 45
+        },
         "full_refresh": {
           "type": "boolean",
           "format": "checkbox",
