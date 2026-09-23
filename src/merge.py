@@ -45,7 +45,7 @@ OWNED_SCHEMA_FIELDS = ("displayName", "description", "sourceUrl", "extension", "
 OWNED_DATABASE_FIELDS = ("displayName", "sourceUrl", "extension")
 
 # Lineage edge sources this component owns; a Manual edge is never in this set.
-OUR_LINEAGE_SOURCES = ("PipelineLineage", "QueryLineage", "ViewLineage")
+OUR_LINEAGE_SOURCES = ("PipelineLineage", "QueryLineage", "ViewLineage", "SchemaLineage")
 # The same discipline for dashboard (data-app) targets: only DashboardLineage edges
 # we authored are ever dropped before re-adding the current ones.
 OUR_DASHBOARD_LINEAGE_SOURCES = ("DashboardLineage",)

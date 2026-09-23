@@ -2,10 +2,17 @@
   "parameters": {
     "om_host": "https://openmetadata.example.com",
     "#bot_token": "your-om-jwt-bot-token",
-    "project_scope": "rows",
-    "write_lineage": true,
+    "scope": "this_project",
+    "write_buckets": true,
+    "write_transformations": true,
+    "write_components": true,
+    "write_flows": true,
+    "write_data_apps": true,
+    "write_bucket_lineage": true,
+    "write_table_lineage": true,
     "write_column_lineage": true,
-    "write_pipelines": true,
+    "write_pipeline_lineage": true,
+    "write_dashboard_lineage": true,
     "write_pipeline_status": true
   }
 }

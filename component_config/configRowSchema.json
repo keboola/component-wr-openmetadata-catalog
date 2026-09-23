@@ -33,42 +33,6 @@
       },
       "propertyOrder": 20
     },
-    "project_name_override": {
-      "type": "string",
-      "title": "Project Name Override (Optional)",
-      "description": "Optional human-readable OpenMetadata Database name",
-      "options": {
-        "dependencies": {
-          "scope": "this_project"
-        },
-        "tooltip": "Defaults to the project name resolved from the token."
-      },
-      "propertyOrder": 30
-    },
-    "buckets": {
-      "type": "array",
-      "title": "Buckets",
-      "format": "select",
-      "uniqueItems": true,
-      "description": "Buckets to catalog (empty = all)",
-      "items": {
-        "type": "string",
-        "enum": []
-      },
-      "options": {
-        "dependencies": {
-          "scope": "this_project"
-        },
-        "tags": true,
-        "async": {
-          "label": "Load Buckets",
-          "action": "listBuckets",
-          "autoload": true,
-          "cache": true
-        }
-      },
-      "propertyOrder": 40
-    },
     "#manage_token": {
       "type": "string",
       "title": "Management Token",
@@ -80,7 +44,7 @@
         },
         "tooltip": "Org-wide credential used only to enumerate projects and mint short-lived read-only Storage tokens. Host the config in a locked-down admin project."
       },
-      "propertyOrder": 50
+      "propertyOrder": 30
     },
     "organization_id": {
       "type": "string",
@@ -92,14 +56,218 @@
         },
         "tooltip": "Enumeration is bound to this single organization via GET /manage/organizations/{id}/projects; the component never lists all organizations."
       },
-      "propertyOrder": 60
+      "propertyOrder": 40
+    },
+    "project_name_override": {
+      "type": "string",
+      "title": "Project Name Override (Optional)",
+      "description": "Optional human-readable OpenMetadata Database name",
+      "options": {
+        "dependencies": {
+          "scope": "this_project"
+        },
+        "tooltip": "Defaults to the project name resolved from the token."
+      },
+      "propertyOrder": 50
+    },
+    "objects": {
+      "type": "object",
+      "title": "Objects",
+      "description": "Which object families to catalog from this project",
+      "propertyOrder": 60,
+      "options": {
+        "dependencies": {
+          "scope": "this_project"
+        }
+      },
+      "properties": {
+        "write_buckets": {
+          "type": "boolean",
+          "format": "checkbox",
+          "title": "Buckets",
+          "default": true,
+          "description": "Catalog buckets, tables, and columns",
+          "options": {
+            "tooltip": "Catalog buckets; uncheck to skip this family entirely."
+          },
+          "propertyOrder": 10
+        },
+        "buckets": {
+          "type": "array",
+          "title": "Only these buckets",
+          "format": "select",
+          "uniqueItems": true,
+          "description": "Buckets to catalog (empty = all)",
+          "items": {
+            "type": "string",
+            "enum": []
+          },
+          "options": {
+            "dependencies": {
+              "write_buckets": true
+            },
+            "tags": true,
+            "async": {
+              "label": "Load Buckets",
+              "action": "listBuckets",
+              "autoload": true,
+              "cache": true
+            }
+          },
+          "propertyOrder": 20
+        },
+        "write_transformations": {
+          "type": "boolean",
+          "format": "checkbox",
+          "title": "Transformations",
+          "default": true,
+          "description": "SQL / Python transformations",
+          "options": {
+            "tooltip": "Catalog transformations; uncheck to skip this family entirely."
+          },
+          "propertyOrder": 30
+        },
+        "transformations": {
+          "type": "array",
+          "title": "Only these transformations",
+          "format": "select",
+          "uniqueItems": true,
+          "description": "Transformations to emit as pipelines (empty = all)",
+          "items": {
+            "type": "string",
+            "enum": []
+          },
+          "options": {
+            "dependencies": {
+              "write_transformations": true
+            },
+            "tags": true,
+            "async": {
+              "label": "Load Transformations",
+              "action": "listTransformations",
+              "autoload": true,
+              "cache": true
+            },
+            "tooltip": "Only selectable for a single project. An organization-wide row emits every eligible transformation it finds in each project."
+          },
+          "propertyOrder": 40
+        },
+        "write_components": {
+          "type": "boolean",
+          "format": "checkbox",
+          "title": "Components",
+          "default": true,
+          "description": "Extractors, writers, and other component configurations",
+          "options": {
+            "tooltip": "Catalog non-transformation component configurations; uncheck to skip this family entirely."
+          },
+          "propertyOrder": 50
+        },
+        "components": {
+          "type": "array",
+          "title": "Only these components",
+          "format": "select",
+          "uniqueItems": true,
+          "description": "Components to emit as pipelines (empty = all)",
+          "items": {
+            "type": "string",
+            "enum": []
+          },
+          "options": {
+            "dependencies": {
+              "write_components": true
+            },
+            "tags": true,
+            "async": {
+              "label": "Load Components",
+              "action": "listComponents",
+              "autoload": true,
+              "cache": true
+            },
+            "tooltip": "Only selectable for a single project. Covers non-transformation configurations, e.g. a MySQL extractor configuration lives here, not under Transformations."
+          },
+          "propertyOrder": 60
+        },
+        "write_flows": {
+          "type": "boolean",
+          "format": "checkbox",
+          "title": "Flows",
+          "default": true,
+          "description": "Emit flows as pipeline entities",
+          "options": {
+            "tooltip": "Catalog flows; uncheck to skip this family entirely."
+          },
+          "propertyOrder": 70
+        },
+        "flows": {
+          "type": "array",
+          "title": "Only these flows",
+          "format": "select",
+          "uniqueItems": true,
+          "description": "Flows to emit as pipelines (empty = all)",
+          "items": {
+            "type": "string",
+            "enum": []
+          },
+          "options": {
+            "dependencies": {
+              "write_flows": true
+            },
+            "tags": true,
+            "async": {
+              "label": "Load Flows",
+              "action": "listFlows",
+              "autoload": true,
+              "cache": true
+            },
+            "tooltip": "Only selectable for a single project. An organization-wide row emits every eligible flow it finds in each project."
+          },
+          "propertyOrder": 80
+        },
+        "write_data_apps": {
+          "type": "boolean",
+          "format": "checkbox",
+          "title": "Data Apps",
+          "default": true,
+          "description": "Catalog data apps as OpenMetadata dashboards",
+          "options": {
+            "tooltip": "Catalog data apps; uncheck to skip this family entirely."
+          },
+          "propertyOrder": 90
+        },
+        "data_apps": {
+          "type": "array",
+          "title": "Only these data apps",
+          "format": "select",
+          "uniqueItems": true,
+          "description": "Data apps to catalog as dashboards (empty = all)",
+          "items": {
+            "type": "string",
+            "enum": []
+          },
+          "options": {
+            "dependencies": {
+              "write_data_apps": true
+            },
+            "tags": true,
+            "async": {
+              "label": "Load Data Apps",
+              "action": "listDataApps",
+              "autoload": true,
+              "cache": true
+            },
+            "tooltip": "Only selectable for a single project. An organization-wide row emits every eligible data app it finds in each project. Each data app becomes a Dashboard entity (keboola.data-apps) with upstream table lineage from its input mapping."
+          },
+          "propertyOrder": 100
+        }
+      }
     },
     "projects": {
       "type": "array",
-      "title": "Projects",
+      "title": "Only these projects",
       "format": "select",
       "uniqueItems": true,
-      "description": "Projects to enumerate and write (empty = all)",
+      "description": "Projects to catalog (empty = all organization projects)",
       "items": {
         "type": "string",
         "enum": []
@@ -114,86 +282,10 @@
           "action": "listProjects",
           "autoload": true,
           "cache": true
-        }
+        },
+        "tooltip": "Every family (buckets, configurations, flows, data apps) is written for each selected project; there is no per-family filter in this scope."
       },
       "propertyOrder": 70
-    },
-    "write_pipelines": {
-      "type": "boolean",
-      "format": "checkbox",
-      "title": "Write Pipelines",
-      "default": true,
-      "description": "Emit Pipeline entities for component configs and flows",
-      "options": {
-        "tooltip": "Enabled by default. Turn off for a catalog-only run (tables, columns, lineage) with no pipeline entities."
-      },
-      "propertyOrder": 80
-    },
-    "configurations": {
-      "type": "array",
-      "title": "Configurations",
-      "format": "select",
-      "uniqueItems": true,
-      "description": "Component configs to emit as pipelines (empty = all)",
-      "items": {
-        "type": "string",
-        "enum": []
-      },
-      "options": {
-        "dependencies": {
-          "scope": "this_project",
-          "write_pipelines": true
-        },
-        "tags": true,
-        "async": {
-          "label": "Load Configurations",
-          "action": "listConfigurations",
-          "autoload": true,
-          "cache": true
-        },
-        "tooltip": "Only selectable for a single project. An organization-wide row emits every eligible producing config it finds in each project."
-      },
-      "propertyOrder": 90
-    },
-    "flows": {
-      "type": "array",
-      "title": "Flows",
-      "format": "select",
-      "uniqueItems": true,
-      "description": "Flows to emit as pipelines (empty = all)",
-      "items": {
-        "type": "string",
-        "enum": []
-      },
-      "options": {
-        "dependencies": {
-          "scope": "this_project",
-          "write_pipelines": true
-        },
-        "tags": true,
-        "async": {
-          "label": "Load Flows",
-          "action": "listFlows",
-          "autoload": true,
-          "cache": true
-        },
-        "tooltip": "Only selectable for a single project. An organization-wide row emits every eligible flow it finds in each project."
-      },
-      "propertyOrder": 100
-    },
-    "write_pipeline_status": {
-      "type": "boolean",
-      "format": "checkbox",
-      "title": "Write Pipeline Status",
-      "default": true,
-      "description": "Emit run history as pipeline status",
-      "options": {
-        "dependencies": {
-          "write_pipelines": true
-        },
-        "tooltip": "Enabled by default when pipelines are written."
-      },
-      "propertyOrder": 110
     },
     "advanced": {
       "type": "object",
@@ -203,6 +295,97 @@
         "collapsed": true
       },
       "properties": {
+        "lineage": {
+          "type": "object",
+          "title": "Lineage",
+          "format": "grid-strict",
+          "description": "Which lineage types to emit",
+          "propertyOrder": 10,
+          "properties": {
+            "write_bucket_lineage": {
+              "type": "boolean",
+              "format": "checkbox",
+              "title": "Bucket lineage",
+              "default": true,
+              "description": "Emit lineage between buckets, aggregated from table lineage",
+              "options": {
+                "grid_columns": 6,
+                "tooltip": "Enabled by default."
+              },
+              "propertyOrder": 1
+            },
+            "write_table_lineage": {
+              "type": "boolean",
+              "format": "checkbox",
+              "title": "Table lineage",
+              "default": true,
+              "description": "Emit declared table-level lineage",
+              "options": {
+                "grid_columns": 6,
+                "tooltip": "Enabled by default."
+              },
+              "propertyOrder": 2
+            },
+            "write_column_lineage": {
+              "type": "boolean",
+              "format": "checkbox",
+              "title": "Column lineage",
+              "default": true,
+              "description": "Emit column-level lineage from transformation SQL",
+              "options": {
+                "grid_columns": 6,
+                "tooltip": "Enabled by default."
+              },
+              "propertyOrder": 3
+            },
+            "write_pipeline_lineage": {
+              "type": "boolean",
+              "format": "checkbox",
+              "title": "Pipeline lineage",
+              "default": true,
+              "description": "Emit lineage between pipelines and the tables they read or write",
+              "options": {
+                "grid_columns": 6,
+                "tooltip": "Enabled by default."
+              },
+              "propertyOrder": 4
+            },
+            "write_dashboard_lineage": {
+              "type": "boolean",
+              "format": "checkbox",
+              "title": "Dashboard lineage",
+              "default": true,
+              "description": "Emit dashboard lineage from data app input mappings",
+              "options": {
+                "grid_columns": 6,
+                "tooltip": "Enabled by default."
+              },
+              "propertyOrder": 5
+            }
+          }
+        },
+        "write_pipeline_status": {
+          "type": "boolean",
+          "format": "checkbox",
+          "title": "Write Pipeline Status",
+          "default": true,
+          "description": "Emit each pipeline's run history (last job status)",
+          "options": {
+            "tooltip": "Enabled by default. Applies to the pipeline entities this row emits from Configurations and Flows."
+          },
+          "propertyOrder": 20
+        },
+        "full_refresh": {
+          "type": "boolean",
+          "format": "checkbox",
+          "title": "Full Refresh",
+          "default": false,
+          "description": "Ignore per-bucket digests and re-push everything this run",
+          "options": {
+            "tooltip": "Disabled by default; incremental digests skip unchanged buckets."
+          },
+          "propertyOrder": 30
+        },
         "merge_mode": {
           "type": "string",
           "title": "Merge Mode",
@@ -219,7 +402,7 @@
             ],
             "tooltip": "Three-way merge keeps fields a person edited in OpenMetadata and logs the change; Keboola overwrites replaces them."
           },
-          "propertyOrder": 10
+          "propertyOrder": 40
         },
         "failure_mode": {
           "type": "string",
@@ -239,51 +422,7 @@
             ],
             "tooltip": "Collect and fail at end records every per-entity failure in the run report and fails the job once all entities are processed. Fail fast stops on the first failure. Log only never fails the job."
           },
-          "propertyOrder": 20
-        },
-        "write_lineage": {
-          "type": "boolean",
-          "format": "checkbox",
-          "title": "Write Table Lineage",
-          "default": true,
-          "description": "Emit declared table-level lineage",
-          "options": {
-            "tooltip": "Enabled by default."
-          },
-          "propertyOrder": 30
-        },
-        "write_column_lineage": {
-          "type": "boolean",
-          "format": "checkbox",
-          "title": "Write Column Lineage",
-          "default": true,
-          "description": "Emit column-level lineage from transformation SQL",
-          "options": {
-            "tooltip": "Enabled by default."
-          },
-          "propertyOrder": 40
-        },
-        "write_data_apps": {
-          "type": "boolean",
-          "format": "checkbox",
-          "title": "Write Data Apps",
-          "default": true,
-          "description": "Catalog Keboola data apps as OpenMetadata Dashboards",
-          "options": {
-            "tooltip": "Enabled by default. Emits a Dashboard entity per data app (keboola.data-apps) with upstream table lineage from its input mapping."
-          },
-          "propertyOrder": 45
-        },
-        "full_refresh": {
-          "type": "boolean",
-          "format": "checkbox",
-          "title": "Full Refresh",
-          "default": false,
-          "description": "Ignore per-bucket digests and re-push everything this run",
-          "options": {
-            "tooltip": "Disabled by default; incremental digests skip unchanged buckets."
-          },
-          "propertyOrder": 90
+          "propertyOrder": 50
         }
       }
     }

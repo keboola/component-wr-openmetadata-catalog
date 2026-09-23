@@ -20,6 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from mapping import enrichment, fqn
+from mapping.dashboard_builder import DATA_APP_COMPONENT_ID
 
 _SERVICE_TYPE = "CustomPipeline"
 
@@ -33,6 +34,7 @@ CUSTOM_PROPERTIES = [
     ("kbcLastChange", "string", "Last configuration change"),
     ("kbcOwner", "email", "Pipeline owner (last configuration editor)"),
     ("kbcSyncedAt", "string", "Catalog snapshot time (UTC) — the fields above are as of this time"),
+    ("kbcType", "string", "Keboola object kind"),
 ]
 
 _FLOW_COMPONENT_IDS = frozenset({"keboola.orchestrator", "keboola.flow"})
@@ -51,6 +53,15 @@ _PYTHON_COMPONENT_IDS = frozenset(
     {"keboola.python-transformation-v2", "keboola.python-transformation", "keboola.r-transformation-v2"}
 )
 
+# Storage API id-pattern fallback for the extractor/writer families, used when a
+# component's own `type` field is absent or unrecognised (see `component_kind`).
+_EXTRACTOR_ID_MARKER = ".ex-"
+_WRITER_ID_MARKER = ".wr-"
+
+# `type` values the Storage API components endpoint is known to return, mapped
+# 1:1 onto this catalog's object-family kinds.
+_KIND_BY_COMPONENT_TYPE = frozenset({"transformation", "extractor", "writer", "application"})
+
 
 def is_flow_component(component_id: str) -> bool:
     """True when ``component_id`` is a Keboola flow / orchestration component.
@@ -59,6 +70,36 @@ def is_flow_component(component_id: str) -> bool:
     it without a project-bound ``PipelineBuilder``.
     """
     return component_id in _FLOW_COMPONENT_IDS
+
+
+def component_kind(component_id: str, component_type: str | None = None) -> str:
+    """Classify one Keboola component into an object-family kind.
+
+    Returns one of ``"transformation" | "extractor" | "writer" | "application" |
+    "orchestration" | "data_app" | "other"``. Verified against a reference
+    connector hitting the same ``GET /v2/storage/branch/{branch}/components``
+    endpoint this component's ``list_component_configs()`` calls: the Storage
+    API DOES return a ``type`` field per component (extractor/writer/
+    application/transformation/...), so it is preferred here. The id-pattern
+    (``.ex-``/``.wr-``) and transformation id-set fallback stays in place for
+    defensiveness -- a ``type`` that is missing, unrecognised, or belongs to a
+    component family this catalog does not special-case (e.g. ``processor``)
+    still resolves to a sensible kind instead of raising.
+    """
+    if is_flow_component(component_id):
+        return "orchestration"
+    if component_id == DATA_APP_COMPONENT_ID:
+        return "data_app"
+    normalized_type = (component_type or "").strip().lower()
+    if normalized_type in _KIND_BY_COMPONENT_TYPE:
+        return normalized_type
+    if component_id in _SQL_COMPONENT_IDS or component_id in _PYTHON_COMPONENT_IDS:
+        return "transformation"
+    if _EXTRACTOR_ID_MARKER in component_id:
+        return "extractor"
+    if _WRITER_ID_MARKER in component_id:
+        return "writer"
+    return "other"
 
 
 @dataclass
@@ -127,6 +168,7 @@ class PipelineBuilder:
         config_url: str,
         available: set[str] | None,
         synced_at: str | None,
+        kind: str | None = None,
     ) -> dict | None:
         values = {
             "kbcComponentId": component_id,
@@ -135,6 +177,7 @@ class PipelineBuilder:
             "kbcLastChange": enrichment.config_last_change(config),
             "kbcOwner": enrichment.creator_token_email(config),
             "kbcSyncedAt": synced_at,
+            "kbcType": kind,
         }
         extension = {k: v for k, v in values.items() if v is not None and (available is None or k in available)}
         return extension or None
@@ -150,19 +193,27 @@ class PipelineBuilder:
         component_id: str,
         config: dict,
         *,
+        kind: str | None = None,
         available_properties: set[str] | None = None,
         synced_at: str | None = None,
         owner_resolver: Callable[[str], str | None] | None = None,
     ) -> BuiltPipeline:
-        """Dispatch to the flow or component-config builder."""
+        """Dispatch to the flow or component-config builder.
+
+        ``kind`` (one of ``component_kind``'s return values) populates the
+        ``kbcType`` custom property when given; it is optional and purely
+        additive, so a caller that predates the object-family split keeps
+        working unchanged (no ``kbcType`` value is written).
+        """
         if self.is_flow(component_id):
-            return self._flow_pipeline(component_id, config, available_properties, synced_at, owner_resolver)
-        return self._config_pipeline(component_id, config, available_properties, synced_at, owner_resolver)
+            return self._flow_pipeline(component_id, config, kind, available_properties, synced_at, owner_resolver)
+        return self._config_pipeline(component_id, config, kind, available_properties, synced_at, owner_resolver)
 
     def _config_pipeline(
         self,
         component_id: str,
         config: dict,
+        kind: str | None = None,
         available: set[str] | None = None,
         synced_at: str | None = None,
         owner_resolver: Callable[[str], str | None] | None = None,
@@ -181,7 +232,7 @@ class PipelineBuilder:
                 "service": fqn.database_service_fqn(self.service_name),
                 "sourceUrl": self._component_url(component_id, config_id),
                 "tasks": tasks or None,
-                "extension": self._extension(component_id, config_id, config, config_url, available, synced_at),
+                "extension": self._extension(component_id, config_id, config, config_url, available, synced_at, kind),
                 "owners": self._owners(config, owner_resolver),
             }
         )
@@ -242,6 +293,7 @@ class PipelineBuilder:
         self,
         component_id: str,
         config: dict,
+        kind: str | None = None,
         available: set[str] | None = None,
         synced_at: str | None = None,
         owner_resolver: Callable[[str], str | None] | None = None,
@@ -258,7 +310,7 @@ class PipelineBuilder:
                 "service": fqn.database_service_fqn(self.service_name),
                 "sourceUrl": self._flow_url(flow_id),
                 "tasks": tasks or None,
-                "extension": self._extension(component_id, flow_id, config, config_url, available, synced_at),
+                "extension": self._extension(component_id, flow_id, config, config_url, available, synced_at, kind),
                 "owners": self._owners(config, owner_resolver),
             }
         )

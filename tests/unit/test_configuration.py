@@ -25,12 +25,25 @@ def test_valid_tier1_config_parses():
     assert cfg.scope == ProjectScope.THIS_PROJECT
     assert cfg.merge_mode == MergeMode.THREE_WAY_MERGE
     assert cfg.failure_mode == FailureMode.COLLECT_AND_FAIL
-    assert cfg.write_lineage is True
+    assert cfg.write_table_lineage is True
     assert cfg.write_column_lineage is True
+    assert cfg.write_bucket_lineage is True
+    assert cfg.write_pipeline_lineage is True
+    assert cfg.write_dashboard_lineage is True
+    assert cfg.write_buckets is True
+    assert cfg.write_transformations is True
+    assert cfg.write_components is True
+    assert cfg.write_flows is True
+    assert cfg.write_data_apps is True
     assert cfg.buckets == []
-    assert cfg.configurations == []
+    assert cfg.transformations == []
+    assert cfg.components == []
     assert cfg.flows == []
+    assert cfg.data_apps == []
     assert cfg.projects == []
+    assert not hasattr(cfg, "write_pipelines")
+    assert not hasattr(cfg, "configurations")
+    assert not hasattr(cfg, "write_lineage")
 
 
 def test_valid_tier2_config_parses():
@@ -120,8 +133,10 @@ def test_selector_fields_parse_non_empty():
     cfg = Configuration(
         **_tier1_params(
             buckets=["in.c-main"],
-            configurations=["123", "456"],
+            transformations=["123"],
+            components=["456"],
             flows=["789"],
+            data_apps=["01app"],
             scope="all_projects",
             **{"#manage_token": "manage-xyz"},
             organization_id="123",
@@ -129,6 +144,102 @@ def test_selector_fields_parse_non_empty():
         )
     )
     assert cfg.buckets == ["in.c-main"]
-    assert cfg.configurations == ["123", "456"]
+    assert cfg.transformations == ["123"]
+    assert cfg.components == ["456"]
     assert cfg.flows == ["789"]
+    assert cfg.data_apps == ["01app"]
     assert cfg.projects == ["111", "222"]
+
+
+def test_family_enable_bools_can_be_disabled():
+    cfg = Configuration(
+        **_tier1_params(
+            write_buckets=False,
+            write_transformations=False,
+            write_components=False,
+            write_flows=False,
+            write_data_apps=False,
+            write_bucket_lineage=False,
+            write_table_lineage=False,
+            write_column_lineage=False,
+            write_pipeline_lineage=False,
+            write_dashboard_lineage=False,
+        )
+    )
+    assert cfg.write_buckets is False
+    assert cfg.write_transformations is False
+    assert cfg.write_components is False
+    assert cfg.write_flows is False
+    assert cfg.write_data_apps is False
+    assert cfg.write_bucket_lineage is False
+    assert cfg.write_table_lineage is False
+    assert cfg.write_column_lineage is False
+    assert cfg.write_pipeline_lineage is False
+    assert cfg.write_dashboard_lineage is False
+
+
+def test_nested_ui_groups_are_flattened():
+    """The row schema nests families under ``objects`` and behaviour under
+    ``advanced`` / ``advanced.lineage``; the UI saves that nested shape. The
+    model must read the nested values, not silently drop them to defaults."""
+    cfg = Configuration(
+        **_tier1_params(
+            scope="this_project",
+            objects={
+                "write_buckets": True,
+                "buckets": ["in.c-main"],
+                "write_transformations": False,
+                "transformations": [],
+                "write_components": True,
+                "components": ["1234"],
+                "write_flows": False,
+                "flows": [],
+                "write_data_apps": False,
+                "data_apps": [],
+            },
+            advanced={
+                "lineage": {
+                    "write_bucket_lineage": False,
+                    "write_table_lineage": True,
+                    "write_column_lineage": False,
+                    "write_pipeline_lineage": True,
+                    "write_dashboard_lineage": False,
+                },
+                "write_pipeline_status": False,
+                "full_refresh": True,
+                "merge_mode": "keboola_always_wins",
+                "failure_mode": "log_only",
+            },
+        )
+    )
+    # objects group
+    assert cfg.write_buckets is True
+    assert cfg.buckets == ["in.c-main"]
+    assert cfg.write_transformations is False
+    assert cfg.write_components is True
+    assert cfg.components == ["1234"]
+    assert cfg.write_flows is False
+    assert cfg.write_data_apps is False
+    # advanced.lineage group
+    assert cfg.write_bucket_lineage is False
+    assert cfg.write_table_lineage is True
+    assert cfg.write_column_lineage is False
+    assert cfg.write_pipeline_lineage is True
+    assert cfg.write_dashboard_lineage is False
+    # advanced scalars
+    assert cfg.write_pipeline_status is False
+    assert cfg.full_refresh is True
+    assert cfg.merge_mode == MergeMode.KEBOOLA_ALWAYS_WINS
+    assert cfg.failure_mode == FailureMode.LOG_ONLY
+    # the nested containers themselves are not retained as stray attributes
+    assert not hasattr(cfg, "objects")
+    assert not hasattr(cfg, "advanced")
+
+
+def test_flat_config_still_parses_without_nested_groups():
+    """A flat config (older configs / functional fixtures, no ``objects`` /
+    ``advanced``) must keep working unchanged."""
+    cfg = Configuration(**_tier1_params(write_buckets=False, merge_mode="keboola_always_wins"))
+    assert cfg.write_buckets is False
+    assert cfg.merge_mode == MergeMode.KEBOOLA_ALWAYS_WINS
+    assert cfg.write_table_lineage is True

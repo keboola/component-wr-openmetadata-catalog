@@ -37,8 +37,14 @@ from sync import StateManager, bucket_digest, digest_fields
 BASE_PARAMS = {
     "om_host": "https://om.example.com",
     "#bot_token": "jwt",
-    "write_pipelines": False,
-    "write_lineage": False,
+    "write_transformations": False,
+    "write_components": False,
+    "write_flows": False,
+    "write_data_apps": False,
+    "write_table_lineage": False,
+    "write_pipeline_lineage": False,
+    "write_bucket_lineage": False,
+    "write_dashboard_lineage": False,
     "write_column_lineage": False,
 }
 
@@ -344,7 +350,7 @@ def test_incremental_skip_is_tombstone_safe_and_writes_nothing():
 
     comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
     comp._config = SimpleNamespace(failure_mode=FailureMode.COLLECT_AND_FAIL)  # ty: ignore[invalid-assignment]
-    config = SimpleNamespace(full_refresh=False, buckets=[])
+    config = SimpleNamespace(full_refresh=False, buckets=[], write_buckets=True)
 
     # config/om are duck-typed test doubles (SimpleNamespace / _RecordingOM).
     comp._catalog_pass(
@@ -503,9 +509,16 @@ def _run_custom_props_passes(om, *, fail_entity_type: str | None = None):
 
     comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
     comp._config = SimpleNamespace(failure_mode=FailureMode.COLLECT_AND_FAIL)  # ty: ignore[invalid-assignment]
-    catalog_config = SimpleNamespace(full_refresh=True, buckets=[])
+    catalog_config = SimpleNamespace(full_refresh=True, buckets=[], write_buckets=True)
     pipeline_config = SimpleNamespace(
-        scope=ProjectScope.THIS_PROJECT, flows=[], configurations=[], write_pipeline_status=False
+        scope=ProjectScope.THIS_PROJECT,
+        write_flows=True,
+        flows=[],
+        write_transformations=True,
+        transformations=[],
+        write_components=True,
+        components=[],
+        write_pipeline_status=False,
     )
 
     # config/om are duck-typed test doubles (SimpleNamespace / _CustomPropsRecordingOM).
@@ -712,7 +725,12 @@ def test_data_app_lineage_pass_emits_table_to_dashboard_edge():
     )
     run.dashboard_fqn_by_config[config_id] = dashboard_fqn  # the dashboard pass ran first
     report = component_mod.RunReport(run_id="rid")
-    config = SimpleNamespace(write_lineage=True, write_column_lineage=False, write_data_apps=True)
+    config = SimpleNamespace(
+        write_dashboard_lineage=True,
+        write_data_apps=True,
+        write_column_lineage=False,
+        write_bucket_lineage=False,
+    )
 
     comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
     comp._lineage_pass(config, om, run, report)  # ty: ignore[invalid-argument-type]
@@ -729,9 +747,9 @@ def test_data_app_lineage_pass_emits_table_to_dashboard_edge():
     assert lineage_rows and lineage_rows[0]["action"] == report_mod.ACTION_UPDATED
 
 
-def test_data_app_lineage_skipped_when_write_lineage_off():
-    """With write_lineage off the data-app branch emits nothing, even though the
-    pass is entered for column lineage."""
+def test_data_app_lineage_skipped_when_write_dashboard_lineage_off():
+    """With write_dashboard_lineage off the data-app branch emits nothing, even
+    though the pass is entered for column lineage."""
     svc, proj, pid = "keboola-stack", "P", "4214"
     om = _LineageOM({})
     run = _ProjectRun(
@@ -743,7 +761,12 @@ def test_data_app_lineage_skipped_when_write_lineage_off():
     )
     run.dashboard_fqn_by_config["01app"] = fqn_mod.dashboard_fqn(svc, proj, "01app")
     report = component_mod.RunReport(run_id="rid")
-    config = SimpleNamespace(write_lineage=False, write_column_lineage=True, write_data_apps=True)
+    config = SimpleNamespace(
+        write_dashboard_lineage=False,
+        write_data_apps=True,
+        write_column_lineage=True,
+        write_bucket_lineage=False,
+    )
 
     comp = component_mod.Component.__new__(component_mod.Component)
     comp._lineage_pass(config, om, run, report)  # ty: ignore[invalid-argument-type]
@@ -876,7 +899,12 @@ def test_lineage_pass_uses_pipeline_edges_when_pipeline_exists_else_declared_fal
     }
     om = _LineageRecordingOM(known_ids)
     report = component_mod.RunReport(run_id="rid")
-    config = SimpleNamespace(write_lineage=True, write_column_lineage=False)
+    config = SimpleNamespace(
+        write_table_lineage=True,
+        write_pipeline_lineage=True,
+        write_column_lineage=False,
+        write_bucket_lineage=False,  # bucket-lineage aggregation is covered by its own dedicated tests
+    )
 
     comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
     comp._lineage_pass(config, om, run, report)  # ty: ignore[invalid-argument-type]
@@ -958,7 +986,12 @@ def test_lineage_pass_infers_input_pipeline_edge_from_direct_sql_when_declared_i
     known_ids = {in_fqn: "id-in-orders", out_fqn: "id-out-result", pipeline_fqn_value: "id-pipeline"}
     om = _LineageRecordingOM(known_ids)
     report = component_mod.RunReport(run_id="rid")
-    config = SimpleNamespace(write_lineage=True, write_column_lineage=True)
+    config = SimpleNamespace(
+        write_table_lineage=True,
+        write_pipeline_lineage=True,
+        write_column_lineage=True,
+        write_bucket_lineage=False,  # bucket-lineage aggregation is covered by its own dedicated tests
+    )
 
     comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
     comp._lineage_pass(config, om, run, report)  # ty: ignore[invalid-argument-type]
@@ -1028,7 +1061,12 @@ def test_lineage_pass_skips_sql_inference_when_declared_input_present():
     }
     om = _LineageRecordingOM(known_ids)
     report = component_mod.RunReport(run_id="rid")
-    config = SimpleNamespace(write_lineage=True, write_column_lineage=True)
+    config = SimpleNamespace(
+        write_table_lineage=True,
+        write_pipeline_lineage=True,
+        write_column_lineage=True,
+        write_bucket_lineage=False,  # bucket-lineage aggregation is covered by its own dedicated tests
+    )
 
     comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
     comp._lineage_pass(config, om, run, report)  # ty: ignore[invalid-argument-type]
@@ -1072,3 +1110,401 @@ def test_refresh_lineage_deletes_stale_edges_keyed_on_target_type():
     assert ("table", out_table_fqn) in delete_targets
     # never the pre-fix hardcoded "table" for the pipeline target
     assert ("table", pipeline_fqn_value) not in delete_targets
+
+
+# ------------------------------- object-family split: sync actions + pass gating
+
+
+class _FamilyReader:
+    """One producing transformation, one producing extractor, one flow, one data app."""
+
+    def list_component_configs(self):
+        return [
+            {
+                "id": "keboola.snowflake-transformation",
+                "type": "transformation",
+                "configurations": [
+                    {
+                        "id": "t1",
+                        "name": "Transform One",
+                        "configuration": {
+                            "storage": {"output": {"tables": [{"source": "o", "destination": "out.c-x.t"}]}}
+                        },
+                    }
+                ],
+            },
+            {
+                "id": "keboola.ex-db-mysql",
+                "type": "extractor",
+                "configurations": [
+                    {
+                        "id": "e1",
+                        "name": "Extract One",
+                        "configuration": {
+                            "storage": {"output": {"tables": [{"source": "o", "destination": "out.c-x.e"}]}}
+                        },
+                    }
+                ],
+            },
+            {
+                "id": "keboola.orchestrator",
+                "configurations": [{"id": "f1", "name": "Flow One", "configuration": {"phases": [], "tasks": []}}],
+            },
+            {
+                "id": "keboola.data-apps",
+                "configurations": [{"id": "a1", "name": "App One", "configuration": {}}],
+            },
+        ]
+
+
+def test_sync_actions_partition_transformations_components_data_apps(tmp_path, monkeypatch, _env):
+    """listTransformations/listComponents/listDataApps each return exactly their
+    own family — a flow and the "other" family's config never leak across."""
+    monkeypatch.setenv("KBC_DATADIR", _make_datadir(tmp_path, BASE_PARAMS))
+    monkeypatch.setattr(component_mod, "StorageReader", lambda *a, **k: _FamilyReader())
+    comp = component_mod.Component()
+
+    transformations = comp.list_transformations()
+    components = comp.list_components()
+    data_apps = comp.list_data_apps()
+
+    assert [e.value for e in transformations] == ["t1"]
+    assert transformations[0].label == "keboola.snowflake-transformation / Transform One"
+    assert [e.value for e in components] == ["e1"]
+    assert components[0].label == "keboola.ex-db-mysql / Extract One"
+    assert [e.value for e in data_apps] == ["a1"]
+    assert data_apps[0].label == "App One"  # listDataApps: label=name, no component-id prefix
+
+
+# --------------------------------------------------- pipeline-pass family gating + kbcType
+
+
+class _PipelineRecordingOM(FakeOM):
+    """Records every upserted Pipeline body (not just kind/name), for asserting
+    kbcType and for counting how many pipelines a gated/filtered pass wrote."""
+
+    def __init__(self):
+        super().__init__()
+        self.pipeline_bodies: dict[str, dict] = {}
+
+    def ensure_custom_properties(self, entity_type, specs):
+        return {name for name, *_ in specs}
+
+    def put_entity(self, kind, body):
+        if kind == "pipelines":
+            self.pipeline_bodies[body["name"]] = body
+        return super().put_entity(kind, body)
+
+
+def _family_gating_run():
+    svc, proj, pid = "keboola-stack", "Proj", "4214"
+    run = _ProjectRun(
+        ctx=ProjectContext(project_id=pid, project_name=proj, storage_token="t", storage_url="https://s"),
+        reader=_FamilyReader(),  # ty: ignore[invalid-argument-type]  (duck-typed test double)
+        entities=EntityBuilder(svc, proj, pid, "https://ui.example"),
+        pipelines=PipelineBuilder(svc, proj, pid, "https://ui.example"),
+        dashboards=DashboardBuilder(svc, proj, pid, "https://ui.example"),
+    )
+    return run
+
+
+def _run_pipeline_pass(config_overrides: dict) -> tuple[_PipelineRecordingOM, component_mod.RunReport]:
+    om = _PipelineRecordingOM()
+    run = _family_gating_run()
+    report = component_mod.RunReport(run_id="rid")
+    base = {
+        "scope": ProjectScope.THIS_PROJECT,
+        "write_transformations": True,
+        "transformations": [],
+        "write_components": True,
+        "components": [],
+        "write_flows": True,
+        "flows": [],
+        "write_pipeline_status": False,
+    }
+    config = SimpleNamespace(**{**base, **config_overrides})
+    comp = component_mod.Component.__new__(component_mod.Component)
+    comp._pipeline_pass(
+        config,  # ty: ignore[invalid-argument-type]  (duck-typed test double)
+        om,  # ty: ignore[invalid-argument-type]  (duck-typed test double)
+        run,
+        SnapshotStore(),
+        report,
+        ThreeWayMerger(MergeMode.THREE_WAY_MERGE),
+        env={"url": None},
+    )
+    return om, report
+
+
+def test_pipeline_pass_family_off_excludes_that_kind():
+    # Transformations off -> "t1" never written; the extractor and the flow still are.
+    om, _ = _run_pipeline_pass({"write_transformations": False})
+    written_config_ids = {body["extension"]["kbcConfigId"] for body in om.pipeline_bodies.values()}
+    assert "t1" not in written_config_ids
+    assert {"e1", "f1"} <= written_config_ids
+
+
+def test_pipeline_pass_components_off_excludes_that_kind():
+    om, _ = _run_pipeline_pass({"write_components": False})
+    written_config_ids = {body["extension"]["kbcConfigId"] for body in om.pipeline_bodies.values()}
+    assert "e1" not in written_config_ids
+    assert {"t1", "f1"} <= written_config_ids
+
+
+def test_pipeline_pass_flows_off_excludes_that_kind():
+    om, _ = _run_pipeline_pass({"write_flows": False})
+    written_config_ids = {body["extension"]["kbcConfigId"] for body in om.pipeline_bodies.values()}
+    assert "f1" not in written_config_ids
+    assert {"t1", "e1"} <= written_config_ids
+
+
+def test_pipeline_pass_selector_narrows_to_subset():
+    # A non-empty `transformations` selector is an allowlist within the family.
+    om, _ = _run_pipeline_pass({"transformations": ["t1"]})
+    written_config_ids = {body["extension"]["kbcConfigId"] for body in om.pipeline_bodies.values()}
+    assert "t1" in written_config_ids
+
+    om_excluded, _ = _run_pipeline_pass({"transformations": ["some-other-id"]})
+    written_excluded = {body["extension"]["kbcConfigId"] for body in om_excluded.pipeline_bodies.values()}
+    assert "t1" not in written_excluded
+    assert {"e1", "f1"} <= written_excluded  # the other families are unaffected by the transformations selector
+
+
+def test_pipeline_pass_kbc_type_reflects_component_kind():
+    om, _ = _run_pipeline_pass({})
+    by_config_id = {body["extension"]["kbcConfigId"]: body for body in om.pipeline_bodies.values()}
+    assert by_config_id["t1"]["extension"]["kbcType"] == "transformation"
+    assert by_config_id["e1"]["extension"]["kbcType"] == "extractor"
+    assert by_config_id["f1"]["extension"]["kbcType"] == "orchestration"
+
+
+# --------------------------------------------------- dashboard-pass data_apps selector
+
+
+def test_dashboard_pass_data_apps_selector_narrows_to_subset():
+    svc, proj, pid = "keboola-stack", "Proj", "4214"
+    om = FakeOM()
+    run = _ProjectRun(
+        ctx=ProjectContext(project_id=pid, project_name=proj, storage_token="t", storage_url="https://s"),
+        reader=_DataAppReader("01app", "in.c-main.a"),  # ty: ignore[invalid-argument-type]  (duck-typed double)
+        entities=EntityBuilder(svc, proj, pid, "https://ui"),
+        pipelines=PipelineBuilder(svc, proj, pid, "https://ui"),
+        dashboards=DashboardBuilder(svc, proj, pid, "https://ui", "connection.keboola.com"),
+    )
+    report = component_mod.RunReport(run_id="rid")
+    config = SimpleNamespace(scope=ProjectScope.THIS_PROJECT, data_apps=["some-other-app"])
+
+    comp = component_mod.Component.__new__(component_mod.Component)
+    comp._dashboard_pass(config, om, run, SnapshotStore(), report, ThreeWayMerger(MergeMode.THREE_WAY_MERGE))  # ty: ignore[invalid-argument-type]
+
+    dashboard_rows = [r for r in report.rows() if r["entity_type"] == "Dashboard"]
+    assert dashboard_rows == []  # "01app" excluded by the selector -> never written
+
+
+# --------------------------------------------------- flow -> child-pipeline lineage
+
+
+class _FlowChildReader:
+    """A flow orchestrating one child config (whose own Pipeline was built this
+    run, per `run.pipeline_fqn_by_config`) plus one task referencing a config
+    that never got a pipeline (selector-excluded / non-producing)."""
+
+    def list_component_configs(self):
+        return [
+            {
+                "id": "keboola.orchestrator",
+                "configurations": [
+                    {
+                        "id": "flow1",
+                        "configuration": {
+                            "phases": [],
+                            "tasks": [
+                                {
+                                    "id": "task1",
+                                    "name": "run child",
+                                    "phase": 1,
+                                    "task": {"componentId": "keboola.snowflake-transformation", "configId": "child1"},
+                                },
+                                {
+                                    "id": "task2",
+                                    "name": "run missing child",
+                                    "phase": 1,
+                                    "task": {"componentId": "keboola.ex-db-mysql", "configId": "missing-child"},
+                                },
+                            ],
+                        },
+                    }
+                ],
+            }
+        ]
+
+
+def test_flow_child_lineage_emits_pipeline_to_pipeline_edge_when_gated_on():
+    svc, proj, pid = "keboola-stack", "Acme_Project", "4214"
+    run = _ProjectRun(
+        ctx=ProjectContext(project_id=pid, project_name=proj, storage_token="t", storage_url="https://s"),
+        reader=_FlowChildReader(),  # ty: ignore[invalid-argument-type]  (duck-typed test double)
+        entities=EntityBuilder(svc, proj, pid, "https://ui.example"),
+        pipelines=PipelineBuilder(svc, proj, pid, "https://ui.example"),
+        dashboards=DashboardBuilder(svc, proj, pid, "https://ui.example"),
+    )
+    flow_fqn = "keboola-stack.Acme_Project__flow1"
+    child_fqn = "keboola-stack.Acme_Project__child1"
+    run.pipeline_fqn_by_config["flow1"] = flow_fqn
+    run.pipeline_fqn_by_config["child1"] = child_fqn
+    # "missing-child" deliberately absent -> its task must be skipped, not raise.
+
+    known_ids = {flow_fqn: "id-flow", child_fqn: "id-child"}
+    om = _LineageRecordingOM(known_ids)
+    report = component_mod.RunReport(run_id="rid")
+    config = SimpleNamespace(
+        write_pipeline_lineage=True,
+        write_table_lineage=False,
+        write_column_lineage=False,
+        write_bucket_lineage=False,
+    )
+
+    comp = component_mod.Component.__new__(component_mod.Component)
+    comp._lineage_pass(config, om, run, report)  # ty: ignore[invalid-argument-type]
+
+    assert len(om.put_calls) == 1
+    edge = om.put_calls[0]["edge"]
+    assert edge["fromEntity"] == {"id": "id-flow", "type": "pipeline"}
+    assert edge["toEntity"] == {"id": "id-child", "type": "pipeline"}
+    assert edge["lineageDetails"]["source"] == lineage_builder.SOURCE_PIPELINE
+
+
+def test_flow_child_lineage_absent_when_pipeline_lineage_off():
+    svc, proj, pid = "keboola-stack", "Acme_Project", "4214"
+    run = _ProjectRun(
+        ctx=ProjectContext(project_id=pid, project_name=proj, storage_token="t", storage_url="https://s"),
+        reader=_FlowChildReader(),  # ty: ignore[invalid-argument-type]  (duck-typed test double)
+        entities=EntityBuilder(svc, proj, pid, "https://ui.example"),
+        pipelines=PipelineBuilder(svc, proj, pid, "https://ui.example"),
+        dashboards=DashboardBuilder(svc, proj, pid, "https://ui.example"),
+    )
+    run.pipeline_fqn_by_config["flow1"] = "keboola-stack.Acme_Project__flow1"
+    run.pipeline_fqn_by_config["child1"] = "keboola-stack.Acme_Project__child1"
+
+    om = _LineageRecordingOM({})
+    report = component_mod.RunReport(run_id="rid")
+    config = SimpleNamespace(
+        write_pipeline_lineage=False,
+        write_table_lineage=False,
+        write_column_lineage=False,
+        write_bucket_lineage=False,
+    )
+
+    comp = component_mod.Component.__new__(component_mod.Component)
+    comp._lineage_pass(config, om, run, report)  # ty: ignore[invalid-argument-type]
+
+    assert om.put_calls == []
+
+
+# --------------------------------------------------- bucket-lineage aggregation (integration)
+
+
+def test_lineage_pass_aggregates_bucket_edges_when_gated_on():
+    """Two producing configs (no pipeline built for either -> plain table->table
+    fallback under write_table_lineage) whose endpoints live in different
+    buckets: with write_bucket_lineage on, a databaseSchema->databaseSchema
+    edge is ALSO emitted, deduped across both table pairs sharing the same
+    bucket pair."""
+    svc, proj, pid = "keboola-stack", "Acme_Project", "4214"
+
+    class _TwoConfigReader:
+        def list_component_configs(self):
+            return [
+                {
+                    "id": "keboola.ex-generic",
+                    "configurations": [
+                        {
+                            "id": "cfg1",
+                            "configuration": {
+                                "storage": {
+                                    "input": {"tables": [{"source": "in.c-main.a"}]},
+                                    "output": {"tables": [{"destination": "out.c-res.x"}]},
+                                }
+                            },
+                        }
+                    ],
+                }
+            ]
+
+    run = _ProjectRun(
+        ctx=ProjectContext(project_id=pid, project_name=proj, storage_token="t", storage_url="https://s"),
+        reader=_TwoConfigReader(),  # ty: ignore[invalid-argument-type]  (duck-typed test double)
+        entities=EntityBuilder(svc, proj, pid, "https://ui.example"),
+        pipelines=PipelineBuilder(svc, proj, pid, "https://ui.example"),
+        dashboards=DashboardBuilder(svc, proj, pid, "https://ui.example"),
+    )
+    # No pipeline_fqn_by_config entry for "cfg1" -> declared_edges table->table fallback.
+    in_fqn = _storage_fqn(svc, proj, "in.c-main.a")
+    out_fqn = _storage_fqn(svc, proj, "out.c-res.x")
+    schema_in = fqn_mod.schema_fqn(svc, proj, "in.c-main")
+    schema_out = fqn_mod.schema_fqn(svc, proj, "out.c-res")
+    known_ids = {in_fqn: "id-in-a", out_fqn: "id-out-x", schema_in: "id-schema-in", schema_out: "id-schema-out"}
+    om = _LineageRecordingOM(known_ids)
+    report = component_mod.RunReport(run_id="rid")
+    config = SimpleNamespace(
+        write_table_lineage=True,
+        write_pipeline_lineage=False,
+        write_column_lineage=False,
+        write_bucket_lineage=True,
+    )
+
+    comp = component_mod.Component.__new__(component_mod.Component)
+    comp._lineage_pass(config, om, run, report)  # ty: ignore[invalid-argument-type]
+
+    edges_by_ids = {(r["edge"]["fromEntity"]["id"], r["edge"]["toEntity"]["id"]): r["edge"] for r in om.put_calls}
+    assert ("id-in-a", "id-out-x") in edges_by_ids  # the table->table fallback edge
+    schema_edge = edges_by_ids[("id-schema-in", "id-schema-out")]
+    assert schema_edge["fromEntity"]["type"] == "databaseSchema"
+    assert schema_edge["toEntity"]["type"] == "databaseSchema"
+    assert schema_edge["lineageDetails"]["source"] == lineage_builder.SOURCE_SCHEMA
+
+
+def test_lineage_pass_no_bucket_edge_when_gated_off():
+    svc, proj, pid = "keboola-stack", "Acme_Project", "4214"
+
+    class _OneConfigReader:
+        def list_component_configs(self):
+            return [
+                {
+                    "id": "keboola.ex-generic",
+                    "configurations": [
+                        {
+                            "id": "cfg1",
+                            "configuration": {
+                                "storage": {
+                                    "input": {"tables": [{"source": "in.c-main.a"}]},
+                                    "output": {"tables": [{"destination": "out.c-res.x"}]},
+                                }
+                            },
+                        }
+                    ],
+                }
+            ]
+
+    run = _ProjectRun(
+        ctx=ProjectContext(project_id=pid, project_name=proj, storage_token="t", storage_url="https://s"),
+        reader=_OneConfigReader(),  # ty: ignore[invalid-argument-type]  (duck-typed test double)
+        entities=EntityBuilder(svc, proj, pid, "https://ui.example"),
+        pipelines=PipelineBuilder(svc, proj, pid, "https://ui.example"),
+        dashboards=DashboardBuilder(svc, proj, pid, "https://ui.example"),
+    )
+    in_fqn = _storage_fqn(svc, proj, "in.c-main.a")
+    out_fqn = _storage_fqn(svc, proj, "out.c-res.x")
+    om = _LineageRecordingOM({in_fqn: "id-in-a", out_fqn: "id-out-x"})
+    report = component_mod.RunReport(run_id="rid")
+    config = SimpleNamespace(
+        write_table_lineage=True,
+        write_pipeline_lineage=False,
+        write_column_lineage=False,
+        write_bucket_lineage=False,
+    )
+
+    comp = component_mod.Component.__new__(component_mod.Component)
+    comp._lineage_pass(config, om, run, report)  # ty: ignore[invalid-argument-type]
+
+    assert len(om.put_calls) == 1  # only the table->table edge; no schema->schema edge

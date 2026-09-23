@@ -73,11 +73,16 @@ class Configuration(BaseModel):
     # --- Behaviour (row, Advanced) ---
     merge_mode: MergeMode = MergeMode.THREE_WAY_MERGE
     failure_mode: FailureMode = FailureMode.COLLECT_AND_FAIL
-    write_lineage: bool = True
+    # Per-object lineage toggles (spec: generalize the old single write_lineage /
+    # write_column_lineage pair to one bool per lineage aspect). write_table_lineage
+    # is the old write_lineage's table-level half; write_pipeline_lineage is the
+    # pipeline-as-node half (see mapping.lineage_builder / component._lineage_pass).
+    write_bucket_lineage: bool = True
+    write_table_lineage: bool = True
     write_column_lineage: bool = True
-    write_pipelines: bool = True
+    write_pipeline_lineage: bool = True
+    write_dashboard_lineage: bool = True
     write_pipeline_status: bool = True
-    write_data_apps: bool = True
     full_refresh: bool = False
 
     # --- SSH (root) ---
@@ -87,9 +92,20 @@ class Configuration(BaseModel):
     # --- Row-level ---
     storage_token: str | None = Field(default=None, alias="#storage_token")
     project_name_override: str | None = None
+
+    # --- Object families (spec: split the pipeline family into Transformations vs
+    # Components; each family is an enable bool + a selector list, mirroring
+    # ``buckets`` -- an empty selector means "all", scoped to THIS_PROJECT only). ---
+    write_buckets: bool = True
     buckets: list[str] = Field(default_factory=list)
-    configurations: list[str] = Field(default_factory=list)
+    write_transformations: bool = True
+    transformations: list[str] = Field(default_factory=list)
+    write_components: bool = True
+    components: list[str] = Field(default_factory=list)
+    write_flows: bool = True
     flows: list[str] = Field(default_factory=list)
+    write_data_apps: bool = True
+    data_apps: list[str] = Field(default_factory=list)
     projects: list[str] = Field(default_factory=list)
 
     def __init__(self, **data: object) -> None:
@@ -98,6 +114,34 @@ class Configuration(BaseModel):
         except ValidationError as e:
             messages = [f"{'.'.join(str(p) for p in err['loc'])}: {err['msg']}" for err in e.errors()]
             raise UserException(f"Configuration validation error: {'; '.join(messages)}") from e
+
+    @model_validator(mode="before")
+    @classmethod
+    def _flatten_ui_groups(cls, data: object) -> object:
+        """Lift the row schema's nested UI groups to the flat model shape.
+
+        ``configRowSchema.json`` nests the object-family fields under ``objects``
+        and the behaviour fields under ``advanced`` (with the five lineage bools
+        one level deeper under ``advanced.lineage``), so the Keboola UI saves
+        ``parameters`` with those nested containers. This model is flat, so the
+        nested keys are lifted to the top level before field validation. Nested
+        values win over any same-named top-level key (the nested group is the
+        schema's authoritative home); a flat-only config (older configs, the
+        functional fixtures) is passed through untouched.
+        """
+        if not isinstance(data, dict):
+            return data
+        flat = dict(data)
+        objects = flat.pop("objects", None)
+        if isinstance(objects, dict):
+            flat.update(objects)
+        advanced = flat.pop("advanced", None)
+        if isinstance(advanced, dict):
+            lineage = advanced.get("lineage")
+            flat.update({k: v for k, v in advanced.items() if k != "lineage"})
+            if isinstance(lineage, dict):
+                flat.update(lineage)
+        return flat
 
     @model_validator(mode="after")
     def _check_cross_fields(self) -> Configuration:

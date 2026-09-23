@@ -181,7 +181,7 @@ def test_table_constraints_ignore_server_enrichment():
 
 def test_manual_lineage_source_never_dropped():
     assert "Manual" not in OUR_LINEAGE_SOURCES
-    assert set(OUR_LINEAGE_SOURCES) == {"PipelineLineage", "QueryLineage", "ViewLineage"}
+    assert set(OUR_LINEAGE_SOURCES) == {"PipelineLineage", "QueryLineage", "ViewLineage", "SchemaLineage"}
 
 
 def test_snapshot_store_roundtrip():

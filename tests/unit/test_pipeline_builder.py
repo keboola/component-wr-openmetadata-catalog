@@ -1,4 +1,4 @@
-from mapping.pipeline_builder import CUSTOM_PROPERTIES, PipelineBuilder
+from mapping.pipeline_builder import CUSTOM_PROPERTIES, PipelineBuilder, component_kind
 
 UI = "https://connection.keboola.com"
 STACK = "connection.us-east4.gcp.keboola.com"
@@ -133,10 +133,86 @@ def test_writer_rows_dict_query_shape():
 
 def test_custom_properties_names_and_types():
     names = {n for n, *_ in CUSTOM_PROPERTIES}
-    assert names == {"kbcComponentId", "kbcConfigId", "kbcConfigUrl", "kbcLastChange", "kbcOwner", "kbcSyncedAt"}
+    assert names == {
+        "kbcComponentId",
+        "kbcConfigId",
+        "kbcConfigUrl",
+        "kbcLastChange",
+        "kbcOwner",
+        "kbcSyncedAt",
+        "kbcType",
+    }
     types = {n: t for n, t, *_ in CUSTOM_PROPERTIES}
     assert types["kbcConfigUrl"] == "hyperlink-cp"
     assert types["kbcOwner"] == "email"
+    assert types["kbcType"] == "string"
+
+
+# --------------------------------------------------------------------- component_kind categorization
+
+
+def test_component_kind_flow_takes_priority():
+    assert component_kind("keboola.orchestrator", None) == "orchestration"
+    assert component_kind("keboola.flow", "application") == "orchestration"
+
+
+def test_component_kind_data_app():
+    assert component_kind("keboola.data-apps", None) == "data_app"
+
+
+def test_component_kind_transformation_from_type_field():
+    assert component_kind("keboola.some-future-transform", "transformation") == "transformation"
+
+
+def test_component_kind_transformation_from_id_set_fallback():
+    # No `type` supplied -> falls back to the SQL/PYTHON id sets already used to
+    # pick a Pipeline task's taskType.
+    assert component_kind("keboola.snowflake-transformation", None) == "transformation"
+    assert component_kind("keboola.python-transformation-v2", None) == "transformation"
+
+
+def test_component_kind_extractor_writer_application_from_type_field():
+    assert component_kind("keboola.some-extractor", "extractor") == "extractor"
+    assert component_kind("keboola.some-writer", "writer") == "writer"
+    assert component_kind("keboola.some-app", "application") == "application"
+
+
+def test_component_kind_extractor_from_id_pattern_when_type_missing():
+    # Verified: list_component_configs() DOES return `type`, but the id-pattern
+    # fallback must still hold when `type` is absent/unrecognised.
+    assert component_kind("keboola.ex-db-mysql", None) == "extractor"
+
+
+def test_component_kind_writer_from_id_pattern_when_type_missing():
+    assert component_kind("keboola.wr-db-snowflake", None) == "writer"
+
+
+def test_component_kind_other_when_nothing_matches():
+    assert component_kind("keboola.processor-unzip", None) == "other"
+    assert component_kind("keboola.processor-unzip", "processor") == "other"
+
+
+# --------------------------------------------------------------------- kbcType extension wiring
+
+
+def test_config_pipeline_extension_carries_kbc_type():
+    config = {"id": "999", "configuration": {"parameters": {}}}
+    built = _builder().build_pipeline("keboola.snowflake-transformation", config, kind="transformation")
+    assert built.body["extension"]["kbcType"] == "transformation"
+
+
+def test_flow_pipeline_extension_carries_kbc_type():
+    config = {"id": "flow-1", "configuration": {"phases": [], "tasks": []}}
+    built = _builder().build_pipeline("keboola.orchestrator", config, kind="orchestration")
+    assert built.body["extension"]["kbcType"] == "orchestration"
+
+
+def test_pipeline_extension_omits_kbc_type_when_kind_not_given():
+    # Backward-compatible default: every pre-existing call site that predates the
+    # object-family split keeps working, simply without a kbcType value.
+    config = {"id": "999", "configuration": {"parameters": {}}}
+    built = _builder().build_pipeline("keboola.snowflake-transformation", config)
+    assert "kbcType" not in built.body["extension"]
 
 
 # --------------------------------------------------------------------- config-pipeline extension/owner

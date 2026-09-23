@@ -21,6 +21,7 @@ SOURCE_PIPELINE = "PipelineLineage"
 SOURCE_QUERY = "QueryLineage"
 SOURCE_VIEW = "ViewLineage"
 SOURCE_DASHBOARD = "DashboardLineage"
+SOURCE_SCHEMA = "SchemaLineage"
 
 
 def _is_self_loop(from_fqn: str, to_fqn: str, source: str) -> bool:
@@ -121,9 +122,9 @@ def pipeline_edges(
     output (``pipeline -> output_table``) — N+M edges, never a cartesian
     product. This is what makes a pipeline's Lineage tab show the tables it
     reads/writes; undeclared inputs recovered by parsing SQL are Phase B, out
-    of scope here. Returns ``[]`` when there is no pipeline (``write_pipelines``
-    off, or the config isn't a pipeline) — callers fall back to
-    :func:`declared_edges` in that case.
+    of scope here. Returns ``[]`` when there is no pipeline (its object family
+    is disabled/selected out, or the config isn't a pipeline) — callers fall
+    back to :func:`declared_edges` in that case.
     """
     if not pipeline_fqn:
         return []
@@ -195,6 +196,52 @@ def data_app_edges(
             )
         )
     return edges
+
+
+def _schema_fqn_of(table_fqn_value: str) -> str:
+    """The DatabaseSchema FQN containing a Table FQN.
+
+    Every FQN segment here is built from FQN-safe, dot-free names
+    (``mapping.fqn.sanitize_name`` never introduces a dot), so a Table FQN's
+    trailing dotted segment is always exactly the table's own name — stripping
+    it yields the owning DatabaseSchema FQN without re-deriving it from the raw
+    bucket path.
+    """
+    return table_fqn_value.rsplit(".", 1)[0]
+
+
+def bucket_edges(edges: list[LineageEdge]) -> list[LineageEdge]:
+    """Bucket lineage: aggregate table->table edges into deduped schema->schema edges.
+
+    For every already-emitted TABLE -> TABLE edge whose endpoints live in
+    different DatabaseSchemas (buckets), emit one ``databaseSchema ->
+    databaseSchema`` edge too, so a bucket's Lineage tab shows which other
+    buckets feed it at a glance, without opening every table. Non
+    table-to-table edges (pipeline-node, dashboard) carry no bucket-to-bucket
+    signal and are ignored. Pairs are deduped and returned sorted, so the
+    aggregation is a stable function of the input edge set — never of
+    Python's per-process hash order (mirrors the ``column_edges`` sorted-dedup
+    discipline).
+    """
+    pairs: set[tuple[str, str]] = set()
+    for edge in edges:
+        if edge.from_type != "table" or edge.to_type != "table":
+            continue
+        from_schema = _schema_fqn_of(edge.from_fqn)
+        to_schema = _schema_fqn_of(edge.to_fqn)
+        if from_schema == to_schema:
+            continue  # same-bucket table->table edge carries no cross-schema signal
+        pairs.add((from_schema, to_schema))
+    return [
+        LineageEdge(
+            from_fqn=from_schema,
+            to_fqn=to_schema,
+            source=SOURCE_SCHEMA,
+            from_type="databaseSchema",
+            to_type="databaseSchema",
+        )
+        for from_schema, to_schema in sorted(pairs)
+    ]
 
 
 def _column_ref_valid(

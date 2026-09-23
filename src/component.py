@@ -46,7 +46,7 @@ from mapping.entity_builder import (
     EntityBuilder,
 )
 from mapping.pipeline_builder import CUSTOM_PROPERTIES as PIPELINE_CUSTOM_PROPERTIES
-from mapping.pipeline_builder import PipelineBuilder, is_flow_component
+from mapping.pipeline_builder import PipelineBuilder, component_kind, is_flow_component
 from merge import (
     OUR_DASHBOARD_LINEAGE_SOURCES,
     OUR_LINEAGE_SOURCES,
@@ -443,11 +443,20 @@ class Component(ComponentBase):
         merger = ThreeWayMerger(config.merge_mode)
 
         self._catalog_pass(config, om, run, state, snapshot, report, merger, version_changed, synced_at)
-        if config.write_pipelines:
-            self._pipeline_pass(config, om, run, snapshot, report, merger, env, synced_at)
+        # Always entered: each object family (flows/transformations/components) is
+        # gated and selector-filtered internally (spec: split the pipeline family
+        # into Transformations vs Components) — mirrors _catalog_pass always
+        # upserting DatabaseService/Database regardless of write_buckets.
+        self._pipeline_pass(config, om, run, snapshot, report, merger, env, synced_at)
         if config.write_data_apps:
-            self._dashboard_pass(om, run, snapshot, report, merger, synced_at)
-        if config.write_lineage or config.write_column_lineage:
+            self._dashboard_pass(config, om, run, snapshot, report, merger, synced_at)
+        if (
+            config.write_table_lineage
+            or config.write_column_lineage
+            or config.write_pipeline_lineage
+            or config.write_dashboard_lineage
+            or config.write_bucket_lineage
+        ):
             self._lineage_pass(config, om, run, report)
         self._tombstone_pass(om, run, report)
 
@@ -515,6 +524,9 @@ class Component(ComponentBase):
             report,
             merger,
         )
+
+        if not config.write_buckets:
+            return  # DatabaseService + Database above are always upserted; buckets/tables/columns are not.
 
         full_refresh_due = state.full_refresh_due()
         for bucket in run.reader.list_buckets():
@@ -595,6 +607,13 @@ class Component(ComponentBase):
             return False
         return not (config.buckets and bucket.id not in config.buckets)
 
+    @staticmethod
+    def _data_app_in_scope(config: Configuration, cfg_id: str) -> bool:
+        """``data_apps`` selector filter (empty = all), scope-guarded like the others."""
+        if config.scope != ProjectScope.THIS_PROJECT:
+            return True
+        return not (config.data_apps and cfg_id not in config.data_apps)
+
     def _pipeline_pass(
         self,
         config: Configuration,
@@ -625,26 +644,22 @@ class Component(ComponentBase):
 
         for component in run.reader.list_component_configs():
             component_id = str(component.get("id") or component.get("componentId") or "")
-            if run.dashboards.is_data_app(component_id):
+            kind = component_kind(component_id, component.get("type"))
+            if kind == "data_app":
                 continue  # data apps are catalogued as Dashboards, not Pipelines
-            is_flow = run.pipelines.is_flow(component_id)
             for cfg in component.get("configurations") or []:
-                if not (is_flow or self._is_producing(cfg)):
+                if kind != "orchestration" and not self._is_producing(cfg):
                     continue
                 cfg_id = str(cfg.get("id"))
-                # Selection narrows *within* the eligibility gate above: an empty
-                # selector means "all", a non-empty one is an explicit allowlist.
-                # It only applies to a single known project — an org-wide row's
-                # selector ids can't map across projects, so all_projects writes
-                # every eligible config/flow (the selectors are hidden in that scope).
-                if config.scope == ProjectScope.THIS_PROJECT:
-                    if is_flow:
-                        if config.flows and cfg_id not in config.flows:
-                            continue
-                    elif config.configurations and cfg_id not in config.configurations:
-                        continue
+                if not self._pipeline_config_in_scope(config, kind, cfg_id):
+                    continue
                 built = run.pipelines.build_pipeline(
-                    component_id, cfg, available_properties=available, synced_at=synced_at, owner_resolver=resolve_owner
+                    component_id,
+                    cfg,
+                    kind=kind,
+                    available_properties=available,
+                    synced_at=synced_at,
+                    owner_resolver=resolve_owner,
                 )
                 run.pipeline_fqn_by_config[cfg_id] = built.fqn
                 self._upsert(
@@ -661,6 +676,29 @@ class Component(ComponentBase):
                 )
                 if config.write_pipeline_status:
                     self._push_pipeline_status(run, built.fqn, cfg, env, om, report)
+
+    @staticmethod
+    def _pipeline_config_in_scope(config: Configuration, kind: str, cfg_id: str) -> bool:
+        """Family enable-gate + selector filter for one pipeline-eligible config.
+
+        Mirrors ``_bucket_in_scope``: the family checkbox gates the whole kind
+        (flow/transformation/component), the matching selector narrows it
+        further (empty = all), and — as before the object-family split — a
+        selector only applies within a single known project: an ``all_projects``
+        row writes every eligible config/flow the family enables, since the
+        selector ids can't map across projects.
+        """
+        if kind == "orchestration":
+            enabled, selector = config.write_flows, config.flows
+        elif kind == "transformation":
+            enabled, selector = config.write_transformations, config.transformations
+        else:  # extractor / writer / application / other
+            enabled, selector = config.write_components, config.components
+        if not enabled:
+            return False
+        if config.scope != ProjectScope.THIS_PROJECT:
+            return True
+        return not (selector and cfg_id not in selector)
 
     @staticmethod
     def _is_producing(cfg: dict) -> bool:
@@ -697,6 +735,7 @@ class Component(ComponentBase):
 
     def _dashboard_pass(
         self,
+        config: Configuration,
         om: OMClient,
         run: _ProjectRun,
         snapshot: SnapshotStore,
@@ -734,6 +773,9 @@ class Component(ComponentBase):
             if not run.dashboards.is_data_app(component_id):
                 continue
             for cfg in component.get("configurations") or []:
+                cfg_id = str(cfg.get("id"))
+                if not self._data_app_in_scope(config, cfg_id):
+                    continue
                 built = run.dashboards.build_dashboard(
                     cfg, available, app_states, synced_at, owner_resolver=lambda e: self._resolve_owner(om, run, e)
                 )
@@ -755,15 +797,22 @@ class Component(ComponentBase):
         edges: list[lineage_builder.LineageEdge] = []
         for component in run.reader.list_component_configs():
             component_id = str(component.get("id") or component.get("componentId") or "")
+            kind = component_kind(component_id, component.get("type"))
             for cfg in component.get("configurations") or []:
                 # rows[]-declared storage (some extractors/transforms map storage
                 # per config row, not at the top level) is not read here — Phase A
                 # scope is the top-level configuration.storage only; a follow-up.
                 storage = (cfg.get("configuration") or {}).get("storage") or {}
-                if run.dashboards.is_data_app(component_id):
+                if kind == "data_app":
                     edges += self._data_app_edges_for(config, run, cfg, storage)
                     continue  # a data app is a Dashboard: upstream table -> app, no table -> table
                 pipeline_fqn = run.pipeline_fqn_by_config.get(str(cfg.get("id")))
+                if kind == "orchestration":
+                    # A flow has no storage mapping of its own; its only lineage is
+                    # flow_pipeline -> each child config's pipeline (below).
+                    if config.write_pipeline_lineage and pipeline_fqn:
+                        edges += self._flow_child_edges_for(run, cfg, pipeline_fqn)
+                    continue
                 # Phase B: the column-lineage engine also recovers input/output
                 # tables a transform reads/writes via a DIRECT fully-qualified SQL
                 # ref instead of a declared mapping. Parsed once here whenever ANY
@@ -773,32 +822,74 @@ class Component(ComponentBase):
                 # wiring, so the SQL is never parsed twice.
                 column_result = (
                     self._column_lineage_for(run, component_id, cfg, storage)
-                    if (config.write_lineage or config.write_column_lineage)
+                    if (config.write_table_lineage or config.write_pipeline_lineage or config.write_column_lineage)
                     else None
                 )
-                if config.write_lineage:
-                    if pipeline_fqn:
-                        # Normal path (write_pipelines on): the pipeline is a first-class
-                        # lineage node, wired from the DECLARED input/output mapping.
-                        edges += lineage_builder.pipeline_edges(
-                            storage,
-                            service_name=run.entities.service_name,
-                            project=run.entities.project,
-                            pipeline_fqn=pipeline_fqn,
-                        )
-                        edges += self._inferred_input_pipeline_edges(run, storage, pipeline_fqn, column_result)
-                    else:
-                        # No pipeline node (write_pipelines off, or not a pipeline config)
-                        # -> fall back to the coarse table->table cartesian edges so
-                        # lineage still exists without a pipeline to hang it on.
-                        edges += lineage_builder.declared_edges(
-                            storage,
-                            service_name=run.entities.service_name,
-                            project=run.entities.project,
-                        )
+                if pipeline_fqn and config.write_pipeline_lineage:
+                    # The pipeline is a first-class lineage node, wired from the
+                    # DECLARED input/output mapping (plus the Phase B SQL-inferred
+                    # input, when nothing was declared).
+                    edges += lineage_builder.pipeline_edges(
+                        storage,
+                        service_name=run.entities.service_name,
+                        project=run.entities.project,
+                        pipeline_fqn=pipeline_fqn,
+                    )
+                    edges += self._inferred_input_pipeline_edges(run, storage, pipeline_fqn, column_result)
+                elif config.write_table_lineage:
+                    # No pipeline node (no pipeline built this run, or pipeline
+                    # lineage off) -> fall back to the coarse table->table cartesian
+                    # edges so lineage still exists without a pipeline to hang it on.
+                    edges += lineage_builder.declared_edges(
+                        storage,
+                        service_name=run.entities.service_name,
+                        project=run.entities.project,
+                    )
                 if config.write_column_lineage:
                     edges += self._column_edges_for(run, cfg, pipeline_fqn, column_result, report)
+        if config.write_bucket_lineage:
+            edges += lineage_builder.bucket_edges(edges)
         self._refresh_lineage(om, run, report, edges)
+
+    @staticmethod
+    def _flow_child_edges_for(run: _ProjectRun, cfg: dict, flow_pipeline_fqn: str) -> list[lineage_builder.LineageEdge]:
+        """``flow_pipeline -> child_config_pipeline`` edges for every task a flow orchestrates.
+
+        Each task in ``configuration.tasks`` names the child component/config it
+        runs (``task.componentId``/``task.configId``); resolved onto the pipeline
+        FQN ``_pipeline_pass`` built for that child config THIS run
+        (``run.pipeline_fqn_by_config`` — populated for every kind, including
+        nested flows, before ``_lineage_pass`` runs). Best-effort: a child whose
+        own pipeline was not built this run (its family disabled/selected out, a
+        non-producing config, or a since-deleted task target) is silently
+        skipped, never a hard failure. A duplicate task referencing the same
+        child config collapses to one edge.
+        """
+        edges: list[lineage_builder.LineageEdge] = []
+        tasks = (cfg.get("configuration") or {}).get("tasks") or []
+        seen_children: set[str] = set()
+        for task_wrapper in tasks:
+            child = (task_wrapper or {}).get("task") or {}
+            child_config_id = child.get("configId")
+            if not child_config_id:
+                continue
+            child_config_id = str(child_config_id)
+            if child_config_id in seen_children:
+                continue
+            seen_children.add(child_config_id)
+            child_fqn = run.pipeline_fqn_by_config.get(child_config_id)
+            if not child_fqn:
+                continue
+            edges.append(
+                lineage_builder.LineageEdge(
+                    from_fqn=flow_pipeline_fqn,
+                    to_fqn=child_fqn,
+                    source=lineage_builder.SOURCE_PIPELINE,
+                    from_type="pipeline",
+                    to_type="pipeline",
+                )
+            )
+        return edges
 
     def _column_lineage_for(
         self, run: _ProjectRun, component_id: str, cfg: dict, storage: dict
@@ -860,10 +951,10 @@ class Component(ComponentBase):
         """Upstream table -> data-app (Dashboard) edges for one data-app config.
 
         Gated on both ``write_data_apps`` (the Dashboard must exist — the dashboard
-        pass wrote it and recorded its FQN) and ``write_lineage``. Returns nothing if
-        the config produced no Dashboard this run.
+        pass wrote it and recorded its FQN) and ``write_dashboard_lineage``. Returns
+        nothing if the config produced no Dashboard this run.
         """
-        if not (config.write_data_apps and config.write_lineage):
+        if not (config.write_data_apps and config.write_dashboard_lineage):
             return []
         dashboard_fqn = run.dashboard_fqn_by_config.get(str(cfg.get("id")))
         if not dashboard_fqn:
@@ -963,7 +1054,11 @@ class Component(ComponentBase):
                 detail=str(exc),
             )
 
-    _KIND_BY_LINEAGE_TYPE: ClassVar[dict[str, str]] = {"pipeline": "pipelines", "dashboard": "dashboards"}
+    _KIND_BY_LINEAGE_TYPE: ClassVar[dict[str, str]] = {
+        "pipeline": "pipelines",
+        "dashboard": "dashboards",
+        "databaseSchema": "databaseSchemas",
+    }
     # Reverse of _KIND_BY_LINEAGE_TYPE keyed by the report entity type, for caching a
     # just-created entity id under the same key _resolve_id looks it up by.
     _LINEAGE_TYPE_BY_ENTITY: ClassVar[dict[str, str]] = {"Pipeline": "pipeline", "Dashboard": "dashboard"}
@@ -1228,8 +1323,8 @@ class Component(ComponentBase):
         reader = StorageReader(url, token, production_only=True)
         return [SelectElement(value=b.id, label=f"{b.id} ({b.display_name or b.name})") for b in reader.list_buckets()]
 
-    @sync_action("listConfigurations")
-    def list_configurations(self) -> list[SelectElement]:
+    @sync_action("listTransformations")
+    def list_transformations(self) -> list[SelectElement]:
         config = Configuration(**self.configuration.parameters)
         env = self._read_environment()
         token, url = resolve_storage_credentials(
@@ -1239,13 +1334,52 @@ class Component(ComponentBase):
         elements: list[SelectElement] = []
         for component in reader.list_component_configs():
             component_id = str(component.get("id") or component.get("componentId") or "")
-            if is_flow_component(component_id):
+            if component_kind(component_id, component.get("type")) != "transformation":
                 continue
             for cfg in component.get("configurations") or []:
                 if not self._is_producing(cfg):
                     continue
                 name = cfg.get("name") or str(cfg.get("id"))
                 elements.append(SelectElement(value=str(cfg.get("id")), label=f"{component_id} / {name}"))
+        return elements
+
+    @sync_action("listComponents")
+    def list_components(self) -> list[SelectElement]:
+        config = Configuration(**self.configuration.parameters)
+        env = self._read_environment()
+        token, url = resolve_storage_credentials(
+            row_token=config.storage_token, injected_token=env["token"], injected_url=env["url"]
+        )
+        reader = StorageReader(url, token, production_only=True)
+        elements: list[SelectElement] = []
+        for component in reader.list_component_configs():
+            component_id = str(component.get("id") or component.get("componentId") or "")
+            kind = component_kind(component_id, component.get("type"))
+            if kind in ("transformation", "orchestration", "data_app"):
+                continue
+            for cfg in component.get("configurations") or []:
+                if not self._is_producing(cfg):
+                    continue
+                name = cfg.get("name") or str(cfg.get("id"))
+                elements.append(SelectElement(value=str(cfg.get("id")), label=f"{component_id} / {name}"))
+        return elements
+
+    @sync_action("listDataApps")
+    def list_data_apps(self) -> list[SelectElement]:
+        config = Configuration(**self.configuration.parameters)
+        env = self._read_environment()
+        token, url = resolve_storage_credentials(
+            row_token=config.storage_token, injected_token=env["token"], injected_url=env["url"]
+        )
+        reader = StorageReader(url, token, production_only=True)
+        elements: list[SelectElement] = []
+        for component in reader.list_component_configs():
+            component_id = str(component.get("id") or component.get("componentId") or "")
+            if not DashboardBuilder.is_data_app(component_id):
+                continue
+            for cfg in component.get("configurations") or []:
+                name = cfg.get("name") or str(cfg.get("id"))
+                elements.append(SelectElement(value=str(cfg.get("id")), label=name))
         return elements
 
     @sync_action("listFlows")

@@ -13,7 +13,10 @@ from mapping.lineage_builder import (
     SOURCE_DASHBOARD,
     SOURCE_PIPELINE,
     SOURCE_QUERY,
+    SOURCE_SCHEMA,
     SOURCE_VIEW,
+    LineageEdge,
+    bucket_edges,
     column_edges,
     data_app_edges,
     declared_edges,
@@ -501,6 +504,68 @@ def test_column_edges_order_is_hash_seed_independent():
     out_seed_3 = _emit_across_hash_seed(42)
     assert out_seed_1  # non-empty guard
     assert out_seed_1 == out_seed_2 == out_seed_3
+
+
+# --------------------------------------------------------------------------
+# Bucket lineage (E-bucket): aggregate table->table edges to schema->schema.
+# --------------------------------------------------------------------------
+
+
+def test_bucket_edges_aggregates_cross_schema_table_edges():
+    edges = [
+        LineageEdge(from_fqn="svc.P.in_c-main.a", to_fqn="svc.P.out_c-res.x", source=SOURCE_PIPELINE),
+        # A second table pair in the SAME two schemas -> still ONE schema edge.
+        LineageEdge(from_fqn="svc.P.in_c-main.b", to_fqn="svc.P.out_c-res.y", source=SOURCE_QUERY),
+    ]
+    result = bucket_edges(edges)
+    assert len(result) == 1
+    edge = result[0]
+    assert edge.from_fqn == "svc.P.in_c-main"
+    assert edge.to_fqn == "svc.P.out_c-res"
+    assert edge.from_type == "databaseSchema"
+    assert edge.to_type == "databaseSchema"
+    assert edge.source == SOURCE_SCHEMA
+
+
+def test_bucket_edges_skips_same_schema_pairs():
+    # Both endpoints live in the same bucket (schema) -> no cross-schema signal.
+    edges = [LineageEdge(from_fqn="svc.P.c-main.a", to_fqn="svc.P.c-main.b", source=SOURCE_PIPELINE)]
+    assert bucket_edges(edges) == []
+
+
+def test_bucket_edges_ignores_non_table_to_table_edges():
+    # Pipeline-node edges (table->pipeline, pipeline->table) and dashboard edges
+    # (table->dashboard) carry no bucket-to-bucket signal.
+    edges = [
+        LineageEdge(
+            from_fqn="svc.P.in_c-main.a",
+            to_fqn="svc.P.pipeline.cfg1",
+            source=SOURCE_PIPELINE,
+            from_type="table",
+            to_type="pipeline",
+        ),
+        LineageEdge(
+            from_fqn="svc.P.in_c-main.a",
+            to_fqn="svc.P.dash.app1",
+            source=SOURCE_DASHBOARD,
+            from_type="table",
+            to_type="dashboard",
+        ),
+    ]
+    assert bucket_edges(edges) == []
+
+
+def test_bucket_edges_dedup_and_sorted_deterministic_order():
+    edges = [
+        LineageEdge(from_fqn="svc.P.c-z.t1", to_fqn="svc.P.c-a.t2", source=SOURCE_PIPELINE),
+        LineageEdge(from_fqn="svc.P.c-b.t1", to_fqn="svc.P.c-a.t2", source=SOURCE_PIPELINE),
+        # Duplicate pair (same schemas, different tables) -> deduped to one edge.
+        LineageEdge(from_fqn="svc.P.c-b.t3", to_fqn="svc.P.c-a.t4", source=SOURCE_QUERY),
+    ]
+    result = bucket_edges(edges)
+    pairs = [(e.from_fqn, e.to_fqn) for e in result]
+    assert pairs == sorted(pairs)
+    assert pairs == [("svc.P.c-b", "svc.P.c-a"), ("svc.P.c-z", "svc.P.c-a")]
 
 
 def test_to_add_lineage_request_drops_id_level_self_loop(caplog):
