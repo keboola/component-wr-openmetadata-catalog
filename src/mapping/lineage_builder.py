@@ -21,7 +21,11 @@ SOURCE_PIPELINE = "PipelineLineage"
 SOURCE_QUERY = "QueryLineage"
 SOURCE_VIEW = "ViewLineage"
 SOURCE_DASHBOARD = "DashboardLineage"
-SOURCE_SCHEMA = "SchemaLineage"
+# Every source must be a member of OM's closed ``lineageDetails.source`` enum — an
+# unknown value fails deserialization (400 "Invalid request format"). ChildAssets is
+# OM's own marker for higher-level lineage aggregated from child-asset edges, which
+# is exactly what a bucket (DatabaseSchema) edge is.
+SOURCE_SCHEMA = "ChildAssets"
 
 
 def _is_self_loop(from_fqn: str, to_fqn: str, source: str) -> bool:

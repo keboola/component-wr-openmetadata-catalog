@@ -4,7 +4,9 @@ from merge import (
     ACTION_SKIPPED_DIVERGED,
     ACTION_SKIPPED_UNCHANGED,
     ACTION_UPDATED,
+    OUR_DASHBOARD_LINEAGE_SOURCES,
     OUR_LINEAGE_SOURCES,
+    OUR_SCHEMA_LINEAGE_SOURCES,
     OWNED_DATABASE_FIELDS,
     OWNED_PIPELINE_FIELDS,
     OWNED_SCHEMA_FIELDS,
@@ -180,8 +182,10 @@ def test_table_constraints_ignore_server_enrichment():
 
 
 def test_manual_lineage_source_never_dropped():
-    assert "Manual" not in OUR_LINEAGE_SOURCES
-    assert set(OUR_LINEAGE_SOURCES) == {"PipelineLineage", "QueryLineage", "ViewLineage", "SchemaLineage"}
+    for sources in (OUR_LINEAGE_SOURCES, OUR_DASHBOARD_LINEAGE_SOURCES, OUR_SCHEMA_LINEAGE_SOURCES):
+        assert "Manual" not in sources
+    assert set(OUR_LINEAGE_SOURCES) == {"PipelineLineage", "QueryLineage", "ViewLineage"}
+    assert set(OUR_SCHEMA_LINEAGE_SOURCES) == {"ChildAssets"}
 
 
 def test_snapshot_store_roundtrip():

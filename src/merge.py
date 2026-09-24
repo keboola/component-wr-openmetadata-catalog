@@ -45,10 +45,14 @@ OWNED_SCHEMA_FIELDS = ("displayName", "description", "sourceUrl", "extension", "
 OWNED_DATABASE_FIELDS = ("displayName", "sourceUrl", "extension")
 
 # Lineage edge sources this component owns; a Manual edge is never in this set.
-OUR_LINEAGE_SOURCES = ("PipelineLineage", "QueryLineage", "ViewLineage", "SchemaLineage")
+OUR_LINEAGE_SOURCES = ("PipelineLineage", "QueryLineage", "ViewLineage")
 # The same discipline for dashboard (data-app) targets: only DashboardLineage edges
 # we authored are ever dropped before re-adding the current ones.
 OUR_DASHBOARD_LINEAGE_SOURCES = ("DashboardLineage",)
+# Bucket (DatabaseSchema) targets hold only our aggregated ChildAssets edges. Scoped
+# to schema targets so cleanup never touches the ChildAssets edges OM derives itself
+# (service / domain / data-product lineage).
+OUR_SCHEMA_LINEAGE_SOURCES = ("ChildAssets",)
 
 ACTION_CREATED = "created"
 ACTION_UPDATED = "updated"

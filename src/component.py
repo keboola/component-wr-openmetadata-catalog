@@ -50,6 +50,7 @@ from mapping.pipeline_builder import PipelineBuilder, component_kind, is_flow_co
 from merge import (
     OUR_DASHBOARD_LINEAGE_SOURCES,
     OUR_LINEAGE_SOURCES,
+    OUR_SCHEMA_LINEAGE_SOURCES,
     OWNED_DASHBOARD_FIELDS,
     OWNED_DATABASE_FIELDS,
     OWNED_PIPELINE_FIELDS,
@@ -1043,11 +1044,13 @@ class Component(ComponentBase):
         # drop our stale edges (never Manual) on affected targets, then add current.
         # Keyed on each edge's TARGET type: an input->pipeline edge's target is the
         # pipeline itself (cleanup must hit /lineage/.../pipeline/..., not a hardcoded
-        # "table"), and dashboard (data-app) targets carry DashboardLineage — clean
-        # each target with the lineage sources it can actually hold.
+        # "table"), dashboard (data-app) targets carry DashboardLineage and bucket
+        # (databaseSchema) targets carry ChildAssets — clean each target with the
+        # lineage sources it can actually hold.
+        sources_by_type = {"dashboard": OUR_DASHBOARD_LINEAGE_SOURCES, "databaseSchema": OUR_SCHEMA_LINEAGE_SOURCES}
         targets = {(e.to_type, e.to_fqn) for e in edges}
         for to_type, target_fqn in targets:
-            sources = OUR_DASHBOARD_LINEAGE_SOURCES if to_type == "dashboard" else OUR_LINEAGE_SOURCES
+            sources = sources_by_type.get(to_type, OUR_LINEAGE_SOURCES)
             for source in sources:
                 try:
                     om.delete_lineage_by_source(to_type, target_fqn, source)

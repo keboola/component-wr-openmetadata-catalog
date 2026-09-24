@@ -24,6 +24,7 @@ from mapping.lineage_builder import (
     to_add_lineage_request,
     view_edge,
 )
+from merge import OUR_DASHBOARD_LINEAGE_SOURCES, OUR_LINEAGE_SOURCES, OUR_SCHEMA_LINEAGE_SOURCES
 
 SVC = "keboola-stack"
 PROJ = "Acme_Project"
@@ -504,6 +505,35 @@ def test_column_edges_order_is_hash_seed_independent():
     out_seed_3 = _emit_across_hash_seed(42)
     assert out_seed_1  # non-empty guard
     assert out_seed_1 == out_seed_2 == out_seed_3
+
+
+# OM 1.13.4 ``type/entityLineage.json`` ``lineageDetails.source`` enum (unchanged
+# on main). It is closed: an unknown value fails request deserialization with a 400
+# "Invalid request format", which the mocked OM in unit tests would never catch.
+OM_LINEAGE_SOURCE_ENUM = frozenset(
+    {
+        "Manual",
+        "ViewLineage",
+        "QueryLineage",
+        "PipelineLineage",
+        "DashboardLineage",
+        "DbtLineage",
+        "SparkLineage",
+        "OpenLineage",
+        "ExternalTableLineage",
+        "CrossDatabaseLineage",
+        "ChildAssets",
+    }
+)
+
+
+def test_every_lineage_source_we_send_is_a_valid_om_enum_value():
+    sent = {SOURCE_PIPELINE, SOURCE_QUERY, SOURCE_VIEW, SOURCE_DASHBOARD, SOURCE_SCHEMA}
+    cleaned = {*OUR_LINEAGE_SOURCES, *OUR_DASHBOARD_LINEAGE_SOURCES, *OUR_SCHEMA_LINEAGE_SOURCES}
+    assert sent <= OM_LINEAGE_SOURCE_ENUM, sent - OM_LINEAGE_SOURCE_ENUM
+    assert cleaned <= OM_LINEAGE_SOURCE_ENUM, cleaned - OM_LINEAGE_SOURCE_ENUM
+    # every source we write is also one we clean up, or re-runs would pile up stale edges
+    assert sent <= cleaned, sent - cleaned
 
 
 # --------------------------------------------------------------------------
