@@ -4,8 +4,8 @@ keboola.wr-openmetadata-catalog
 A push-based **writer** that reads a Keboola project's metadata (buckets, tables,
 columns, native datatypes, primary keys, descriptions, sharing/linkage, the
 producing configs' storage mapping and transformation SQL, flows/orchestrations,
-and job run history) and pushes a catalog, pipelines, and lineage into an
-[OpenMetadata](https://open-metadata.org/) tenant via the OpenMetadata REST API.
+and job run history) and pushes a catalog, pipelines, dashboards, and lineage into
+an [OpenMetadata](https://open-metadata.org/) tenant via the OpenMetadata REST API.
 
 It is an atypical writer: its "input" is the whole project's metadata pulled over
 the Storage / Configurations / Job Queue APIs (not Keboola input-table mapping),
@@ -17,11 +17,21 @@ What it writes to OpenMetadata
 - **Catalog** — DatabaseService (stack) → Database (project) → DatabaseSchema
   (bucket) → Table (Regular / View / External) with columns, native datatypes,
   primary keys, descriptions, and deep links back into the Keboola UI.
-- **Pipelines** — component configs and flows/orchestrations → Pipeline + Tasks
-  (`taskSQL`, `downstreamTasks`), plus run history → pipeline status.
-- **Lineage** — declared table-level edges (`source=PipelineLineage`) and
-  column-level edges computed with SQLGlot (`source=QueryLineage`), chained
-  through workspace intermediates.
+- **Pipelines** — transformations, components (extractors/writers/apps) and
+  flows/orchestrations → Pipeline + Tasks (`taskSQL`, `downstreamTasks`), plus run
+  history → pipeline status. Each pipeline carries a `kbcType` custom property
+  (transformation / extractor / writer / application / orchestration).
+- **Dashboards** — Keboola data apps (`keboola.data-apps`) → Dashboard entities under
+  a single `CustomDashboard` service, with upstream table lineage from their input
+  mapping.
+- **Lineage** — declared table-level edges (`source=PipelineLineage`), column-level
+  edges computed with SQLGlot (`source=QueryLineage`), pipeline-node edges
+  (table→pipeline→table) and flow→child edges, and bucket→bucket edges aggregated from
+  table lineage. Each lineage type has its own on/off toggle.
+- **Custom properties + owners** — cataloged Tables, Pipelines, Dashboards,
+  DatabaseSchemas and Databases carry typed `kbc*` custom properties (ids, deep links,
+  last-change, owner e-mail) plus native OM `owners` when the config's creator e-mail
+  resolves to an OM user.
 - **Three-way merge** — the component only touches fields it authored; a field a
   human edited in OpenMetadata is left alone (unless `merge_mode=keboola_always_wins`).
 
@@ -41,10 +51,15 @@ Authentication
 Configuration
 =============
 
-Root config holds the OpenMetadata connection and global behaviour; each config
-row is one Keboola project. See `component_config/configSchema.json` and
-`component_config/configRowSchema.json`. Sync actions: **testConnection** and
-**listBuckets**.
+The root config holds only the OpenMetadata **connection** (host, bot token, optional
+SSH tunnel). Each config **row is one source**: its scope (this project / all
+organization projects), the Storage (or management) token, which object families to
+catalog — **buckets, transformations, components, flows, data apps**, each with an
+optional selector (empty = all) — and, under **Advanced**, the per-object lineage
+toggles, pipeline status, full refresh, merge mode and failure mode. See
+`component_config/configSchema.json` (root) and `component_config/configRowSchema.json`
+(row). Sync actions: **testConnection**, **listBuckets**, **listTransformations**,
+**listComponents**, **listFlows**, **listDataApps**, **listProjects**.
 
 Output tables
 =============

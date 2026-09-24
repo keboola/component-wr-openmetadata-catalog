@@ -12,12 +12,19 @@ hand-patch a cassette** (regenerate instead).
 
 ## What to record against
 
-- **OM:** the public sandbox `https://sandbox.open-metadata.org` (runs OM **1.13.4**,
-  the guaranteed stable surface — spec §3.5). No customer creds needed.
-- **Keboola:** a dedicated **CF scratch project** that has buckets/tables (and, for
-  the pipeline/lineage cases, at least one transformation + one flow + a completed
-  job). Use a non-customer project — its project id/name are baked into cassettes
-  and output tables, so they must be safe to commit.
+- **OM:** a real OpenMetadata **1.13.4** tenant you control (the guaranteed stable
+  surface — spec §3.5); its host is the `om_host` pinned in each case in
+  `tests/setup/configs.json`, and its bot JWT goes in `secrets.json` `#bot_token`. The
+  public sandbox is now on OM 2.0.x (wrong feature surface), so it can't be used.
+  **Each run-mode case records into its OWN fresh OM service** (`service_name:
+  keboola-vcr-*` in `configs.json`) so it starts from an empty catalog — the recorder
+  cannot reset OM between cases, so distinct service names replace resets. A helper
+  `scripts/reset_om.py` (dry-run by default) wipes OM services when you need a clean
+  slate; deletes must be run by a human.
+- **Keboola:** a dedicated **CF scratch project** (currently **4214**) that has
+  buckets/tables (and, for the pipeline/lineage cases, at least one transformation +
+  one flow + a completed job). Use a non-customer project — its project id/name are
+  baked into cassettes and output tables, so they must be safe to commit.
 
 ## secrets.json (git-ignored)
 
@@ -123,8 +130,8 @@ Most success cases record straight from the sandbox + scratch project with the
 |------|------------------------------|
 | `02_testConnection_bad_bot_token` | Record in a pass whose `--secrets` file **omits `#bot_token`**, so the intentionally-bad token reaches the authenticated OM call (`GET /users/loggedInUser`) and 401s (the global merge would otherwise restore the real token). The version probe is unauthenticated, so the auth call is what fails. |
 | `04_listBuckets_bad_storage_token` | Record in a pass whose `--secrets` file **omits `#storage_token`**, so the intentionally-bad token reaches Storage and 401s (the global merge would otherwise restore the real token). |
-| `06_run_catalog_incremental_second_run` | Record **after** `05` with `--chain-state` so `05`'s `out/state.json` seeds `06`'s `in/state.json` → unchanged buckets `skipped_unchanged`. |
-| `11`/`12` merge (`skipped_diverged` / overwrite) | Pre-seed OM: create an entity, then diverge one curated field, and provide a chained snapshot base so the merge sees `base == last-written`. |
+| `06_run_catalog_incremental_second_run` | Record `05`+`06` together with `--chain-state` so `05`'s `out/state.json` seeds `06`'s `in/state.json` → unchanged buckets `skipped_unchanged`. **Also export `KBC_TOKEN`** at record time: the incremental run reads the previous snapshot via `GET /tables/{snapshot}/data-preview`, gated on `KBC_TOKEN` (line ~347), so without it the read is skipped at record time but happens at replay → a VCR request-order mismatch. A dummy `KBC_TOKEN` is fine (the read 401s → empty base, as in the original). |
+| `11`/`12` merge (`skipped_diverged` / overwrite) | OM-only pre-seed (no Storage snapshot base — recorded with empty state, so the "base" is the pre-seeded OM): (1) run the catalog once into a fresh OM service to create all entities; (2) `PATCH` one table's `description` (an owned field) via the bot token so OM diverges from the Keboola-derived value; (3) record. `11` (`three_way_merge`) leaves it → `skipped_diverged`; `12` (`keboola_always_wins`) overwrites it → `updated`; the rest are `skipped_unchanged`. |
 | `13`/`14`/`15` failure_mode | Need **one** OM entity write to fail deterministically (a seeded conflict / a payload OM rejects) so `catalog_run_report` gets an `action=failed` row. |
 | `16_run_host_project_forward_token` | Omit `#storage_token` from `--secrets` for this pass and export a **real read-only `KBC_TOKEN`** (forward_token path). |
 | `17`/`18` config-validation failures | No HTTP — empty cassette, `expected_status.json` exit 1. Record straight through. `#manage_token` must stay absent from `secrets.json` for `18`. |
