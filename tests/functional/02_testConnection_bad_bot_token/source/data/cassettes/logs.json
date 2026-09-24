@@ -1,0 +1,5 @@
+{
+  "exit_code": 1,
+  "stderr": "OpenMetadata rejected the bot token (401) on GET /users/loggedInUser. Check that #bot_token is valid and the bot has the required policy.",
+  "logs": []
+}

@@ -1,0 +1,613 @@
+import logging
+import os
+import subprocess
+import sys
+import textwrap
+from collections import defaultdict
+from pathlib import Path
+
+from lineage.column_lineage import ColumnEdge, LineageResult, extract_column_lineage
+from lineage.dialect import dialect_for
+from mapping import fqn
+from mapping.lineage_builder import (
+    SOURCE_DASHBOARD,
+    SOURCE_PIPELINE,
+    SOURCE_QUERY,
+    SOURCE_SCHEMA,
+    SOURCE_VIEW,
+    LineageEdge,
+    bucket_edges,
+    column_edges,
+    data_app_edges,
+    declared_edges,
+    pipeline_edges,
+    to_add_lineage_request,
+    view_edge,
+)
+from merge import OUR_DASHBOARD_LINEAGE_SOURCES, OUR_LINEAGE_SOURCES, OUR_SCHEMA_LINEAGE_SOURCES
+
+SVC = "keboola-stack"
+PROJ = "Acme_Project"
+SNOW = dialect_for(component_id="keboola.snowflake-transformation")
+
+
+def _resolver(known):
+    return lambda fqn, _type: known.get(fqn)
+
+
+def test_declared_edges_are_n_by_m_and_tagged_pipeline_lineage():
+    storage = {
+        "input": {"tables": [{"source": "in.c-main.a"}, {"source": "in.c-main.b"}]},
+        "output": {"tables": [{"destination": "out.c-res.x"}, {"destination": "out.c-res.y"}]},
+    }
+    edges = declared_edges(storage, service_name=SVC, project=PROJ, pipeline_fqn="keboola-stack.Acme_Project__99")
+    assert len(edges) == 4  # 2 inputs x 2 outputs
+    assert all(e.source == SOURCE_PIPELINE for e in edges)
+    assert all(e.pipeline_fqn == "keboola-stack.Acme_Project__99" for e in edges)
+    assert edges[0].from_fqn == "keboola-stack.Acme_Project.in_c-main.a"
+
+
+def test_to_add_lineage_request_resolves_ids_and_attaches_pipeline():
+    edge = declared_edges(
+        {"input": {"tables": [{"source": "in.c-main.a"}]}, "output": {"tables": [{"destination": "out.c-res.x"}]}},
+        service_name=SVC,
+        project=PROJ,
+        pipeline_fqn="keboola-stack.Acme_Project__99",
+    )[0]
+    known = {
+        "keboola-stack.Acme_Project.in_c-main.a": "id-a",
+        "keboola-stack.Acme_Project.out_c-res.x": "id-x",
+        "keboola-stack.Acme_Project__99": "id-pipe",
+    }
+    req = to_add_lineage_request(edge, _resolver(known))
+    assert req is not None
+    assert req["edge"]["fromEntity"] == {"id": "id-a", "type": "table"}
+    assert req["edge"]["toEntity"] == {"id": "id-x", "type": "table"}
+    assert req["edge"]["lineageDetails"]["source"] == SOURCE_PIPELINE
+    assert req["edge"]["lineageDetails"]["pipeline"] == {"id": "id-pipe", "type": "pipeline"}
+
+
+def test_edge_skipped_when_entity_missing():
+    edge = view_edge("keboola-stack.P.b.view", "keboola-stack.P.b.base")
+    assert edge.source == SOURCE_VIEW
+    # target entity not in OM yet -> resolver returns None -> edge skipped, never a dangling ref
+    assert to_add_lineage_request(edge, _resolver({"keboola-stack.P.b.base": "id-base"})) is None
+
+
+DASH_FQN = "keboola-stack.Acme_Project__01app"
+
+
+def test_data_app_edges_from_input_tables_target_the_dashboard():
+    storage = {"input": {"tables": [{"source": "in.c-main.a"}, {"source": "in.c-main.b"}]}}
+    edges = data_app_edges(storage, service_name=SVC, project=PROJ, dashboard_fqn=DASH_FQN)
+    assert len(edges) == 2
+    assert all(e.source == SOURCE_DASHBOARD for e in edges)
+    assert all(e.to_type == "dashboard" and e.to_fqn == DASH_FQN for e in edges)
+    assert all(e.from_type == "table" for e in edges)
+    assert {e.from_fqn for e in edges} == {
+        "keboola-stack.Acme_Project.in_c-main.a",
+        "keboola-stack.Acme_Project.in_c-main.b",
+    }
+
+
+def test_data_app_edges_dedup_same_source():
+    storage = {"input": {"tables": [{"source": "in.c-main.a", "destination": "x.csv"}, {"source": "in.c-main.a"}]}}
+    edges = data_app_edges(storage, service_name=SVC, project=PROJ, dashboard_fqn=DASH_FQN)
+    assert len(edges) == 1
+
+
+def test_data_app_edges_empty_without_input():
+    assert data_app_edges({}, service_name=SVC, project=PROJ, dashboard_fqn=DASH_FQN) == []
+    assert data_app_edges({"input": {"tables": []}}, service_name=SVC, project=PROJ, dashboard_fqn=DASH_FQN) == []
+
+
+def test_data_app_edge_to_add_lineage_request_carries_dashboard_target():
+    edge = data_app_edges(
+        {"input": {"tables": [{"source": "in.c-main.a"}]}}, service_name=SVC, project=PROJ, dashboard_fqn=DASH_FQN
+    )[0]
+    known = {"keboola-stack.Acme_Project.in_c-main.a": "id-a", DASH_FQN: "id-dash"}
+    req = to_add_lineage_request(edge, _resolver(known))
+    assert req is not None
+    assert req["edge"]["fromEntity"] == {"id": "id-a", "type": "table"}
+    assert req["edge"]["toEntity"] == {"id": "id-dash", "type": "dashboard"}
+    assert req["edge"]["lineageDetails"]["source"] == SOURCE_DASHBOARD
+
+
+def test_data_app_edge_skipped_when_dashboard_absent():
+    # The Dashboard is not in OM yet (resolver returns None for it) -> edge skipped.
+    edge = data_app_edges(
+        {"input": {"tables": [{"source": "in.c-main.a"}]}}, service_name=SVC, project=PROJ, dashboard_fqn=DASH_FQN
+    )[0]
+    assert to_add_lineage_request(edge, _resolver({"keboola-stack.Acme_Project.in_c-main.a": "id-a"})) is None
+
+
+def test_column_edges_group_by_table_pair_and_carry_temp_tables():
+    result = LineageResult(
+        column_edges={
+            ColumnEdge("in.c-main.orders", "id", "out.c-res.result", "id"),
+            ColumnEdge("in.c-main.orders", "amount", "out.c-res.result", "total"),
+        },
+        temp_lineage_tables={"stg"},
+    )
+    edges = column_edges(result, service_name=SVC, project=PROJ, pipeline_fqn="keboola-stack.Acme_Project__7")
+    assert len(edges) == 1  # one edge for the single table pair
+    edge = edges[0]
+    assert edge.source == SOURCE_QUERY
+    assert edge.from_fqn == "keboola-stack.Acme_Project.in_c-main.orders"
+    assert edge.to_fqn == "keboola-stack.Acme_Project.out_c-res.result"
+    assert len(edge.columns_lineage) == 2
+    assert edge.temp_lineage_tables == ["stg"]
+    to_cols = {c["toColumn"] for c in edge.columns_lineage}
+    assert "keboola-stack.Acme_Project.out_c-res.result.total" in to_cols
+
+
+def test_pipeline_edges_are_input_to_pipeline_plus_pipeline_to_output():
+    # 2 inputs + 1 output + a pipeline -> N+M edges, never a cartesian product.
+    storage = {
+        "input": {"tables": [{"source": "in.c-main.a"}, {"source": "in.c-main.b"}]},
+        "output": {"tables": [{"destination": "out.c-res.x"}]},
+    }
+    pipeline_fqn_value = "keboola-stack.Acme_Project__99"
+    edges = pipeline_edges(storage, service_name=SVC, project=PROJ, pipeline_fqn=pipeline_fqn_value)
+
+    assert len(edges) == 3
+    in_edges = [e for e in edges if e.to_type == "pipeline"]
+    out_edges = [e for e in edges if e.from_type == "pipeline"]
+    assert len(in_edges) == 2
+    assert len(out_edges) == 1
+
+    assert {e.from_fqn for e in in_edges} == {
+        "keboola-stack.Acme_Project.in_c-main.a",
+        "keboola-stack.Acme_Project.in_c-main.b",
+    }
+    assert all(e.to_fqn == pipeline_fqn_value for e in in_edges)
+    assert all(e.from_type == "table" for e in in_edges)
+    assert all(e.to_type == "pipeline" for e in in_edges)
+    assert all(e.source == SOURCE_PIPELINE for e in in_edges)
+
+    (out_edge,) = out_edges
+    assert out_edge.from_fqn == pipeline_fqn_value
+    assert out_edge.to_fqn == "keboola-stack.Acme_Project.out_c-res.x"
+    assert out_edge.from_type == "pipeline"
+    assert out_edge.to_type == "table"
+    assert out_edge.source == SOURCE_PIPELINE
+
+
+def test_pipeline_edges_empty_input_only_emits_output_edge():
+    # The reported tr-fact_pull_request case: no declared inputs, one output ->
+    # ONLY the pipeline -> output edge (Downstream populated, Upstream stays empty
+    # until Phase B's SQL inference).
+    storage = {
+        "input": {"tables": []},
+        "output": {"tables": [{"destination": "ai-adoption.c-main.fact_pull_request"}]},
+    }
+    pipeline_fqn_value = "keboola-stack.Acme_Project__tr-fact_pull_request"
+    edges = pipeline_edges(storage, service_name=SVC, project=PROJ, pipeline_fqn=pipeline_fqn_value)
+
+    assert len(edges) == 1
+    (edge,) = edges
+    assert edge.from_fqn == pipeline_fqn_value
+    assert edge.to_fqn == "keboola-stack.Acme_Project.ai-adoption_c-main.fact_pull_request"
+    assert edge.from_type == "pipeline"
+    assert edge.to_type == "table"
+    assert edge.source == SOURCE_PIPELINE
+
+
+def test_pipeline_edges_without_pipeline_fqn_is_empty():
+    storage = {
+        "input": {"tables": [{"source": "in.c-main.a"}]},
+        "output": {"tables": [{"destination": "out.c-res.x"}]},
+    }
+    assert pipeline_edges(storage, service_name=SVC, project=PROJ, pipeline_fqn=None) == []
+
+
+def test_declared_edges_skip_self_reference():
+    storage = {
+        "input": {"tables": [{"source": "out.c-res.x"}]},
+        "output": {"tables": [{"destination": "out.c-res.x"}]},
+    }
+    assert declared_edges(storage, service_name=SVC, project=PROJ) == []
+
+
+def test_column_edges_drop_self_loop_not_emitted_and_warn(caplog):
+    # An SCD / self-snapshot config resolves the SAME storage table on both ends
+    # (in.c-scd.snapshot read AND rewritten); the same-table pair would become an
+    # OM self-loop (400). It must be dropped (not emitted) with a warning.
+    result = LineageResult(
+        column_edges={
+            ColumnEdge("in.c-scd.snapshot", "id", "in.c-scd.snapshot", "id"),
+            ColumnEdge("in.c-main.orders", "id", "out.c-res.result", "id"),  # normal edge, kept
+        },
+    )
+    with caplog.at_level(logging.WARNING):
+        edges = column_edges(result, service_name=SVC, project=PROJ)
+
+    # the self-loop pair is gone; the normal edge survives unchanged
+    assert len(edges) == 1
+    assert edges[0].from_fqn == "keboola-stack.Acme_Project.in_c-main.orders"
+    assert edges[0].to_fqn == "keboola-stack.Acme_Project.out_c-res.result"
+    assert edges[0].from_fqn != edges[0].to_fqn
+    assert any("self-loop" in rec.getMessage() for rec in caplog.records)
+
+
+def test_to_add_lineage_request_drops_self_loop_view_edge(caplog):
+    # A ViewLineage edge whose source FQN equals its target FQN (e.g. a linked
+    # bucket pointing at itself) is caught by the central pre-PUT gate.
+    edge = view_edge("keboola-stack.P.b.t", "keboola-stack.P.b.t")
+    assert edge.source == SOURCE_VIEW
+    with caplog.at_level(logging.WARNING):
+        req = to_add_lineage_request(edge, _resolver({"keboola-stack.P.b.t": "id-t"}))
+    assert req is None
+    assert any("self-loop" in rec.getMessage() for rec in caplog.records)
+
+
+def test_column_edges_degrade_to_table_level_when_target_is_empty_stub(caplog):
+    # (a) An SCD / self-snapshot output ("out.c-scd.snapshot") is declared but never
+    # materialised in Storage, so it is cataloged as an empty stub (columns=[]).
+    # A columnsLineage entry to it would name columns the table lacks -> OM 400 on
+    # the WHOLE edge. It must degrade to a table-level edge (no columnsLineage) with
+    # a warning, since both endpoint tables exist in the catalog.
+    result = LineageResult(
+        column_edges={ColumnEdge("in.c-main.orders", "id", "out.c-scd.snapshot", "snapshot_pk")},
+    )
+    catalog = {
+        "keboola-stack.Acme_Project.in_c-main.orders": {"id"},
+        "keboola-stack.Acme_Project.out_c-scd.snapshot": set(),  # empty stub
+    }
+    with caplog.at_level(logging.WARNING):
+        edges = column_edges(result, service_name=SVC, project=PROJ, column_catalog=catalog)
+
+    assert len(edges) == 1
+    edge = edges[0]
+    assert edge.source == SOURCE_QUERY
+    assert edge.from_fqn == "keboola-stack.Acme_Project.in_c-main.orders"
+    assert edge.to_fqn == "keboola-stack.Acme_Project.out_c-scd.snapshot"
+    assert edge.columns_lineage == []  # no columnsLineage -> OM cannot 400 on a missing column
+    assert any("snapshot" in rec.getMessage() for rec in caplog.records)
+
+
+def test_column_edges_drop_mapping_referencing_unknown_column(caplog):
+    # (b) One mapping references a column the target does not have ("missing"); it is
+    # dropped, while the sibling mapping with a real column survives.
+    result = LineageResult(
+        column_edges={
+            ColumnEdge("in.c-main.orders", "amount", "out.c-res.result", "total"),  # valid
+            ColumnEdge("in.c-main.orders", "id", "out.c-res.result", "missing"),  # target lacks 'missing'
+        },
+    )
+    catalog = {
+        "keboola-stack.Acme_Project.in_c-main.orders": {"id", "amount"},
+        "keboola-stack.Acme_Project.out_c-res.result": {"total"},
+    }
+    with caplog.at_level(logging.WARNING):
+        edges = column_edges(result, service_name=SVC, project=PROJ, column_catalog=catalog)
+
+    assert len(edges) == 1
+    edge = edges[0]
+    assert len(edge.columns_lineage) == 1  # only the valid mapping remains
+    assert edge.columns_lineage[0]["toColumn"] == "keboola-stack.Acme_Project.out_c-res.result.total"
+    assert any("missing" in rec.getMessage() for rec in caplog.records)
+
+
+def test_column_edges_keep_fully_valid_edge_unchanged():
+    # (c) Every referenced column exists in the catalog -> the edge is emitted with
+    # its columnsLineage intact, identical to the no-catalog behaviour.
+    result = LineageResult(
+        column_edges={
+            ColumnEdge("in.c-main.orders", "id", "out.c-res.result", "id"),
+            ColumnEdge("in.c-main.orders", "amount", "out.c-res.result", "total"),
+        },
+        temp_lineage_tables={"stg"},
+    )
+    catalog = {
+        "keboola-stack.Acme_Project.in_c-main.orders": {"id", "amount"},
+        "keboola-stack.Acme_Project.out_c-res.result": {"id", "total"},
+    }
+    edges = column_edges(result, service_name=SVC, project=PROJ, column_catalog=catalog)
+
+    assert len(edges) == 1
+    edge = edges[0]
+    assert len(edge.columns_lineage) == 2
+    assert edge.temp_lineage_tables == ["stg"]
+    to_cols = {c["toColumn"] for c in edge.columns_lineage}
+    assert to_cols == {
+        "keboola-stack.Acme_Project.out_c-res.result.id",
+        "keboola-stack.Acme_Project.out_c-res.result.total",
+    }
+
+
+def test_e17_end_to_end_sql_to_add_lineage_request():
+    """E17 seam — real transformation SQL all the way to the OM AddLineageRequest.
+
+    Compensates the DROPPED functional case ``10_run_column_lineage_only``: the two
+    halves (SQL text -> ``extract_column_lineage`` in test_lineage.py, and
+    ``LineageResult`` -> edges -> request here) are each covered, but nothing else
+    chains them. This drives a multi-step transformation (with an intermediate temp
+    table) through the parser, groups + validates the parsed column edges against
+    the cataloged column sets, and asserts the resulting ``QueryLineage``
+    ``AddLineageRequest`` carries the parser-derived ``columnsLineage`` and the
+    pipeline attachment.
+    """
+    statements = [
+        ("load_stg", 'CREATE TABLE "stg" AS SELECT "id", "amount" FROM "src"'),
+        ("build_result", 'INSERT INTO "result" SELECT "id", "amount" AS "total" FROM "stg"'),
+    ]
+    result = extract_column_lineage(
+        statements,
+        in_map={"src": "in.c-main.orders"},
+        out_map={"result": "out.c-sales.result"},
+        dialect=SNOW,
+    )
+    # (1) the parser resolved both columns through the intermediate temp table
+    assert ColumnEdge("in.c-main.orders", "id", "out.c-sales.result", "id") in result.column_edges
+    assert ColumnEdge("in.c-main.orders", "amount", "out.c-sales.result", "total") in result.column_edges
+    assert "stg" in result.temp_lineage_tables
+
+    # (2) group + validate against the endpoint tables' cataloged column sets
+    catalog = {
+        "keboola-stack.Acme_Project.in_c-main.orders": {"id", "amount"},
+        "keboola-stack.Acme_Project.out_c-sales.result": {"id", "total"},
+    }
+    edges = column_edges(
+        result,
+        service_name=SVC,
+        project=PROJ,
+        pipeline_fqn="keboola-stack.Acme_Project__42",
+        column_catalog=catalog,
+    )
+    assert len(edges) == 1
+    edge = edges[0]
+    assert edge.source == SOURCE_QUERY
+    assert edge.from_fqn == "keboola-stack.Acme_Project.in_c-main.orders"
+    assert edge.to_fqn == "keboola-stack.Acme_Project.out_c-sales.result"
+    assert edge.temp_lineage_tables == ["stg"]
+
+    # (3) resolve FQNs -> OM ids and assert the final PUT /lineage payload
+    known = {
+        edge.from_fqn: "id-src",
+        edge.to_fqn: "id-result",
+        "keboola-stack.Acme_Project__42": "id-pipe",
+    }
+    req = to_add_lineage_request(edge, _resolver(known))
+    assert req is not None
+    details = req["edge"]["lineageDetails"]
+    assert req["edge"]["fromEntity"] == {"id": "id-src", "type": "table"}
+    assert req["edge"]["toEntity"] == {"id": "id-result", "type": "table"}
+    assert details["source"] == SOURCE_QUERY
+    assert details["tempLineageTables"] == ["stg"]
+    assert details["pipeline"] == {"id": "id-pipe", "type": "pipeline"}
+    to_cols = {c["toColumn"] for c in details["columnsLineage"]}
+    assert to_cols == {
+        "keboola-stack.Acme_Project.out_c-sales.result.id",
+        "keboola-stack.Acme_Project.out_c-sales.result.total",
+    }
+
+
+# --------------------------------------------------------------------------
+# Determinism: the column-lineage set feeds emitted output (PUT /lineage
+# payloads + warning logs); its iteration order must be a stable function of
+# the edge set, not Python's per-process string-hash randomization.
+# --------------------------------------------------------------------------
+
+
+def _emitted_pairs(edges):
+    return [(e.from_fqn, e.to_fqn) for e in edges]
+
+
+def test_column_edge_is_stably_sortable():
+    # ColumnEdge sorts by (from_table, from_column, to_table, to_column).
+    edges = [
+        ColumnEdge("b", "1", "z", "9"),
+        ColumnEdge("a", "2", "z", "9"),
+        ColumnEdge("a", "1", "z", "9"),
+        ColumnEdge("a", "1", "y", "9"),
+    ]
+    assert sorted(edges) == [
+        ColumnEdge("a", "1", "y", "9"),
+        ColumnEdge("a", "1", "z", "9"),
+        ColumnEdge("a", "2", "z", "9"),
+        ColumnEdge("b", "1", "z", "9"),
+    ]
+
+
+def test_column_edges_emission_order_equals_stable_sort():
+    # Several edges across several table-pairs, with several columns per pair.
+    result = LineageResult(
+        column_edges={
+            ColumnEdge("in.c-main.orders", "id", "out.c-res.result", "id"),
+            ColumnEdge("in.c-main.orders", "amount", "out.c-res.result", "total"),
+            ColumnEdge("in.c-main.orders", "qty", "out.c-res.summary", "q"),
+            ColumnEdge("in.c-ext.people", "name", "out.c-res.result", "who"),
+            ColumnEdge("in.c-ext.people", "age", "out.c-res.summary", "a"),
+        },
+    )
+    edges = column_edges(result, service_name=SVC, project=PROJ)
+
+    # Expected emission derived directly from the ColumnEdge stable-sort key:
+    # table-pairs in first-seen order, columnsLineage in the same order.
+    expected_pairs: list[tuple[str, str]] = []
+    expected_cols: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for ce in sorted(result.column_edges):
+        from_fqn = fqn.table_fqn_from_storage_id(SVC, PROJ, ce.from_table)
+        to_fqn = fqn.table_fqn_from_storage_id(SVC, PROJ, ce.to_table)
+        assert from_fqn and to_fqn  # all test storage ids resolve
+        pair = (from_fqn, to_fqn)
+        if pair not in expected_pairs:
+            expected_pairs.append(pair)
+        expected_cols[pair].append(fqn.column_fqn(to_fqn, ce.to_column))
+
+    assert _emitted_pairs(edges) == expected_pairs
+    for e in edges:
+        got = [c["toColumn"] for c in e.columns_lineage]
+        assert got == expected_cols[(e.from_fqn, e.to_fqn)]
+
+
+def test_column_edges_drop_warning_order_is_deterministic(caplog):
+    # Every mapping references a column absent from the (empty-stub) target set,
+    # so all are dropped with a "Dropping column-level mapping" warning. The
+    # warning sequence must follow the stable sort key, not hash order.
+    result = LineageResult(
+        column_edges={
+            ColumnEdge("in.c-main.orders", "id", "out.c-res.result", "gone_c"),
+            ColumnEdge("in.c-main.orders", "amount", "out.c-res.result", "gone_a"),
+            ColumnEdge("in.c-main.orders", "qty", "out.c-res.result", "gone_b"),
+        },
+    )
+    catalog = {
+        "keboola-stack.Acme_Project.in_c-main.orders": {"id", "amount", "qty"},
+        "keboola-stack.Acme_Project.out_c-res.result": {"real"},  # none of the targets exist
+    }
+    with caplog.at_level(logging.WARNING):
+        column_edges(result, service_name=SVC, project=PROJ, column_catalog=catalog)
+
+    drops = [r.getMessage() for r in caplog.records if "Dropping column-level mapping" in r.getMessage()]
+    assert len(drops) == 3
+    # The warnings appear in ColumnEdge stable-sort order (from_table constant,
+    # so by from_column here: amount < id < qty), which the source-column
+    # substring reflects — never in hash order.
+    from_cols_in_order = [m.split(".orders.")[1].split(" ")[0] for m in drops]
+    assert from_cols_in_order == ["amount", "id", "qty"]
+
+
+def _emit_across_hash_seed(seed: int) -> str:
+    """Run the column-lineage emission in a fresh interpreter under a fixed
+    PYTHONHASHSEED and return its serialized emitted order."""
+    src_dir = str(Path(__file__).resolve().parents[2] / "src")
+    script = textwrap.dedent(
+        """
+        import json
+        from lineage.column_lineage import ColumnEdge, LineageResult
+        from mapping.lineage_builder import column_edges
+
+        result = LineageResult(column_edges={
+            ColumnEdge("in.c-main.orders", "id", "out.c-res.result", "id"),
+            ColumnEdge("in.c-main.orders", "amount", "out.c-res.result", "total"),
+            ColumnEdge("in.c-main.orders", "qty", "out.c-res.summary", "q"),
+            ColumnEdge("in.c-ext.people", "name", "out.c-res.result", "who"),
+            ColumnEdge("in.c-ext.people", "age", "out.c-res.summary", "a"),
+            ColumnEdge("in.c-ext.people", "city", "out.c-res.summary", "c"),
+        })
+        edges = column_edges(result, service_name="keboola-stack", project="Acme_Project")
+        out = [(e.from_fqn, e.to_fqn, [c["toColumn"] for c in e.columns_lineage]) for e in edges]
+        print(json.dumps(out))
+        """
+    )
+    env = dict(os.environ, PYTHONHASHSEED=str(seed), PYTHONPATH=src_dir)
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, env=env, check=True)
+    return proc.stdout.strip()
+
+
+def test_column_edges_order_is_hash_seed_independent():
+    # The recorder's finding, reproduced across processes: without the stable
+    # sort the emitted order differs between hash seeds; with it, it is identical.
+    out_seed_1 = _emit_across_hash_seed(1)
+    out_seed_2 = _emit_across_hash_seed(2)
+    out_seed_3 = _emit_across_hash_seed(42)
+    assert out_seed_1  # non-empty guard
+    assert out_seed_1 == out_seed_2 == out_seed_3
+
+
+# OM 1.13.4 ``type/entityLineage.json`` ``lineageDetails.source`` enum (unchanged
+# on main). It is closed: an unknown value fails request deserialization with a 400
+# "Invalid request format", which the mocked OM in unit tests would never catch.
+OM_LINEAGE_SOURCE_ENUM = frozenset(
+    {
+        "Manual",
+        "ViewLineage",
+        "QueryLineage",
+        "PipelineLineage",
+        "DashboardLineage",
+        "DbtLineage",
+        "SparkLineage",
+        "OpenLineage",
+        "ExternalTableLineage",
+        "CrossDatabaseLineage",
+        "ChildAssets",
+    }
+)
+
+
+def test_every_lineage_source_we_send_is_a_valid_om_enum_value():
+    sent = {SOURCE_PIPELINE, SOURCE_QUERY, SOURCE_VIEW, SOURCE_DASHBOARD, SOURCE_SCHEMA}
+    cleaned = {*OUR_LINEAGE_SOURCES, *OUR_DASHBOARD_LINEAGE_SOURCES, *OUR_SCHEMA_LINEAGE_SOURCES}
+    assert sent <= OM_LINEAGE_SOURCE_ENUM, sent - OM_LINEAGE_SOURCE_ENUM
+    assert cleaned <= OM_LINEAGE_SOURCE_ENUM, cleaned - OM_LINEAGE_SOURCE_ENUM
+    # every source we write is also one we clean up, or re-runs would pile up stale edges
+    assert sent <= cleaned, sent - cleaned
+
+
+# --------------------------------------------------------------------------
+# Bucket lineage (E-bucket): aggregate table->table edges to schema->schema.
+# --------------------------------------------------------------------------
+
+
+def test_bucket_edges_aggregates_cross_schema_table_edges():
+    edges = [
+        LineageEdge(from_fqn="svc.P.in_c-main.a", to_fqn="svc.P.out_c-res.x", source=SOURCE_PIPELINE),
+        # A second table pair in the SAME two schemas -> still ONE schema edge.
+        LineageEdge(from_fqn="svc.P.in_c-main.b", to_fqn="svc.P.out_c-res.y", source=SOURCE_QUERY),
+    ]
+    result = bucket_edges(edges)
+    assert len(result) == 1
+    edge = result[0]
+    assert edge.from_fqn == "svc.P.in_c-main"
+    assert edge.to_fqn == "svc.P.out_c-res"
+    assert edge.from_type == "databaseSchema"
+    assert edge.to_type == "databaseSchema"
+    assert edge.source == SOURCE_SCHEMA
+
+
+def test_bucket_edges_skips_same_schema_pairs():
+    # Both endpoints live in the same bucket (schema) -> no cross-schema signal.
+    edges = [LineageEdge(from_fqn="svc.P.c-main.a", to_fqn="svc.P.c-main.b", source=SOURCE_PIPELINE)]
+    assert bucket_edges(edges) == []
+
+
+def test_bucket_edges_ignores_non_table_to_table_edges():
+    # Pipeline-node edges (table->pipeline, pipeline->table) and dashboard edges
+    # (table->dashboard) carry no bucket-to-bucket signal.
+    edges = [
+        LineageEdge(
+            from_fqn="svc.P.in_c-main.a",
+            to_fqn="svc.P.pipeline.cfg1",
+            source=SOURCE_PIPELINE,
+            from_type="table",
+            to_type="pipeline",
+        ),
+        LineageEdge(
+            from_fqn="svc.P.in_c-main.a",
+            to_fqn="svc.P.dash.app1",
+            source=SOURCE_DASHBOARD,
+            from_type="table",
+            to_type="dashboard",
+        ),
+    ]
+    assert bucket_edges(edges) == []
+
+
+def test_bucket_edges_dedup_and_sorted_deterministic_order():
+    edges = [
+        LineageEdge(from_fqn="svc.P.c-z.t1", to_fqn="svc.P.c-a.t2", source=SOURCE_PIPELINE),
+        LineageEdge(from_fqn="svc.P.c-b.t1", to_fqn="svc.P.c-a.t2", source=SOURCE_PIPELINE),
+        # Duplicate pair (same schemas, different tables) -> deduped to one edge.
+        LineageEdge(from_fqn="svc.P.c-b.t3", to_fqn="svc.P.c-a.t4", source=SOURCE_QUERY),
+    ]
+    result = bucket_edges(edges)
+    pairs = [(e.from_fqn, e.to_fqn) for e in result]
+    assert pairs == sorted(pairs)
+    assert pairs == [("svc.P.c-b", "svc.P.c-a"), ("svc.P.c-z", "svc.P.c-a")]
+
+
+def test_to_add_lineage_request_drops_id_level_self_loop(caplog):
+    # Two distinct FQNs that resolve to the SAME OM entity id are a malformed
+    # self-referential payload (entities exist -> not a 404 -> OM 400). Skipped.
+    edge = declared_edges(
+        {"input": {"tables": [{"source": "in.c-main.a"}]}, "output": {"tables": [{"destination": "out.c-res.x"}]}},
+        service_name=SVC,
+        project=PROJ,
+    )[0]
+    known = {edge.from_fqn: "same-id", edge.to_fqn: "same-id"}
+    with caplog.at_level(logging.WARNING):
+        req = to_add_lineage_request(edge, _resolver(known))
+    assert req is None
+    assert any("same OM entity" in rec.getMessage() for rec in caplog.records)

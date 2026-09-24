@@ -1,0 +1,7 @@
+{
+  "_metadata": {"component_run_duration_seconds": 0.225, "component_run_ended_at": "2026-08-24T14:45:21.468856+00:00", "component_run_started_at": "2026-08-24T14:45:21.243842+00:00", "freeze_time": "2026-08-24T12:00:00", "keboola_vcr_version": "0.7.1", "recorded_at": "2026-08-24T14:45:21.470073+00:00", "recording_duration_seconds": 0.0, "recording_ended_at": "2026-08-24T14:45:21.467534+00:00", "recording_started_at": "2026-08-24T14:45:21.467534+00:00", "request_pairs": 1},
+  "interactions": [
+    {"request": {"body": null, "headers": {"Accept": ["application/json"]}, "method": "GET", "uri": "https://connection.us-east4.gcp.keboola.com/v2/storage/buckets?include=metadata"}, "response": {"body": {"string": "{\"error\": \"Invalid access token\", \"exceptionId\": \"com-keboola-gcp-us-east4-connection-0397004e9b19bbdf9df76d437333bd9f\", \"code\": \"REDACTED\"}"}, "headers": {"Content-Length": ["147"], "content-type": ["application/json"]}, "status": {"code": 401, "message": "Unauthorized"}}}
+  ],
+  "version": 1
+}

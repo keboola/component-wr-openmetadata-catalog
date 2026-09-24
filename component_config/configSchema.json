@@ -1,19 +1,91 @@
 {
   "type": "object",
-  "title": "extractor configuration",
+  "title": "OpenMetadata Catalog Writer",
   "required": [
-    "print_hello"
+    "om_host",
+    "#bot_token"
   ],
   "properties": {
-    "print_hello": {
-      "type": "boolean",
-      "title": "Print Hello",
-      "propertyOrder": 1
+    "om_host": {
+      "type": "string",
+      "title": "OpenMetadata Host",
+      "description": "Base URL of the OpenMetadata API",
+      "options": {
+        "inputAttributes": {
+          "placeholder": "https://openmetadata.example.com"
+        },
+        "tooltip": "The component appends `/api/v1`. Must be reachable from Keboola's static egress IPs, or via the SSH tunnel below."
+      },
+      "propertyOrder": 10
     },
-    "debug": {
+    "#bot_token": {
+      "type": "string",
+      "title": "OpenMetadata Token",
+      "format": "password",
+      "description": "OpenMetadata bot JWT token",
+      "options": {
+        "tooltip": "In OpenMetadata: Settings → Bots → your bot → Generate new token. A dedicated bot with a long expiry is recommended over the shared ingestion-bot."
+      },
+      "propertyOrder": 20
+    },
+    "use_ssh_tunnel": {
       "type": "boolean",
-      "title": "Debug",
-      "propertyOrder": 2
+      "format": "checkbox",
+      "title": "Use SSH Tunnel",
+      "description": "Reach the OpenMetadata host through an SSH bastion",
+      "propertyOrder": 30
+    },
+    "ssh": {
+      "type": "object",
+      "title": "SSH Tunnel",
+      "format": "grid",
+      "options": {
+        "dependencies": {
+          "use_ssh_tunnel": true
+        }
+      },
+      "properties": {
+        "host": {
+          "type": "string",
+          "title": "Bastion Host",
+          "propertyOrder": 1
+        },
+        "user": {
+          "type": "string",
+          "title": "Bastion User",
+          "propertyOrder": 2
+        },
+        "port": {
+          "type": "integer",
+          "title": "Bastion Port",
+          "default": 22,
+          "options": {
+            "tooltip": "Standard SSH port; change only if your bastion listens elsewhere."
+          },
+          "propertyOrder": 3
+        },
+        "#private_key": {
+          "type": "string",
+          "title": "Private Key",
+          "format": "password",
+          "propertyOrder": 4
+        }
+      },
+      "propertyOrder": 40
+    },
+    "test_connection": {
+      "type": "button",
+      "format": "test-connection",
+      "propertyOrder": 50
+    },
+    "service_name": {
+      "type": "string",
+      "title": "Service Name (Optional)",
+      "description": "Name of the OpenMetadata DatabaseService this catalog writes under (the root of every FQN)",
+      "options": {
+        "tooltip": "One DatabaseService per Keboola stack is recommended. Leave empty to auto-derive a stable name from the stack id (e.g. keboola-<stack>). Set it only to pin a specific service name, or when two stacks write into one OpenMetadata instance and need distinct services."
+      },
+      "propertyOrder": 60
     }
   }
 }

@@ -15,8 +15,13 @@ venv
 
 # vcr datadirtesting
 secrets.json
+tests/functional/*/source/data/config.secrets.json
 tests/functional/*/source/data/out/
 tests/functional/*/source/data/in/
+# Exception: case 06's committed incremental seed state is read directly by the
+# replay harness (tests/test_functional.py _STATE_OVERRIDE_CASE) and must ship in
+# the CI test image, so its in/ dir (only state.json) is tracked explicitly.
+!tests/functional/06_run_catalog_incremental_second_run/source/data/in/
 
 # env
 .env
@@ -27,5 +32,5 @@ SPEC.md
 assessment.html
 reference-connector/
 lineage-spike/
-docs/superpowers/
+# Only the local lifecycle tracker is ignored; specs/plans/research under docs/superpowers/ ARE committed.
 docs/superpowers/*-lifecycle.md
