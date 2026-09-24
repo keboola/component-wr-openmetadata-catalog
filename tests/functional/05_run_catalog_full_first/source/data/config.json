@@ -80,6 +80,6 @@
     "write_table_lineage": false,
     "write_pipeline_lineage": false,
     "write_dashboard_lineage": false,
-    "service_name": "keboola-vcr-catalog5"
+    "service_name": "keboola-vcr-catalog6"
   }
 }

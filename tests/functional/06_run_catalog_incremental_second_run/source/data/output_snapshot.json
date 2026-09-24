@@ -14,9 +14,9 @@
         "om_status_code",
         "timestamp"
       ],
-      "hash": "sha256:ee6bd40d657e01c05c9040c8599655598bf5a80766c23263651412fac3f39681",
+      "hash": "sha256:6db23228d5cc8a342cde76ed8d74b68a3ae0742084f90a0aba6760c4e75a4831",
       "row_count": 67,
-      "size_bytes": 8237
+      "size_bytes": 8191
     },
     "catalog_run_report.csv.manifest": {
       "columns": null,
@@ -32,9 +32,9 @@
         "content_hash",
         "updated_at"
       ],
-      "hash": "sha256:8f464a8fe40dc95d472cc61077f37adeab8a9aeb2b947fdf8f888dfa2acb3a65",
+      "hash": "sha256:1bf49619da003513ce2d62b5ba2a86dc8fb45304893d3b240a1799dde8ae14d5",
       "row_count": 3,
-      "size_bytes": 725
+      "size_bytes": 886
     },
     "last_written_snapshot.csv.manifest": {
       "columns": null,

@@ -1,6 +1,6 @@
 run_id,config_row_id,project_id,entity_type,entity_fqn,action,detail,om_status_code,timestamp
-keboola-om-catalog-vcr,,4214,DatabaseService,keboola-connection-us-east4-gcp-keboola-com,skipped_unchanged,,,2026-08-24T12:00:00+00:00
-keboola-om-catalog-vcr,,4214,Database,keboola-connection-us-east4-gcp-keboola-com.CF_New_Features_Testing,skipped_unchanged,,,2026-08-24T12:00:00+00:00
+keboola-om-catalog-vcr,,4214,DatabaseService,keboola-vcr-catalog6,skipped_unchanged,,,2026-08-24T12:00:00+00:00
+keboola-om-catalog-vcr,,4214,Database,keboola-vcr-catalog6.CF_New_Features_Testing,skipped_unchanged,,,2026-08-24T12:00:00+00:00
 keboola-om-catalog-vcr,,4214,Schema,in.c-de-test,skipped_unchanged,,,2026-08-24T12:00:00+00:00
 keboola-om-catalog-vcr,,4214,Schema,in.c-dev_portal_components,skipped_unchanged,,,2026-08-24T12:00:00+00:00
 keboola-om-catalog-vcr,,4214,Schema,in.c-dtyped-salesforce,skipped_unchanged,,,2026-08-24T12:00:00+00:00

@@ -1,12 +1,9 @@
 {
   "parameters": {
-    "om_host": "http://localhost:8585",
+    "om_host": "https://34.56.130.9.nip.io",
     "#bot_token": "DUMMY_BOT_TOKEN",
     "#storage_token": "DUMMY_STORAGE_TOKEN",
-    "write_pipelines": false,
     "write_pipeline_status": false,
-    "write_lineage": false,
-    "write_data_apps": false,
     "write_column_lineage": false,
     "buckets": [
       "in.c-ESG-dummy",
@@ -73,6 +70,16 @@
       "out.c-mareks_out_for_snflk",
       "out.c-postgres-cdc-test-perm",
       "out.c-typeform-LxWl3ZmU"
-    ]
+    ],
+    "write_buckets": true,
+    "write_transformations": false,
+    "write_components": false,
+    "write_flows": false,
+    "write_data_apps": false,
+    "write_bucket_lineage": false,
+    "write_table_lineage": false,
+    "write_pipeline_lineage": false,
+    "write_dashboard_lineage": false,
+    "service_name": "keboola-vcr-catalog6"
   }
 }
