@@ -409,13 +409,11 @@
     "description": "PASS run: merge_mode=three_way_merge (default) with a populated snapshot base -> when OM still matches our last-written value an owned field change PATCHes (action=updated); when a human diverged from the base OM is left untouched (action=skipped_diverged) + report row. RECORD NOTE: needs OM pre-seeded with an entity + a divergent curated field to exercise the skipped_diverged branch (see README); the updated branch needs a chained snapshot from a prior run.",
     "config": {
       "parameters": {
-        "om_host": "http://localhost:8585",
+        "om_host": "https://34.56.130.9.nip.io",
         "#bot_token": "DUMMY_BOT_TOKEN",
         "#storage_token": "DUMMY_STORAGE_TOKEN",
         "merge_mode": "three_way_merge",
-        "write_pipelines": false,
         "write_pipeline_status": false,
-        "write_lineage": false,
         "write_column_lineage": false,
         "buckets": [
           "in.c-ESG-dummy",
@@ -482,7 +480,17 @@
           "out.c-mareks_out_for_snflk",
           "out.c-postgres-cdc-test-perm",
           "out.c-typeform-LxWl3ZmU"
-        ]
+        ],
+        "write_buckets": true,
+        "write_transformations": false,
+        "write_components": false,
+        "write_flows": false,
+        "write_data_apps": false,
+        "write_bucket_lineage": false,
+        "write_table_lineage": false,
+        "write_pipeline_lineage": false,
+        "write_dashboard_lineage": false,
+        "service_name": "keboola-vcr-merge-tw"
       }
     }
   },
@@ -491,13 +499,11 @@
     "description": "PASS run: merge_mode=keboola_always_wins -> a divergence between OM and the Keboola-derived value is overwritten (action=updated) instead of preserved. The three_way_merge (11) vs keboola_always_wins (12) pair. RECORD NOTE: same OM pre-seed as 11 to show the overwrite.",
     "config": {
       "parameters": {
-        "om_host": "http://localhost:8585",
+        "om_host": "https://34.56.130.9.nip.io",
         "#bot_token": "DUMMY_BOT_TOKEN",
         "#storage_token": "DUMMY_STORAGE_TOKEN",
         "merge_mode": "keboola_always_wins",
-        "write_pipelines": false,
         "write_pipeline_status": false,
-        "write_lineage": false,
         "write_column_lineage": false,
         "buckets": [
           "in.c-ESG-dummy",
@@ -564,7 +570,17 @@
           "out.c-mareks_out_for_snflk",
           "out.c-postgres-cdc-test-perm",
           "out.c-typeform-LxWl3ZmU"
-        ]
+        ],
+        "write_buckets": true,
+        "write_transformations": false,
+        "write_components": false,
+        "write_flows": false,
+        "write_data_apps": false,
+        "write_bucket_lineage": false,
+        "write_table_lineage": false,
+        "write_pipeline_lineage": false,
+        "write_dashboard_lineage": false,
+        "service_name": "keboola-vcr-merge-kw"
       }
     }
   },
