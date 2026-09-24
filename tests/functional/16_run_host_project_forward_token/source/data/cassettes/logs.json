@@ -41,7 +41,7 @@
     {
       "level": "INFO",
       "logger": "__main__",
-      "message": "Run summary: {'skipped_unchanged': 185}",
+      "message": "Run summary: {'created': 185}",
       "timestamp": "2026-08-24T12:00:00.000Z"
     }
   ]

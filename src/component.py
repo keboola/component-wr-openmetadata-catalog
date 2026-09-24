@@ -105,8 +105,15 @@ class CredentialScrubber(BaseSanitizer):
         "token",
     )
     _NAME_SUFFIXES: ClassVar[tuple[str, ...]] = ("key", "secret", "password", "token")
-    # Benign ``*_key`` field names that are NOT credentials and must survive.
-    _NAME_ALLOWLIST: ClassVar[frozenset[str]] = frozenset({"primarykey"})
+    # Benign field names that end in a credential suffix but are NOT credentials and
+    # must survive: ``primary_key`` (a Storage column list) and the bare ``key`` field
+    # of Keboola ``{"key": ..., "value": ...}`` metadata entries — its value is a
+    # metadata key *name* (e.g. ``KBC.description``, ``KBC.datatype.type``), not a
+    # secret. Redacting it corrupts every metadata key name in a recorded response, so
+    # replay can no longer find ``KBC.description`` / ``KBC.datatype.*`` and descriptions
+    # and legacy datatypes silently vanish. A real secret sitting under a bare ``key``
+    # field is still caught by the value-shape rules (PEM block, AWS key id).
+    _NAME_ALLOWLIST: ClassVar[frozenset[str]] = frozenset({"primarykey", "key"})
 
     _PEM_RE: ClassVar[re.Pattern[str]] = re.compile(
         r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
@@ -134,10 +141,20 @@ class CredentialScrubber(BaseSanitizer):
     @classmethod
     def _scrub_value(cls, value: Any) -> Any:
         if isinstance(value, dict):
-            return {
-                key: (cls.REPLACEMENT if isinstance(key, str) and cls._is_credential_name(key) else cls._scrub_value(v))
-                for key, v in value.items()
-            }
+            scrubbed: dict[Any, Any] = {}
+            for key, v in value.items():
+                # A credential is a scalar secret, so a matching field name is only
+                # redacted when its value is a string. A list/dict under a name that
+                # merely ends in "key" (e.g. a Storage column literally named
+                # ``ACC_KEY`` whose value is its ``columnMetadata`` list of
+                # ``{"key": ..., "value": ...}`` entries) is structured data, not a
+                # secret; recurse so its contents survive (an embedded PEM/AWS-shaped
+                # secret is still caught by the value-shape rules).
+                if isinstance(key, str) and cls._is_credential_name(key) and isinstance(v, str):
+                    scrubbed[key] = cls.REPLACEMENT
+                else:
+                    scrubbed[key] = cls._scrub_value(v)
+            return scrubbed
         if isinstance(value, list):
             return [cls._scrub_value(item) for item in value]
         if isinstance(value, str):

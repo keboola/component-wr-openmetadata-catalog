@@ -172,3 +172,44 @@ def test_primary_key_is_not_treated_as_credential():
     assert CredentialScrubber._is_credential_name("SNOWFLAKE_PRIVATE_KEY") is True
     assert CredentialScrubber._is_credential_name("accessKeyId") is True
     assert CredentialScrubber._is_credential_name("columns") is False
+
+
+def test_bare_key_field_is_not_treated_as_credential():
+    """A field literally named ``key`` is the name half of a Keboola
+    ``{"key": ..., "value": ...}`` metadata entry, not a secret — redacting it would
+    rewrite every ``KBC.*`` metadata key name in a recorded response and make replay
+    lose descriptions and legacy datatypes."""
+    assert CredentialScrubber._is_credential_name("key") is False
+    # compound *_key names are still credentials
+    assert CredentialScrubber._is_credential_name("ssh_key") is True
+
+
+def test_metadata_key_names_survive_but_secret_shapes_still_redacted():
+    """columnMetadata entries keep their ``key`` names (so KBC.description resolves),
+    while a PEM/AWS-shaped value under any field is still redacted."""
+    body = json.dumps(
+        {
+            "columnMetadata": {
+                "id": [
+                    {"key": "KBC.datatype.type", "value": "NUMBER"},
+                    {"key": "KBC.description", "value": "Will be used in Storage table metadata"},
+                ],
+                # a Storage column literally named ACC_KEY — "acckey" ends in "key" but
+                # its value is a metadata LIST, not a scalar secret, and must survive.
+                "ACC_KEY": [
+                    {"key": "KBC.datatype.basetype", "value": "INTEGER"},
+                    {"key": "KBC.description", "value": "an account key column"},
+                ],
+            },
+            "leaked": {"key": "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----"},
+            "access_key": "AKIAIOSFODNN7EXAMPLE-not",  # scalar under a credential name -> still redacted
+        }
+    )
+    out = json.loads(CredentialScrubber.scrub_body_text(body))
+    for col in ("id", "ACC_KEY"):
+        keys = [e["key"] for e in out["columnMetadata"][col]]
+        assert "KBC.description" in keys, f"{col} lost its metadata key names"
+    assert out["columnMetadata"]["id"][1]["value"] == "Will be used in Storage table metadata"
+    assert out["columnMetadata"]["ACC_KEY"][1]["value"] == "an account key column"
+    assert out["leaked"]["key"] == _REDACTED  # PEM value still redacted by shape
+    assert out["access_key"] == _REDACTED  # scalar credential-named field still redacted

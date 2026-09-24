@@ -52,12 +52,10 @@
     "description": "PASS run (Tier-1, catalog only): empty snapshot/state -> E1 DatabaseService, E2 Database, E3 DatabaseSchema, E4 Table + E8 columns/datatypes + E9 primary keys all created. Report rows action=created; last_written_snapshot written. Pipelines/lineage OFF to isolate the catalog pass.",
     "config": {
       "parameters": {
-        "om_host": "http://localhost:8585",
+        "om_host": "https://34.56.130.9.nip.io",
         "#bot_token": "DUMMY_BOT_TOKEN",
         "#storage_token": "DUMMY_STORAGE_TOKEN",
-        "write_pipelines": false,
         "write_pipeline_status": false,
-        "write_lineage": false,
         "write_column_lineage": false,
         "buckets": [
           "in.c-ESG-dummy",
@@ -124,7 +122,17 @@
           "out.c-mareks_out_for_snflk",
           "out.c-postgres-cdc-test-perm",
           "out.c-typeform-LxWl3ZmU"
-        ]
+        ],
+        "write_buckets": true,
+        "write_transformations": false,
+        "write_components": false,
+        "write_flows": false,
+        "write_data_apps": false,
+        "write_bucket_lineage": false,
+        "write_table_lineage": false,
+        "write_pipeline_lineage": false,
+        "write_dashboard_lineage": false,
+        "service_name": "keboola-vcr-catalog5"
       }
     }
   },
@@ -214,13 +222,11 @@
     "description": "PASS run: full_refresh=true ignores the per-bucket digests and re-reads/re-pushes every bucket even when state exists (spec 2.3 periodic full refresh). Catalog only. Complements 06 (the full_refresh ON vs OFF pair).",
     "config": {
       "parameters": {
-        "om_host": "http://localhost:8585",
+        "om_host": "https://34.56.130.9.nip.io",
         "#bot_token": "DUMMY_BOT_TOKEN",
         "#storage_token": "DUMMY_STORAGE_TOKEN",
         "full_refresh": true,
-        "write_pipelines": false,
         "write_pipeline_status": false,
-        "write_lineage": false,
         "write_column_lineage": false,
         "buckets": [
           "in.c-ESG-dummy",
@@ -287,7 +293,17 @@
           "out.c-mareks_out_for_snflk",
           "out.c-postgres-cdc-test-perm",
           "out.c-typeform-LxWl3ZmU"
-        ]
+        ],
+        "write_buckets": true,
+        "write_transformations": false,
+        "write_components": false,
+        "write_flows": false,
+        "write_data_apps": false,
+        "write_bucket_lineage": false,
+        "write_table_lineage": false,
+        "write_pipeline_lineage": false,
+        "write_dashboard_lineage": false,
+        "service_name": "keboola-vcr-refresh"
       }
     }
   },
@@ -296,12 +312,10 @@
     "description": "PASS run (lineage/pipelines OFF): write_lineage=false, write_column_lineage=false, write_pipelines=false -> NO PUT /lineage and NO PUT /pipelines calls; only the catalog pass runs. The write-on (08) vs write-off (09) pair for E16/E17 + pipelines.",
     "config": {
       "parameters": {
-        "om_host": "http://localhost:8585",
+        "om_host": "https://34.56.130.9.nip.io",
         "#bot_token": "DUMMY_BOT_TOKEN",
         "#storage_token": "DUMMY_STORAGE_TOKEN",
-        "write_pipelines": false,
         "write_pipeline_status": false,
-        "write_lineage": false,
         "write_column_lineage": false,
         "buckets": [
           "in.c-ESG-dummy",
@@ -368,7 +382,17 @@
           "out.c-mareks_out_for_snflk",
           "out.c-postgres-cdc-test-perm",
           "out.c-typeform-LxWl3ZmU"
-        ]
+        ],
+        "write_buckets": true,
+        "write_transformations": false,
+        "write_components": false,
+        "write_flows": false,
+        "write_data_apps": false,
+        "write_bucket_lineage": false,
+        "write_table_lineage": false,
+        "write_pipeline_lineage": false,
+        "write_dashboard_lineage": false,
+        "service_name": "keboola-vcr-lineage-off"
       }
     }
   },
@@ -589,11 +613,9 @@
     "description": "PASS run (Tier-1 host project, forward_token path): NO #storage_token in config -> the component uses the injected KBC_TOKEN/KBC_URL (forward_token). Proves the headless single-project story (spec 3.2). RECORD NOTE: export a REAL read-only KBC_TOKEN (+ KBC_URL for the stack) in the shell for this recording; the secrets.json #storage_token must be absent for this pass so the row-token path is not taken. Every other success case exercises the remote-row #storage_token path, so together they cover both Tier-1 credential resolutions.",
     "config": {
       "parameters": {
-        "om_host": "http://localhost:8585",
+        "om_host": "https://34.56.130.9.nip.io",
         "#bot_token": "DUMMY_BOT_TOKEN",
-        "write_pipelines": false,
         "write_pipeline_status": false,
-        "write_lineage": false,
         "write_column_lineage": false,
         "buckets": [
           "in.c-ESG-dummy",
@@ -660,7 +682,17 @@
           "out.c-mareks_out_for_snflk",
           "out.c-postgres-cdc-test-perm",
           "out.c-typeform-LxWl3ZmU"
-        ]
+        ],
+        "write_buckets": true,
+        "write_transformations": false,
+        "write_components": false,
+        "write_flows": false,
+        "write_data_apps": false,
+        "write_bucket_lineage": false,
+        "write_table_lineage": false,
+        "write_pipeline_lineage": false,
+        "write_dashboard_lineage": false,
+        "service_name": "keboola-vcr-forward"
       }
     }
   },
@@ -790,7 +822,7 @@
   },
   {
     "name": "21_testConnection_unreachable_host",
-    "description": "NOT VCR-RECORDABLE \u2014 do not scaffold. A connection/DNS failure produces no HTTP response, so VCR records no interaction and cannot replay it (record_mode=none -> 'no match for the request'). The reachability path (unreachable OM host -> OMConnectionError -> UserException -> exit 1, spec 6.3) is instead covered by the unit test tests/test_component.py::test_test_connection_unreachable_host and tests/unit/test_om_client.py::test_connection_error_retried_then_raises_user_exception. Kept here to document the matrix row; the recorder skips it.",
+    "description": "NOT VCR-RECORDABLE — do not scaffold. A connection/DNS failure produces no HTTP response, so VCR records no interaction and cannot replay it (record_mode=none -> 'no match for the request'). The reachability path (unreachable OM host -> OMConnectionError -> UserException -> exit 1, spec 6.3) is instead covered by the unit test tests/test_component.py::test_test_connection_unreachable_host and tests/unit/test_om_client.py::test_connection_error_retried_then_raises_user_exception. Kept here to document the matrix row; the recorder skips it.",
     "config": {
       "action": "testConnection",
       "parameters": {

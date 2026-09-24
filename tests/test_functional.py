@@ -38,13 +38,9 @@ _STATE_OVERRIDE_CASE = "06_run_catalog_incremental_second_run"
 # covered by tests/unit meanwhile. Remove a name here once its cassette is
 # re-recorded (see tests/setup/README.md).
 _PENDING_RERECORD = {
-    "05_run_catalog_full_first",
     "06_run_catalog_incremental_second_run",
-    "07_run_full_refresh",
-    "09_run_lineage_off",
     "11_run_merge_three_way",
     "12_run_merge_keboola_wins",
-    "16_run_host_project_forward_token",
     "19_run_tier2_all_projects",
 }
 
