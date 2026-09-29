@@ -83,7 +83,7 @@
       "title": "Service Name (Optional)",
       "description": "Name of the OpenMetadata DatabaseService this catalog writes under (the root of every FQN)",
       "options": {
-        "tooltip": "One DatabaseService per Keboola stack is recommended. Leave empty to auto-derive a stable name from the stack id (e.g. keboola-<stack>). Set it only to pin a specific service name, or when two stacks write into one OpenMetadata instance and need distinct services."
+        "tooltip": "Leave empty to use the default service \"keboola\" (shown as \"Keboola\" in OpenMetadata). Set a name only to pin a specific service, or when several Keboola stacks write into one OpenMetadata instance and each needs its own service. Changing it later starts a new service tree in OpenMetadata."
       },
       "propertyOrder": 60
     }

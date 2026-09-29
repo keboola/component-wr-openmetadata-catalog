@@ -61,11 +61,14 @@ class DashboardBuilder:
         self.stack_id = stack_id
 
     def dashboard_service_body(self) -> dict:
-        return {
+        body = {
             "name": fqn.sanitize_name(self.service_name),
             "serviceType": _SERVICE_TYPE,
             "description": "Keboola data apps catalogued by keboola.wr-openmetadata-catalog.",
         }
+        if display_name := fqn.service_display_name(body["name"]):
+            body["displayName"] = display_name
+        return body
 
     @staticmethod
     def is_data_app(component_id: str) -> bool:

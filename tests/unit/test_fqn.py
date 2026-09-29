@@ -24,6 +24,12 @@ def test_sanitize_display_name_preserves_original():
     assert fqn.sanitize_display_name(None) is None
 
 
+def test_service_display_name_only_for_the_default_service():
+    assert fqn.service_display_name(fqn.DEFAULT_SERVICE_NAME) == "Keboola"
+    # An explicitly chosen service name is shown as typed: no displayName is sent.
+    assert fqn.service_display_name("keboola-eu") is None
+
+
 def test_table_fqn_deterministic():
     a = fqn.table_fqn("keboola-stack", "Acme Project", "out.c-sales", "orders")
     b = fqn.table_fqn("keboola-stack", "Acme Project", "out.c-sales", "orders")

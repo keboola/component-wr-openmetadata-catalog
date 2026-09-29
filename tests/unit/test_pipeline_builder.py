@@ -12,6 +12,10 @@ def test_pipeline_service_body():
     svc = _builder().pipeline_service_body()
     assert svc["serviceType"] == "CustomPipeline"
     assert svc["name"] == "keboola-stack"
+    assert "displayName" not in svc
+
+    default_svc = PipelineBuilder("keboola", "Acme_Project", "1234", UI).pipeline_service_body()
+    assert default_svc["displayName"] == "Keboola"
 
 
 def test_config_to_pipeline_with_ordered_tasks_and_sql():

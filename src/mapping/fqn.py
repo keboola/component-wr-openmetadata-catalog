@@ -16,6 +16,13 @@ import re
 _UNSAFE = re.compile(r"[^0-9A-Za-z_-]+")
 _MULTI_UNDERSCORE = re.compile(r"_+")
 
+# The FQN root every service (database / pipeline / dashboard) uses unless the
+# config pins its own ``service_name``. Fixed rather than stack-derived: a customer
+# lives on one stack, and OM's Explore tree shows the service right above the
+# project, so it should read "Keboola", not "keboola-connection-<stack>".
+DEFAULT_SERVICE_NAME = "keboola"
+_DEFAULT_SERVICE_DISPLAY_NAME = "Keboola"
+
 
 def sanitize_name(name: str | None) -> str:
     """Return an FQN-safe single segment for ``name``.
@@ -37,6 +44,15 @@ def sanitize_display_name(name: str | None) -> str | None:
         return None
     text = str(name).strip()
     return text or None
+
+
+def service_display_name(service_name: str) -> str | None:
+    """``displayName`` for a service: "Keboola" for the default one, else ``None``.
+
+    A service name the user chose is shown exactly as typed, so two pinned
+    services (e.g. one per stack) stay distinguishable in OM's tree.
+    """
+    return _DEFAULT_SERVICE_DISPLAY_NAME if service_name == DEFAULT_SERVICE_NAME else None
 
 
 def database_service_fqn(service_name: str) -> str:

@@ -15,6 +15,8 @@ from enum import StrEnum
 from keboola.component.exceptions import UserException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from mapping.fqn import DEFAULT_SERVICE_NAME
+
 logger = logging.getLogger(__name__)
 
 
@@ -138,14 +140,6 @@ class Configuration(BaseModel):
             raise UserException("use_ssh_tunnel is enabled but the 'ssh' configuration block is missing.")
         return self
 
-    def resolve_service_name(self, stack_id: str | None) -> str:
-        """Return the OM DatabaseService name (FQN root).
-
-        Uses the explicit ``service_name`` override when set, otherwise derives
-        a stable default from ``KBC_STACKID`` (spec 5.2). Never persisted.
-        """
-        if self.service_name:
-            return self.service_name
-        if stack_id:
-            return f"keboola-{stack_id}".replace(".", "-")
-        return "keboola"
+    def resolve_service_name(self) -> str:
+        """Return the OM service name (FQN root): the ``service_name`` override, else ``keboola``."""
+        return self.service_name or DEFAULT_SERVICE_NAME

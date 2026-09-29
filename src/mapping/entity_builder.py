@@ -139,11 +139,14 @@ class EntityBuilder:
     # ---------------------------------------------------------------- E1-E3
 
     def database_service_body(self) -> dict:
-        return {
+        body = {
             "name": fqn.sanitize_name(self.service_name),
             "serviceType": _SERVICE_TYPE,
             "description": "Keboola Connection stack catalogued by keboola.wr-openmetadata-catalog.",
         }
+        if display_name := fqn.service_display_name(body["name"]):
+            body["displayName"] = display_name
+        return body
 
     def _database_extension(self, available: set[str] | None, synced_at: str | None) -> dict | None:
         values = {

@@ -12,6 +12,10 @@ def test_dashboard_service_body():
     svc = _builder().dashboard_service_body()
     assert svc["serviceType"] == "CustomDashboard"
     assert svc["name"] == "keboola-stack"
+    assert "displayName" not in svc
+
+    default_svc = DashboardBuilder("keboola", "Acme_Project", "1234", UI, STACK).dashboard_service_body()
+    assert default_svc["displayName"] == "Keboola"
 
 
 def test_is_data_app():

@@ -14,7 +14,8 @@ and its "output" is OpenMetadata entities plus two small Keboola report tables.
 What it writes to OpenMetadata
 ==============================
 
-- **Catalog** — DatabaseService (stack) → Database (project) → DatabaseSchema
+- **Catalog** — DatabaseService (`keboola`, shown as "Keboola"; override with Service
+  Name) → Database (project) → DatabaseSchema
   (bucket) → Table (Regular / View / External) with columns, native datatypes,
   primary keys, descriptions, and deep links back into the Keboola UI.
 - **Pipelines** — transformations, components (extractors/writers/apps) and

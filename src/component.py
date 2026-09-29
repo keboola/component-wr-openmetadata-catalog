@@ -397,7 +397,7 @@ class Component(ComponentBase):
         # production_only (the former branch_filter toggle is gone).
         reader = StorageReader(ctx.storage_url, ctx.storage_token, production_only=True)
         ui_base = self._ui_base(ctx.storage_url)
-        service_name = config.resolve_service_name(env["stack_id"])
+        service_name = config.resolve_service_name()
         run = _ProjectRun(
             ctx=ctx,
             reader=reader,

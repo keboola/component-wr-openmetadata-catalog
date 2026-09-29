@@ -93,15 +93,16 @@ def test_ssh_block_parses_with_alias():
     assert cfg.ssh.private_key == "KEY"
 
 
-def test_service_name_default_resolves_from_stackid():
+def test_service_name_defaults_to_keboola():
+    # One fixed root, not the stack id: a customer lives on one stack, and OM's tree
+    # should read "Keboola > <project>", not "keboola-connection-... > <project>".
     cfg = Configuration(**_base_params())
-    assert cfg.resolve_service_name("connection.keboola.com") == "keboola-connection-keboola-com"
-    assert cfg.resolve_service_name(None) == "keboola"
+    assert cfg.resolve_service_name() == "keboola"
 
 
 def test_service_name_override_wins():
     cfg = Configuration(**_base_params(service_name="my-service"))
-    assert cfg.resolve_service_name("connection.keboola.com") == "my-service"
+    assert cfg.resolve_service_name() == "my-service"
 
 
 def test_storage_token_row_field_alias():

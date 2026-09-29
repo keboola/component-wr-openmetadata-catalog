@@ -21,6 +21,11 @@ def test_database_service_and_database_bodies():
     svc = b.database_service_body()
     assert svc["name"] == "keboola-stack"
     assert svc["serviceType"] == "CustomDatabase"
+    assert "displayName" not in svc  # an explicit service name is shown as typed
+
+    default_svc = EntityBuilder("keboola", "Acme_Project", "1234", UI).database_service_body()
+    assert default_svc["name"] == "keboola"
+    assert default_svc["displayName"] == "Keboola"
 
     db = b.database_body(display_name="Acme Project")
     assert db["name"] == "Acme_Project"
