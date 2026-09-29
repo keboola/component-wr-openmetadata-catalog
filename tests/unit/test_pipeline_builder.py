@@ -348,3 +348,16 @@ def test_flow_pipeline_owners_absent_when_no_creator_email_resolver_never_called
     built = _builder().build_pipeline("keboola.orchestrator", config, owner_resolver=resolver)
     assert "owners" not in built.body
     assert calls == []
+
+
+INTERNAL_KBC_URL = "http://connection-api.connection.svc.cluster.local"
+
+
+def test_pipeline_source_urls_use_public_stack_host_not_internal_kbc_url():
+    """Inside a job KBC_URL is the internal cluster host; OM links must open the public UI."""
+    b = PipelineBuilder("keboola", "Acme_Project", "1234", INTERNAL_KBC_URL, STACK)
+    public = "https://connection.us-east4.gcp.keboola.com/admin/projects/1234"
+    config = b.build_pipeline("keboola.snowflake-transformation", {"id": "999", "name": "T", "configuration": {}})
+    assert config.body["sourceUrl"] == f"{public}/components/keboola.snowflake-transformation/999"
+    flow = b.build_pipeline("keboola.orchestrator", {"id": "f1", "name": "F", "configuration": {}})
+    assert flow.body["sourceUrl"] == f"{public}/flows/f1"

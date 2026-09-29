@@ -147,20 +147,18 @@ class PipelineBuilder:
     def is_flow(self, component_id: str) -> bool:
         return is_flow_component(component_id)
 
-    def _component_url(self, component_id: str, config_id: str) -> str:
-        return f"{self.ui_base}/admin/projects/{self.project_id}/components/{component_id}/{config_id}"
-
-    def _flow_url(self, flow_id: str) -> str:
-        return f"{self.ui_base}/admin/projects/{self.project_id}/flows/{flow_id}"
-
     def _public_base(self) -> str:
-        """Public Keboola connection base URL (``KBC_STACKID``, falls back to ``ui_base``)."""
+        """Public Keboola connection base URL (``KBC_STACKID``, falls back to ``ui_base``).
+
+        Every UI link uses it: inside a job ``ui_base`` (``KBC_URL``) is the internal
+        cluster host, which a browser can't open.
+        """
         return enrichment.connection_base(self.stack_id, self.ui_base)
 
-    def _kbc_component_url(self, component_id: str, config_id: str) -> str:
+    def _component_url(self, component_id: str, config_id: str) -> str:
         return f"{self._public_base()}/admin/projects/{self.project_id}/components/{component_id}/{config_id}"
 
-    def _kbc_flow_url(self, flow_id: str) -> str:
+    def _flow_url(self, flow_id: str) -> str:
         return f"{self._public_base()}/admin/projects/{self.project_id}/flows/{flow_id}"
 
     @staticmethod
@@ -226,7 +224,7 @@ class PipelineBuilder:
         tasks = self._blocks_to_tasks(component_id, configuration)
         if not tasks:
             tasks = self._rows_to_tasks(component_id, config.get("rows") or [])
-        config_url = self._kbc_component_url(component_id, config_id)
+        config_url = self._component_url(component_id, config_id)
         body = _drop_none(
             {
                 "name": fqn.pipeline_name(self.project, config_id),
@@ -304,7 +302,7 @@ class PipelineBuilder:
         flow_id = str(config.get("id"))
         configuration = config.get("configuration") or {}
         tasks = self._flow_to_tasks(configuration)
-        config_url = self._kbc_flow_url(flow_id)
+        config_url = self._flow_url(flow_id)
         body = _drop_none(
             {
                 "name": fqn.pipeline_name(self.project, flow_id),

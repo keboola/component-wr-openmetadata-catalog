@@ -87,26 +87,21 @@ class EntityBuilder:
 
     # --------------------------------------------------------------- helpers
 
-    def _project_url(self) -> str:
-        return f"{self.ui_base}/admin/projects/{self.project_id}/storage"
-
-    def _bucket_url(self, bucket_id: str) -> str:
-        return f"{self.ui_base}/admin/projects/{self.project_id}/storage/{bucket_id}"
-
-    def _table_url(self, bucket_id: str, table_id: str) -> str:
-        return f"{self.ui_base}/admin/projects/{self.project_id}/storage/{bucket_id}/table/{table_id}"
-
     def _public_base(self) -> str:
-        """Public Keboola connection base URL (``KBC_STACKID``, falls back to ``ui_base``)."""
+        """Public Keboola connection base URL (``KBC_STACKID``, falls back to ``ui_base``).
+
+        Every UI link uses it: inside a job ``ui_base`` (``KBC_URL``) is the internal
+        cluster host, which a browser can't open.
+        """
         return enrichment.connection_base(self.stack_id, self.ui_base)
 
-    def _kbc_project_url(self) -> str:
+    def _project_url(self) -> str:
         return f"{self._public_base()}/admin/projects/{self.project_id}/storage"
 
-    def _kbc_bucket_url(self, bucket_id: str) -> str:
+    def _bucket_url(self, bucket_id: str) -> str:
         return f"{self._public_base()}/admin/projects/{self.project_id}/storage/{bucket_id}"
 
-    def _kbc_table_url(self, bucket_id: str, table_id: str) -> str:
+    def _table_url(self, bucket_id: str, table_id: str) -> str:
         return f"{self._public_base()}/admin/projects/{self.project_id}/storage/{bucket_id}/table/{table_id}"
 
     @staticmethod
@@ -151,7 +146,7 @@ class EntityBuilder:
     def _database_extension(self, available: set[str] | None, synced_at: str | None) -> dict | None:
         values = {
             "kbcProjectId": self.project_id,
-            "kbcProjectUrl": enrichment.hyperlink(self._kbc_project_url(), "Open project"),
+            "kbcProjectUrl": enrichment.hyperlink(self._project_url(), "Open project"),
             "kbcSyncedAt": synced_at,
         }
         extension = {k: v for k, v in values.items() if v is not None and (available is None or k in available)}
@@ -182,7 +177,7 @@ class EntityBuilder:
             "kbcStage": bucket.stage,
             "kbcBackend": bucket.backend,
             "kbcSharing": bucket.sharing,
-            "kbcBucketUrl": enrichment.hyperlink(self._kbc_bucket_url(bucket.id), "Open bucket"),
+            "kbcBucketUrl": enrichment.hyperlink(self._bucket_url(bucket.id), "Open bucket"),
             "kbcSyncedAt": synced_at,
         }
         extension = {k: v for k, v in values.items() if v is not None and (available is None or k in available)}
@@ -281,7 +276,7 @@ class EntityBuilder:
             "kbcDataSizeBytes": str(table.data_size_bytes) if table.data_size_bytes is not None else None,
             "kbcLastImport": table.last_import_date,
             "kbcIsAlias": "true" if table.is_alias else "false",
-            "kbcTableUrl": enrichment.hyperlink(self._kbc_table_url(bucket.id, table.id), "Open table"),
+            "kbcTableUrl": enrichment.hyperlink(self._table_url(bucket.id, table.id), "Open table"),
             "kbcSyncedAt": synced_at,
         }
         extension = {k: v for k, v in values.items() if v is not None and (available is None or k in available)}

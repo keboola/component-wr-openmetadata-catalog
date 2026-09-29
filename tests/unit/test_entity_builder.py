@@ -405,3 +405,17 @@ def test_database_body_no_extension_when_no_properties_available():
     body = _builder().database_body(available=set())
     assert "extension" not in body
     assert "owners" not in body
+
+
+INTERNAL_KBC_URL = "http://connection-api.connection.svc.cluster.local"
+
+
+def test_source_urls_use_public_stack_host_not_internal_kbc_url():
+    """Inside a job KBC_URL is the internal cluster host; OM links must open the public UI."""
+    b = EntityBuilder("keboola", "Acme_Project", "1234", INTERNAL_KBC_URL, STACK)
+    bucket = SourceBucket(id="out.c-sales", name="c-sales", stage="out", path="out.c-sales")
+    table = SourceTable(id="out.c-sales.orders", name="orders", columns=[SourceColumn(name="id")])
+    public = "https://connection.us-east4.gcp.keboola.com/admin/projects/1234/storage"
+    assert b.database_body()["sourceUrl"] == public
+    assert b.schema_body(bucket)["sourceUrl"] == f"{public}/out.c-sales"
+    assert b.table_body(bucket, table).body["sourceUrl"] == f"{public}/out.c-sales/table/out.c-sales.orders"
