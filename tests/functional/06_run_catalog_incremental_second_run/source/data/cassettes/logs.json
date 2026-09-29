@@ -1,6 +1,6 @@
 {
   "exit_code": null,
-  "stderr": "No action defined in the configuration, using the default run action.\nRunning on legacy queue some manifest properties will be ignored: ['write_always']\nRunning on legacy queue some manifest properties will be ignored: ['write_always']\n",
+  "stderr": "No action defined in the configuration, using the default run action.\nCould not read the snapshot merge base 'in.c-wr-openmetadata-catalog.last_written_snapshot' (HTTP 401); existing entities will be skipped as diverged this run.\nRunning on legacy queue some manifest properties will be ignored: ['write_always']\nRunning on legacy queue some manifest properties will be ignored: ['write_always']\n",
   "logs": [
     {
       "level": "WARNING",
@@ -18,6 +18,12 @@
       "level": "INFO",
       "logger": "client.om_client",
       "message": "OpenMetadata server version: 1.13.4",
+      "timestamp": "2026-08-24T12:00:00.000Z"
+    },
+    {
+      "level": "WARNING",
+      "logger": "client.storage_reader",
+      "message": "Could not read the snapshot merge base 'in.c-wr-openmetadata-catalog.last_written_snapshot' (HTTP 401); existing entities will be skipped as diverged this run.",
       "timestamp": "2026-08-24T12:00:00.000Z"
     },
     {
