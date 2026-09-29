@@ -2,70 +2,21 @@
   "type": "object",
   "title": "Source",
   "properties": {
-    "scope": {
-      "type": "string",
-      "title": "Scope",
-      "enum": [
-        "this_project",
-        "all_projects"
-      ],
-      "default": "this_project",
-      "description": "What this row catalogs",
-      "options": {
-        "enum_titles": [
-          "This project",
-          "All organization projects"
-        ],
-        "tooltip": "This project catalogs a single project via a Storage token (or the forwarded host-project token). All organization projects enumerates the org with a Management token and writes every project it finds."
-      },
-      "propertyOrder": 10
-    },
     "#storage_token": {
       "type": "string",
       "title": "Storage Token",
       "format": "password",
       "description": "Read-only Storage token for this project",
       "options": {
-        "dependencies": {
-          "scope": "this_project"
-        },
         "tooltip": "Leave empty to catalog the config's own (host) project via the forwarded token. Required for any other project: create a read-only Storage token in that project and paste it here."
       },
       "propertyOrder": 20
-    },
-    "#manage_token": {
-      "type": "string",
-      "title": "Management Token",
-      "format": "password",
-      "description": "Management API token with manage:storage-tokens scope",
-      "options": {
-        "dependencies": {
-          "scope": "all_projects"
-        },
-        "tooltip": "Org-wide credential used only to enumerate projects and mint short-lived read-only Storage tokens. Host the config in a locked-down admin project."
-      },
-      "propertyOrder": 30
-    },
-    "organization_id": {
-      "type": "string",
-      "title": "Organization ID",
-      "description": "Keboola organization to enumerate",
-      "options": {
-        "dependencies": {
-          "scope": "all_projects"
-        },
-        "tooltip": "Enumeration is bound to this single organization via GET /manage/organizations/{id}/projects; the component never lists all organizations."
-      },
-      "propertyOrder": 40
     },
     "project_name_override": {
       "type": "string",
       "title": "Project Name Override (Optional)",
       "description": "Optional human-readable OpenMetadata Database name",
       "options": {
-        "dependencies": {
-          "scope": "this_project"
-        },
         "tooltip": "Defaults to the project name resolved from the token."
       },
       "propertyOrder": 50
@@ -75,11 +26,6 @@
       "title": "Objects",
       "description": "Which object families to catalog from this project",
       "propertyOrder": 60,
-      "options": {
-        "dependencies": {
-          "scope": "this_project"
-        }
-      },
       "properties": {
         "write_buckets": {
           "type": "boolean",
@@ -147,8 +93,7 @@
               "action": "listTransformations",
               "autoload": true,
               "cache": true
-            },
-            "tooltip": "Only selectable for a single project. An organization-wide row emits every eligible transformation it finds in each project."
+            }
           },
           "propertyOrder": 40
         },
@@ -184,7 +129,7 @@
               "autoload": true,
               "cache": true
             },
-            "tooltip": "Only selectable for a single project. Covers non-transformation configurations, e.g. a MySQL extractor configuration lives here, not under Transformations."
+            "tooltip": "Covers non-transformation configurations, e.g. a MySQL extractor configuration lives here, not under Transformations."
           },
           "propertyOrder": 60
         },
@@ -219,8 +164,7 @@
               "action": "listFlows",
               "autoload": true,
               "cache": true
-            },
-            "tooltip": "Only selectable for a single project. An organization-wide row emits every eligible flow it finds in each project."
+            }
           },
           "propertyOrder": 80
         },
@@ -256,36 +200,11 @@
               "autoload": true,
               "cache": true
             },
-            "tooltip": "Only selectable for a single project. An organization-wide row emits every eligible data app it finds in each project. Each data app becomes a Dashboard entity (keboola.data-apps) with upstream table lineage from its input mapping."
+            "tooltip": "Each data app becomes a Dashboard entity (keboola.data-apps) with upstream table lineage from its input mapping."
           },
           "propertyOrder": 100
         }
       }
-    },
-    "projects": {
-      "type": "array",
-      "title": "Only these projects",
-      "format": "select",
-      "uniqueItems": true,
-      "description": "Projects to catalog (empty = all organization projects)",
-      "items": {
-        "type": "string",
-        "enum": []
-      },
-      "options": {
-        "dependencies": {
-          "scope": "all_projects"
-        },
-        "tags": true,
-        "async": {
-          "label": "Load Projects",
-          "action": "listProjects",
-          "autoload": true,
-          "cache": true
-        },
-        "tooltip": "Every family (buckets, configurations, flows, data apps) is written for each selected project; there is no per-family filter in this scope."
-      },
-      "propertyOrder": 70
     },
     "advanced": {
       "type": "object",

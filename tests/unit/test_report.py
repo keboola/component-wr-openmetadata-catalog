@@ -1,6 +1,5 @@
 from report import (
     ACTION_CREATED,
-    ACTION_DEGRADED,
     ACTION_FAILED,
     ACTION_UNRESOLVED,
     REPORT_PRIMARY_KEY,
@@ -30,11 +29,10 @@ def test_report_row_shape_and_null_safe_config_row_id():
 def test_new_action_values_recorded():
     report = RunReport(run_id="r", config_row_id="row-9")
     report.record(project_id="p", entity_type="Column", entity_fqn="a", action=ACTION_UNRESOLVED)
-    report.record(project_id="p", entity_type="Project", entity_fqn="b", action=ACTION_DEGRADED)
     report.record(project_id="p", entity_type="Table", entity_fqn="c", action=ACTION_FAILED)
     counts = report.counts()
     assert counts["unresolved"] == 1
-    assert counts["degraded"] == 1
+    assert "degraded" not in counts
     assert counts["failed"] == 1
     assert report.has_failures() is True
 

@@ -1,8 +1,8 @@
 """keboola.wr-openmetadata-catalog — Keboola -> OpenMetadata catalog + lineage writer.
 
-``run()`` is a thin orchestrator (spec 6.2): validate -> resolve the project set
-(Tier-1 row, or Tier-2 enumerate+mint with graceful degradation) -> open the
-optional SSH tunnel -> probe the OM version -> per project run the catalog,
+``run()`` is a thin orchestrator (spec 6.2): validate -> resolve the row's one
+project (host project via the forwarded token, or the row ``#storage_token``) ->
+open the optional SSH tunnel -> probe the OM version -> run the catalog,
 pipeline, lineage and tombstone passes with three-way merge -> write the
 snapshot/state/report -> raise at the end in collect_and_fail mode.
 """
@@ -29,10 +29,9 @@ import report as report_mod
 from client import ssh_proxy
 from client.data_app_reader import fetch_app_states
 from client.job_queue_reader import JobQueueReader
-from client.manage_client import ManageClient, ManageScopeError
 from client.om_client import OMAuthError, OMClient, OMClientError, OMPreconditionFailed
 from client.storage_reader import SourceBucket, SourceTable, StorageReader, resolve_storage_credentials
-from configuration import Configuration, FailureMode, ProjectScope
+from configuration import Configuration, FailureMode
 from lineage.column_lineage import LineageResult, extract_column_lineage
 from lineage.dialect import dialect_for
 from mapping import fqn as fqn_mod
@@ -200,15 +199,12 @@ class CredentialScrubber(BaseSanitizer):
 #
 # ``DefaultSanitizer`` covers every secret this writer handles in two ways:
 #   1. It whitelists request/response headers to {content-type, content-length,
-#      accept}, so the three auth headers that carry our tokens are stripped from
-#      every recorded interaction: ``Authorization: Bearer <#bot_token>`` (OM),
-#      ``X-StorageApi-Token`` (Keboola Storage token / KBC_TOKEN / Tier-2 minted
-#      token) and ``X-KBC-ManageApiToken`` (``#manage_token``).
+#      accept}, so the two auth headers that carry our tokens are stripped from
+#      every recorded interaction: ``Authorization: Bearer <#bot_token>`` (OM) and
+#      ``X-StorageApi-Token`` (the row ``#storage_token`` / forwarded KBC_TOKEN).
 #   2. It redacts sensitive JSON fields by name in request/response bodies. We add
-#      ``token`` — the read-only Storage token the Management API returns in the
-#      Tier-2 mint response body (``POST /manage/projects/{id}/tokens``) and that
-#      the component then round-trips as a header — plus the ``#``-prefixed config
-#      keys, so no secret value survives inside a body either.
+#      ``token`` (defense-in-depth for a token value echoed in a body) plus the
+#      ``#``-prefixed config keys, so no secret value survives inside a body either.
 #
 # The OM host and the Keboola stack host are deliberately NOT sanitized: both are
 # public (the OM public sandbox / a public stack URL) and the request URI is the
@@ -227,13 +223,12 @@ class CredentialScrubber(BaseSanitizer):
 VCR_SANITIZERS = [
     DefaultSanitizer(
         additional_sensitive_fields=[
-            "token",  # Tier-2 minted read-only Storage token in the mint response body
+            "token",
             "botToken",
             "jwtToken",
             "privateKey",
             "#bot_token",
             "#storage_token",
-            "#manage_token",
             "#private_key",
         ],
     ),
@@ -297,28 +292,19 @@ class Component(ComponentBase):
         state = StateManager(self.get_state_file() or {})
         state.run_count += 1
 
-        projects, degraded_reason = self._resolve_projects(config, env)
+        project = self._resolve_project(config, env)
         proxy = ssh_proxy.maybe_open_tunnel(config)
         # One snapshot time for the whole run, shared by every entity's
-        # kbcSyncedAt custom property (across all passes and all projects) —
-        # the same run-level snapshot the dashboard pass already stamped.
+        # kbcSyncedAt custom property (across all passes) — the same run-level
+        # snapshot the dashboard pass already stamped.
         synced_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
         try:
             om = self._build_om_client(config, proxy)
             om.probe_version()
             server_version = om.server_version
             version_changed = state.om_version_seen not in (None, server_version)
-            snapshot = self._load_snapshot(config, env, projects, state)
-            if degraded_reason:
-                report.record(
-                    project_id=None,
-                    entity_type="Project",
-                    entity_fqn="*",
-                    action=report_mod.ACTION_DEGRADED,
-                    detail=degraded_reason,
-                )
-            for project in projects:
-                self._process_project(config, om, project, env, state, snapshot, report, version_changed, synced_at)
+            snapshot = self._load_snapshot(env, state)
+            self._process_project(config, om, project, env, state, snapshot, report, version_changed, synced_at)
             state.om_version_seen = server_version
         finally:
             if proxy is not None:
@@ -363,12 +349,9 @@ class Component(ComponentBase):
 
     # ------------------------------------------------------ project resolve
 
-    def _resolve_projects(self, config: Configuration, env: dict) -> tuple[list[ProjectContext], str | None]:
-        if config.scope == ProjectScope.ALL_PROJECTS:
-            return self._resolve_tier2(config, env)
-        return [self._resolve_host_or_row(config, env)], None
-
-    def _resolve_host_or_row(self, config: Configuration, env: dict) -> ProjectContext:
+    @staticmethod
+    def _resolve_project(config: Configuration, env: dict) -> ProjectContext:
+        """The one project this row catalogs: the row ``#storage_token``'s project, else the host project."""
         token, url = resolve_storage_credentials(
             row_token=config.storage_token,
             injected_token=env["token"],
@@ -384,46 +367,10 @@ class Component(ComponentBase):
             storage_url=url,
         )
 
-    def _resolve_tier2(self, config: Configuration, env: dict) -> tuple[list[ProjectContext], str | None]:
-        host = (env["url"] or "https://connection.keboola.com").rstrip("/")
-        client = ManageClient(host, config.manage_token or "")
-        try:
-            if not config.organization_id:
-                raise ManageScopeError("organization_id is required for Tier-2 enumeration.")
-            enumerated = client.enumerate_projects(config.organization_id)
-            if config.projects:
-                # Narrow to the user-selected projects *before* minting a token — a
-                # project the user excluded from the row's `projects` select must
-                # never get a (short-lived, but blast-radius-bearing) minted token.
-                enumerated = [p for p in enumerated if str(p.get("id")) in config.projects]
-            if not enumerated:
-                raise ManageScopeError("No projects enumerated for the organization.")
-            minted = [
-                client.mint_storage_token(str(p.get("id")), p.get("name") or str(p.get("id"))) for p in enumerated
-            ]
-        except ManageScopeError as exc:
-            logger.warning("Tier-2 enumeration failed (%s); degrading to the host project.", exc)
-            return [self._resolve_host_or_row(config, env)], f"Tier-2 org enumeration unavailable: {exc}"
-        contexts = [
-            ProjectContext(
-                project_id=m.project_id,
-                project_name=m.project_name,
-                storage_token=m.storage_token,
-                storage_url=m.storage_url,
-            )
-            for m in minted
-        ]
-        return contexts, None
-
     # -------------------------------------------------------------- snapshot
 
-    def _load_snapshot(
-        self,
-        config: Configuration,
-        env: dict,
-        projects: list[ProjectContext],
-        state: StateManager,
-    ) -> SnapshotStore:
+    @staticmethod
+    def _load_snapshot(env: dict, state: StateManager) -> SnapshotStore:
         snapshot = SnapshotStore()
         if not state.snapshot_table or not env["token"] or not env["url"]:
             return snapshot
@@ -627,9 +574,7 @@ class Component(ComponentBase):
 
     @staticmethod
     def _data_app_in_scope(config: Configuration, cfg_id: str) -> bool:
-        """``data_apps`` selector filter (empty = all), scope-guarded like the others."""
-        if config.scope != ProjectScope.THIS_PROJECT:
-            return True
+        """``data_apps`` selector filter (empty = all), like the other families."""
         return not (config.data_apps and cfg_id not in config.data_apps)
 
     def _pipeline_pass(
@@ -709,11 +654,8 @@ class Component(ComponentBase):
         """Family enable-gate + selector filter for one pipeline-eligible config.
 
         Mirrors ``_bucket_in_scope``: the family checkbox gates the whole kind
-        (flow/transformation/component), the matching selector narrows it
-        further (empty = all), and — as before the object-family split — a
-        selector only applies within a single known project: an ``all_projects``
-        row writes every eligible config/flow the family enables, since the
-        selector ids can't map across projects.
+        (flow/transformation/component) and the matching selector narrows it
+        further (empty = all).
         """
         if kind == "orchestration":
             enabled, selector = config.write_flows, config.flows
@@ -723,8 +665,6 @@ class Component(ComponentBase):
             enabled, selector = config.write_components, config.components
         if not enabled:
             return False
-        if config.scope != ProjectScope.THIS_PROJECT:
-            return True
         return not (selector and cfg_id not in selector)
 
     @staticmethod
@@ -1428,22 +1368,6 @@ class Component(ComponentBase):
                 name = cfg.get("name") or str(cfg.get("id"))
                 elements.append(SelectElement(value=str(cfg.get("id")), label=name))
         return elements
-
-    @sync_action("listProjects")
-    def list_projects(self) -> list[SelectElement]:
-        config = Configuration(**self.configuration.parameters)
-        env = self._read_environment()
-        if not config.manage_token or not config.organization_id:
-            raise UserException(
-                "Listing projects requires both a Management Token (#manage_token) and an Organization ID."
-            )
-        host = (env["url"] or "https://connection.keboola.com").rstrip("/")
-        client = ManageClient(host, config.manage_token)
-        try:
-            projects = client.enumerate_projects(config.organization_id)
-        except ManageScopeError as exc:
-            raise UserException(str(exc)) from exc
-        return [SelectElement(value=str(p.get("id")), label=f"{p.get('id')} ({p.get('name')})") for p in projects]
 
 
 if __name__ == "__main__":

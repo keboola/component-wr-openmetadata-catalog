@@ -66,7 +66,7 @@ def test_version_change_forces_reprocess():
     )
 
 
-def test_state_manager_tier2_per_project_keying():
+def test_state_manager_per_project_keying():
     sm = StateManager({"projects": {"p1": {"bucket_digests": {"in.c-a": "d1"}}}, "run_count": 5})
     assert sm.bucket_digest("p1", "in.c-a") == "d1"
     assert sm.bucket_digest("p2", "in.c-a") is None

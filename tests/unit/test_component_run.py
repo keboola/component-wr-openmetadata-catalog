@@ -24,7 +24,7 @@ import report as report_mod
 from client.om_client import OMClient, OMNotFound
 from client.storage_reader import SourceBucket, SourceColumn, SourceTable
 from component import ProjectContext, _ProjectRun
-from configuration import FailureMode, MergeMode, ProjectScope
+from configuration import FailureMode, MergeMode
 from mapping import entity_builder, lineage_builder
 from mapping import fqn as fqn_mod
 from mapping import pipeline_builder as pipeline_builder_mod
@@ -511,7 +511,6 @@ def _run_custom_props_passes(om, *, fail_entity_type: str | None = None):
     comp._config = SimpleNamespace(failure_mode=FailureMode.COLLECT_AND_FAIL)  # ty: ignore[invalid-assignment]
     catalog_config = SimpleNamespace(full_refresh=True, buckets=[], write_buckets=True)
     pipeline_config = SimpleNamespace(
-        scope=ProjectScope.THIS_PROJECT,
         write_flows=True,
         flows=[],
         write_transformations=True,
@@ -1213,7 +1212,6 @@ def _run_pipeline_pass(config_overrides: dict) -> tuple[_PipelineRecordingOM, co
     run = _family_gating_run()
     report = component_mod.RunReport(run_id="rid")
     base = {
-        "scope": ProjectScope.THIS_PROJECT,
         "write_transformations": True,
         "transformations": [],
         "write_components": True,
@@ -1281,7 +1279,6 @@ def test_pipeline_pass_all_families_off_skips_component_fetch():
         dashboards=DashboardBuilder("keboola-stack", "Proj", "4214", "https://ui.example"),
     )
     config = SimpleNamespace(
-        scope=ProjectScope.THIS_PROJECT,
         write_transformations=False,
         transformations=[],
         write_components=False,
@@ -1338,7 +1335,7 @@ def test_dashboard_pass_data_apps_selector_narrows_to_subset():
         dashboards=DashboardBuilder(svc, proj, pid, "https://ui", "connection.keboola.com"),
     )
     report = component_mod.RunReport(run_id="rid")
-    config = SimpleNamespace(scope=ProjectScope.THIS_PROJECT, data_apps=["some-other-app"])
+    config = SimpleNamespace(data_apps=["some-other-app"])
 
     comp = component_mod.Component.__new__(component_mod.Component)
     comp._dashboard_pass(config, om, run, SnapshotStore(), report, ThreeWayMerger(MergeMode.THREE_WAY_MERGE))  # ty: ignore[invalid-argument-type]

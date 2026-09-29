@@ -27,20 +27,6 @@ from keboola.datadirtest.vcr import VCRDataDirTester, VCRTestDataDir, get_test_c
 # tests/setup/README.md ("Incremental-skip state override").
 _STATE_OVERRIDE_CASE = "06_run_catalog_incremental_second_run"
 
-# Recorded run-mode cases that no longer replay against the current component and
-# are SKIPPED pending a re-record. Their committed config.json pins pre-redesign
-# field names (write_pipelines / write_lineage and the flat behaviour params) that
-# the config redesign removed, and they predate the owners / custom-property HTTP,
-# so replay drifts (the pipeline pass now enumerates components and issues
-# un-recorded calls -> exit 2). A faithful re-record needs an ISOLATED OpenMetadata
-# 1.13.4 tenant: the public sandbox is 2.0.x (wrong feature surface) and recording
-# against the shared GCP instance would pollute it. The redesigned behaviour is
-# covered by tests/unit meanwhile. Remove a name here once its cassette is
-# re-recorded (see tests/setup/README.md).
-_PENDING_RERECORD = {
-    "19_run_tier2_all_projects",
-}
-
 FUNCTIONAL_DIR = str(Path(__file__).parent / "functional")
 COMPONENT_SCRIPT = str(Path(__file__).parent.parent / "src" / "component.py")
 
@@ -69,7 +55,7 @@ KBC_ENV = {
     "KBC_CONFIGID": "vcr-test",
     # Replay-only dummy (the auth header is stripped from every cassette). At
     # record time export a REAL read-only Storage token for the forward_token
-    # cases (16, and the 20 degrade fallback).
+    # case (16).
     "KBC_TOKEN": "dummy-storage-token-replay",
 }
 
@@ -77,11 +63,6 @@ KBC_ENV = {
 @pytest.mark.parametrize("test_name", get_test_cases(FUNCTIONAL_DIR))
 def test_functional(test_name, monkeypatch):
     """Replay a single recorded VCR functional case."""
-    if test_name in _PENDING_RERECORD:
-        pytest.skip(
-            f"{test_name}: cassette pins pre-redesign config fields and predates the "
-            "owners/custom-property HTTP; pending re-record against an isolated OM 1.13.4."
-        )
     for key, value in KBC_ENV.items():
         monkeypatch.setenv(key, value)
     # A non-row run: config_row_id is recorded as null; the data-type gate is off.

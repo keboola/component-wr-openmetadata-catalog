@@ -1,7 +1,7 @@
 """Incremental per-bucket digest + tombstoning (spec 2.3 / 6.2, T16).
 
-Incremental skip: a per-bucket content digest lives in ``state.json`` (Tier-2
-keyed ``project_id -> {bucket -> digest}``). A bucket whose digest is unchanged
+Incremental skip: a per-bucket content digest lives in ``state.json`` (keyed
+``project_id -> {bucket -> digest}``). A bucket whose digest is unchanged
 is skipped unless ``full_refresh``, a version change, or the auto-cadence fires.
 Digests advance only *after* that bucket's OM writes succeed (advance-after-
 success), so a mid-run failure re-processes the affected buckets next run.

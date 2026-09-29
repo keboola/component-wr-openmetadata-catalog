@@ -6,4 +6,4 @@ Every run publishes:
 - **Pipelines** — component configurations and flows as OpenMetadata pipelines, including run-history status read from the Job Queue.
 - **Lineage** — declared table-level lineage derived from producer input/output mapping, and column-level lineage parsed from transformation SQL.
 
-Writes use a three-way merge that preserves manual edits made in OpenMetadata, and an incremental per-bucket digest skips unchanged buckets between runs. Connect to your OpenMetadata host with a JWT bot token — optionally through an SSH bastion — and catalog one project per configuration row, or every project in an organization with a management token.
+Writes use a three-way merge that preserves manual edits made in OpenMetadata, and an incremental per-bucket digest skips unchanged buckets between runs. Connect to your OpenMetadata host with a JWT bot token — optionally through an SSH bastion — and catalog one project per configuration row: the configuration's own project, or another project on the same stack via a Storage token.

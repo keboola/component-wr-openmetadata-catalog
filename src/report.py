@@ -48,7 +48,6 @@ ACTION_SKIPPED_UNCHANGED = "skipped_unchanged"
 ACTION_SKIPPED_DIVERGED = "skipped_diverged"
 ACTION_TOMBSTONED = "tombstoned"
 ACTION_UNRESOLVED = "unresolved"
-ACTION_DEGRADED = "degraded"
 ACTION_FAILED = "failed"
 
 

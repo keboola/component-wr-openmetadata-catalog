@@ -32,16 +32,11 @@ def _reader(routes):
     return StorageReader("https://connection.keboola.com", "tok", session=session)
 
 
-def test_resolve_credentials_prefers_minted():
-    tok, url = resolve_storage_credentials(
-        row_token="row",
-        injected_token="inj",
-        injected_url="https://x",
-        minted_token="minted",
-        minted_url="https://m/",
-    )
-    assert tok == "minted"
-    assert url == "https://m"
+def test_resolve_credentials_row_token_wins_over_forwarded():
+    # A row #storage_token targets another project on the same stack, so it beats
+    # the forwarded host-project token but keeps the forwarded stack URL.
+    tok, url = resolve_storage_credentials(row_token="row", injected_token="inj", injected_url="https://x/")
+    assert (tok, url) == ("row", "https://x")
 
 
 def test_resolve_credentials_row_then_forward():

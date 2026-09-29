@@ -1,7 +1,7 @@
 # VCR functional tests — recording guide
 
 These tests replay recorded HTTP interactions against **two** APIs — OpenMetadata
-(OM) and the Keboola Storage / Configurations / Management / Job-Queue APIs — so
+(OM) and the Keboola Storage / Configurations / Job-Queue APIs — so
 the suite runs in CI with no live credentials. Cassettes are **recorded from real
 interactions** with the `keboola.datadirtest` scaffolder; **never hand-author or
 hand-patch a cassette** (regenerate instead).
@@ -58,8 +58,8 @@ Then verify replay: `uv run pytest tests/test_functional.py -v`, and run the
 
 ## Bucket subset (run-mode cassettes)
 
-The run-mode catalog/merge/Tier-2 cases —
-`05, 06, 07, 09, 11, 12, 16, 19` — record against a **64-bucket subset**
+The run-mode catalog/merge cases —
+`05, 06, 07, 09, 11, 12, 16` — record against a **64-bucket subset**
 of project **4214** (`[CF] New Features Testing`), pinned in their config as
 `parameters.buckets` and mirrored in `tests/setup/subset_buckets_4214.json`.
 
@@ -100,10 +100,6 @@ secrets. Even so, 08/10 stay out of the committed VCR set: `?include=configurati
 is inherently a whole-project secret surface and must not be recorded against a
 real project.
 
-**Tier-2 case (19):** `organization_id` is `3697` (not a secret — kept literal in
-`configs.json`); the org has 4 projects but only 4214 holds data, so 19 catalogs
-4214's subset and creates empty databases for the other three.
-
 ## Incremental-skip state override (case 06)
 
 `06_run_catalog_incremental_second_run` is recorded **after 05 with `--chain-state`**
@@ -134,9 +130,7 @@ Most success cases record straight from the sandbox + scratch project with the
 | `11`/`12` merge (`skipped_diverged` / overwrite) | OM-only pre-seed (no Storage snapshot base — recorded with empty state, so the "base" is the pre-seeded OM): (1) run the catalog once into a fresh OM service to create all entities; (2) `PATCH` one table's `description` (an owned field) via the bot token so OM diverges from the Keboola-derived value; (3) record. `11` (`three_way_merge`) leaves it → `skipped_diverged`; `12` (`keboola_always_wins`) overwrites it → `updated`; the rest are `skipped_unchanged`. |
 | `13`/`14`/`15` failure_mode | Need **one** OM entity write to fail deterministically (a seeded conflict / a payload OM rejects) so `catalog_run_report` gets an `action=failed` row. |
 | `16_run_host_project_forward_token` | Omit `#storage_token` from `--secrets` for this pass and export a **real read-only `KBC_TOKEN`** (forward_token path). |
-| `17`/`18` config-validation failures | No HTTP — empty cassette, `expected_status.json` exit 1. Record straight through. `#manage_token` must stay absent from `secrets.json` for `18`. |
-| `19_run_tier2_all_projects` | Needs a real `manage:storage-tokens` **manage token** + `organization_id`; add `#manage_token` to `--secrets` for this pass only. If unavailable, record later / against a mock — do not block the phase. |
-| `20_run_tier2_degrade` | Needs a **scope-limited** manage token (or a mocked 401/403) + a real `KBC_TOKEN` for the host-project fallback. Conditional, like `19`. |
+| `17_run_ssh_tunnel_missing_block` | Config-validation failure: no HTTP — empty cassette, `expected_status.json` exit 1. Record straight through. |
 | `21_testConnection_unreachable_host` | Records a real connection error (unreachable `om_host`); the retry/backoff makes this the slowest recording (~15 s). Maps to `OMConnectionError` → `UserException` → **exit 1** (spec §6.3). |
 
 ## Sanitizers (secrets scrubbed from cassettes)
@@ -145,11 +139,9 @@ Most success cases record straight from the sandbox + scratch project with the
 
 1. **`DefaultSanitizer`** (1) whitelists request/response headers to
    `{content-type, content-length, accept}` — so `Authorization: Bearer <#bot_token>`
-   (OM), `X-StorageApi-Token` (Storage token / `KBC_TOKEN` / Tier-2 minted token) and
-   `X-KBC-ManageApiToken` (`#manage_token`) are stripped from every interaction — and
-   (2) redacts sensitive body fields by exact name, extended with `token` (the Tier-2
-   minted Storage token returned in the mint response body) and the `#`-prefixed
-   config keys.
+   (OM) and `X-StorageApi-Token` (the row `#storage_token` / `KBC_TOKEN`) are stripped
+   from every interaction — and (2) redacts sensitive body fields by exact name,
+   extended with `token` and the `#`-prefixed config keys.
 
 2. **`CredentialScrubber`** (defense-in-depth for *foreign* secrets that the exact
    field-name list can never enumerate ahead of time). It walks every recorded

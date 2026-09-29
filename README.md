@@ -43,30 +43,30 @@ Authentication
 ==============
 
 - **OpenMetadata:** a JWT bot token (`#bot_token`), `Authorization: Bearer`.
-- **Keboola Storage:** the host project uses the forwarded token; additional
-  projects use a per-row read-only `#storage_token` (Tier-1) or a single
-  `#manage_token` that enumerates the org and mints short-lived read-only tokens
-  (Tier-2, degrades to the host project when the token lacks scope).
+- **Keboola Storage:** each config row catalogs exactly one project. Leave the row's
+  `#storage_token` empty to catalog the configuration's own (host) project via the
+  forwarded token, or paste a Storage token of another project on the same stack to
+  catalog that one — add one row per project.
 
 Configuration
 =============
 
 The root config holds only the OpenMetadata **connection** (host, bot token, optional
-SSH tunnel). Each config **row is one source**: its scope (this project / all
-organization projects), the Storage (or management) token, which object families to
-catalog — **buckets, transformations, components, flows, data apps**, each with an
-optional selector (empty = all) — and, under **Advanced**, the per-object lineage
-toggles, pipeline status, full refresh, merge mode and failure mode. See
-`component_config/configSchema.json` (root) and `component_config/configRowSchema.json`
-(row). Sync actions: **testConnection**, **listBuckets**, **listTransformations**,
-**listComponents**, **listFlows**, **listDataApps**, **listProjects**.
+SSH tunnel). Each config **row is one project**: an optional Storage token (empty =
+the host project), which object families to catalog — **buckets, transformations,
+components, flows, data apps**, each with an optional selector (empty = all) — and,
+under **Advanced**, the per-object lineage toggles, pipeline status, full refresh,
+merge mode and failure mode. See `component_config/configSchema.json` (root) and
+`component_config/configRowSchema.json` (row). Sync actions: **testConnection**,
+**listBuckets**, **listTransformations**, **listComponents**, **listFlows**,
+**listDataApps**.
 
 Output tables
 =============
 
 - `catalog_run_report` — one row per entity action (`created` / `updated` /
   `skipped_unchanged` / `skipped_diverged` / `tombstoned` / `unresolved` /
-  `degraded` / `failed`); `write_always`, so it survives a failing job.
+  `failed`); `write_always`, so it survives a failing job.
 - `last_written_snapshot` — the three-way-merge base (last-written fields per FQN).
 
 Development

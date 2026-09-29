@@ -7,7 +7,7 @@ flows/orchestrations needed for the pipeline and lineage passes.
 
 The component only ever *reads*; a read-only Storage token is sufficient. The
 caller resolves which credential to use (row ``#storage_token`` / injected
-``KBC_TOKEN`` / a Tier-2 minted token) via :func:`resolve_storage_credentials`.
+``KBC_TOKEN``) via :func:`resolve_storage_credentials`.
 """
 
 from __future__ import annotations
@@ -36,25 +36,20 @@ def resolve_storage_credentials(
     row_token: str | None,
     injected_token: str | None,
     injected_url: str | None,
-    minted_token: str | None = None,
-    minted_url: str | None = None,
 ) -> tuple[str, str]:
     """Resolve ``(token, base_url)`` for a project (spec 3.2).
 
-    Priority: a Tier-2 minted token, else the row ``#storage_token``, else the
+    Priority: the row ``#storage_token`` (a project on the same stack), else the
     injected ``KBC_TOKEN``/``KBC_URL`` (``forward_token``). Raises
     ``UserException`` when no usable credential exists.
     """
-    if minted_token and minted_url:
-        return minted_token, minted_url.rstrip("/")
     if row_token:
         url = injected_url or "https://connection.keboola.com"
         return row_token, url.rstrip("/")
     if injected_token and injected_url:
         return injected_token, injected_url.rstrip("/")
     raise UserException(
-        "No Storage credential available: provide a row #storage_token, or enable forward_token "
-        "for the host project, or configure a Tier-2 #manage_token."
+        "No Storage credential available: provide a row #storage_token, or enable forward_token for the host project."
     )
 
 

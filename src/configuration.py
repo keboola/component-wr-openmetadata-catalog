@@ -18,13 +18,6 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 logger = logging.getLogger(__name__)
 
 
-class ProjectScope(StrEnum):
-    """Which multi-project seam to use (spec 5.4)."""
-
-    THIS_PROJECT = "this_project"
-    ALL_PROJECTS = "all_projects"
-
-
 class MergeMode(StrEnum):
     """How a divergence between OM and our last-written value is resolved."""
 
@@ -65,11 +58,6 @@ class Configuration(BaseModel):
     bot_token: str = Field(alias="#bot_token")
     service_name: str | None = None
 
-    # --- Scope / multi-project (row) ---
-    scope: ProjectScope = ProjectScope.THIS_PROJECT
-    manage_token: str | None = Field(default=None, alias="#manage_token")
-    organization_id: str | None = None
-
     # --- Behaviour (row, Advanced) ---
     merge_mode: MergeMode = MergeMode.THREE_WAY_MERGE
     failure_mode: FailureMode = FailureMode.COLLECT_AND_FAIL
@@ -89,13 +77,14 @@ class Configuration(BaseModel):
     use_ssh_tunnel: bool = False
     ssh: Ssh | None = None
 
-    # --- Row-level ---
+    # --- Row-level: each row catalogs exactly one project — the host project via the
+    # forwarded KBC_TOKEN, or another project via this row's #storage_token. ---
     storage_token: str | None = Field(default=None, alias="#storage_token")
     project_name_override: str | None = None
 
     # --- Object families (spec: split the pipeline family into Transformations vs
     # Components; each family is an enable bool + a selector list, mirroring
-    # ``buckets`` -- an empty selector means "all", scoped to THIS_PROJECT only). ---
+    # ``buckets`` -- an empty selector means "all"). ---
     write_buckets: bool = True
     buckets: list[str] = Field(default_factory=list)
     write_transformations: bool = True
@@ -106,7 +95,6 @@ class Configuration(BaseModel):
     flows: list[str] = Field(default_factory=list)
     write_data_apps: bool = True
     data_apps: list[str] = Field(default_factory=list)
-    projects: list[str] = Field(default_factory=list)
 
     def __init__(self, **data: object) -> None:
         try:
@@ -146,17 +134,6 @@ class Configuration(BaseModel):
     @model_validator(mode="after")
     def _check_cross_fields(self) -> Configuration:
         """Cross-field rules that map to config-error exit codes (spec 6.3)."""
-        if self.scope == ProjectScope.ALL_PROJECTS:
-            missing: list[str] = []
-            if not self.manage_token:
-                missing.append("a Management API token (#manage_token)")
-            if not self.organization_id:
-                missing.append("an organization_id")
-            if missing:
-                raise UserException(
-                    f"scope='all_projects' requires {' and '.join(missing)}. "
-                    "Provide the missing value(s) or switch scope to 'this_project'."
-                )
         if self.use_ssh_tunnel and self.ssh is None:
             raise UserException("use_ssh_tunnel is enabled but the 'ssh' configuration block is missing.")
         return self
