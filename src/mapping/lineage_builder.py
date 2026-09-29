@@ -405,8 +405,9 @@ def to_add_lineage_request(
     details: dict = {"source": edge.source}
     if edge.columns_lineage:
         details["columnsLineage"] = edge.columns_lineage
-    if edge.temp_lineage_tables:
-        details["tempLineageTables"] = edge.temp_lineage_tables
+    # edge.temp_lineage_tables is deliberately not sent: OM types tempLineageTables
+    # as ordered {fromEntity, toEntity} hops, and we only know the set of temp table
+    # names, which OM rejects with 400 "Invalid request format".
     if edge.sql_query:
         details["sqlQuery"] = edge.sql_query
     if edge.pipeline_fqn:

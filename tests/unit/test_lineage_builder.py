@@ -374,7 +374,10 @@ def test_e17_end_to_end_sql_to_add_lineage_request():
     assert req["edge"]["fromEntity"] == {"id": "id-src", "type": "table"}
     assert req["edge"]["toEntity"] == {"id": "id-result", "type": "table"}
     assert details["source"] == SOURCE_QUERY
-    assert details["tempLineageTables"] == ["stg"]
+    # OM 1.13.4 types tempLineageTables as ordered {fromEntity, toEntity} hop objects;
+    # we only know the set of temp table names, and a list of strings is rejected with
+    # 400 "Invalid request format" (7 live edges failed that way). It is not sent.
+    assert "tempLineageTables" not in details
     assert details["pipeline"] == {"id": "id-pipe", "type": "pipeline"}
     to_cols = {c["toColumn"] for c in details["columnsLineage"]}
     assert to_cols == {
