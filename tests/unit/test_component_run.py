@@ -284,15 +284,16 @@ def test_log_only_does_not_raise(tmp_path, monkeypatch, _env):
 
 
 class _RecordingOM:
-    """OM double that records every write; get returns None (create path)."""
+    """OM double that records every write; get returns ``existing`` entities, else None (create path)."""
 
-    def __init__(self):
+    def __init__(self, existing: dict[tuple[str, str], dict] | None = None):
         self.put_calls: list[tuple[str, str | None]] = []
         self.patch_calls: list[tuple[str, str]] = []
         self.is_2_0_or_newer = False
+        self.existing = existing or {}
 
     def get_by_fqn(self, kind, fqn, fields=None):
-        return None
+        return self.existing.get((kind, fqn))
 
     def put_entity(self, kind, body):
         self.put_calls.append((kind, body.get("name")))
@@ -338,11 +339,19 @@ def test_incremental_skip_is_tombstone_safe_and_writes_nothing():
     digest = bucket_digest(digest_fields(bucket), [digest_fields(t) for t in tables])
     state = StateManager({"projects": {pid: {"bucket_digests": {bucket.id: digest}}}, "run_count": 1})
 
-    om = _RecordingOM()
+    entities = EntityBuilder(svc, proj, pid, "https://ui.example")
+    # A real second run: the service + database already exist in OM exactly as written
+    # (were they absent, the saved digests could not be trusted and the bucket would sync).
+    om = _RecordingOM(
+        existing={
+            ("databaseServices", svc): entities.database_service_body(),
+            ("databases", f"{svc}.{proj}"): entities.database_body(available=set(), synced_at=None),
+        }
+    )
     run = _ProjectRun(
         ctx=ProjectContext(project_id=pid, project_name=proj, storage_token="t", storage_url="https://s"),
         reader=_OneBucketReader(bucket, tables),  # ty: ignore[invalid-argument-type]  (duck-typed test double)
-        entities=EntityBuilder(svc, proj, pid, "https://ui.example"),
+        entities=entities,
         pipelines=PipelineBuilder(svc, proj, pid, "https://ui.example"),
         dashboards=DashboardBuilder(svc, proj, pid, "https://ui.example"),
     )
@@ -364,10 +373,8 @@ def test_incremental_skip_is_tombstone_safe_and_writes_nothing():
         version_changed=False,
     )
 
-    # 1) No OM write for the unchanged bucket's schema/tables (only the always-on
-    #    DatabaseService + Database upserts precede the bucket loop).
-    written_kinds = {kind for kind, _ in om.put_calls}
-    assert written_kinds == {"databaseServices", "databases"}
+    # 1) No OM write at all: the service + database already match, the bucket is unchanged.
+    assert om.put_calls == []
     assert om.patch_calls == []
 
     # 2) The bucket is reported skipped_unchanged.

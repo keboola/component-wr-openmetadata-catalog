@@ -273,6 +273,8 @@ class _ProjectRun:
     # lineage pass can attach table -> dashboard edges to the entity it just wrote.
     dashboard_fqn_by_config: dict[str, str] = field(default_factory=dict)
     id_cache: dict[str, str | None] = field(default_factory=dict)
+    # FQNs this run had to create (they were absent from OM when the run started).
+    created_fqns: set[str] = field(default_factory=set)
     failures: int = 0
 
 
@@ -467,12 +469,14 @@ class Component(ComponentBase):
         def resolve_owner(email: str) -> str | None:
             return self._resolve_owner(om, run, email)
 
+        service_fqn = run.entities.database_service_body()["name"]
+        database_fqn = fqn_mod.database_fqn(run.entities.service_name, run.entities.project)
         self._upsert(
             om,
             run,
             "databaseServices",
             "DatabaseService",
-            run.entities.database_service_body()["name"],
+            service_fqn,
             run.entities.database_service_body(),
             (),
             snapshot,
@@ -484,7 +488,7 @@ class Component(ComponentBase):
             run,
             "databases",
             "Database",
-            fqn_mod.database_fqn(run.entities.service_name, run.entities.project),
+            database_fqn,
             run.entities.database_body(available=available_database, synced_at=synced_at),
             OWNED_DATABASE_FIELDS,
             snapshot,
@@ -495,6 +499,11 @@ class Component(ComponentBase):
         if not config.write_buckets:
             return  # DatabaseService + Database above are always upserted; buckets/tables/columns are not.
 
+        # A service or database created just now means OM holds none of this project's
+        # buckets, whatever the saved digests say (e.g. the service was deleted).
+        catalog_is_new = bool(run.created_fqns & {service_fqn, database_fqn})
+        if catalog_is_new and state.has_bucket_digests(run.ctx.project_id):
+            logger.info("OpenMetadata holds none of this project's catalog (was it deleted?); syncing every bucket.")
         full_refresh_due = state.full_refresh_due()
         for bucket in run.reader.list_buckets():
             if not self._bucket_in_scope(config, bucket):
@@ -507,7 +516,7 @@ class Component(ComponentBase):
             if not should_process_bucket(
                 previous_digest=state.bucket_digest(run.ctx.project_id, bucket.id),
                 current_digest=digest,
-                full_refresh=config.full_refresh,
+                full_refresh=config.full_refresh or catalog_is_new,
                 version_changed=version_changed,
                 full_refresh_due=full_refresh_due,
             ):
@@ -1163,6 +1172,7 @@ class Component(ComponentBase):
             if decision.is_create:
                 created = om.put_entity(kind, desired)
                 status_code = 200
+                run.created_fqns.add(entity_fqn)
                 if created.get("id"):
                     lineage_type = self._LINEAGE_TYPE_BY_ENTITY.get(entity_type, "table")
                     run.id_cache[f"{lineage_type}:{entity_fqn}"] = created["id"]

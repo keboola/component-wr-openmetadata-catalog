@@ -129,25 +129,58 @@ def test_run_catalog_happy_path(tmp_path, monkeypatch, _env):
     assert "out.c-sales" in state["projects"]["777"]["bucket_digests"]
 
 
-def test_service_name_change_resyncs_unchanged_buckets(tmp_path, monkeypatch, _env):
-    """An unchanged bucket is skipped on the next run, but only for the same OM target:
-    after a Service Name change the new service tree is empty, so the bucket must be
-    written again (else it goes missing there and lineage into it is dropped)."""
+class PersistentOM(FakeOM):
+    """A FakeOM that remembers what was written, like a real OM across runs."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.store: dict[tuple[str, str], dict] = {}
+
+    @staticmethod
+    def _fqn(kind, body):
+        parent = {"databases": "service", "databaseSchemas": "database", "tables": "databaseSchema"}.get(kind)
+        return f"{body[parent]}.{body['name']}" if parent and body.get(parent) else body["name"]
+
+    def get_by_fqn(self, kind, fqn, fields=None):
+        return self.store.get((kind, fqn))
+
+    def put_entity(self, kind, body):
+        created = super().put_entity(kind, body)
+        self.store[(kind, self._fqn(kind, body))] = {**body, **created}
+        return created
+
+
+def _run_twice(tmp_path, monkeypatch, second_params, *, same_om=True):
+    """Run 1 with BASE_PARAMS, then run 2 on its state; return run 2's table writes."""
     monkeypatch.setattr(component_mod, "StorageReader", FakeStorage)
+    om1 = PersistentOM()
+    monkeypatch.setattr(component_mod, "OMClient", lambda *a, **k: om1)
     monkeypatch.setenv("KBC_DATADIR", _make_datadir(tmp_path / "r1", BASE_PARAMS))
-    monkeypatch.setattr(component_mod, "OMClient", FakeOM)
     component_mod.Component().run()
-    state_after_1 = json.loads((tmp_path / "r1" / "data" / "out" / "state.json").read_text())
+    state = json.loads((tmp_path / "r1" / "data" / "out" / "state.json").read_text())
 
-    def table_writes(run_dir, params):
-        om = FakeOM()
-        monkeypatch.setattr(component_mod, "OMClient", lambda *a, **k: om)
-        monkeypatch.setenv("KBC_DATADIR", _make_datadir(tmp_path / run_dir, params, state=state_after_1))
-        component_mod.Component().run()
-        return [name for kind, name in om.put_calls if kind == "tables"]
+    om2 = om1 if same_om else PersistentOM()
+    om2.put_calls = []
+    monkeypatch.setattr(component_mod, "OMClient", lambda *a, **k: om2)
+    monkeypatch.setenv("KBC_DATADIR", _make_datadir(tmp_path / "r2", second_params, state=state))
+    component_mod.Component().run()
+    return [name for kind, name in om2.put_calls if kind == "tables"]
 
-    assert table_writes("same", BASE_PARAMS) == []  # same target: unchanged bucket skipped
-    assert table_writes("renamed", {**BASE_PARAMS, "service_name": "keboola-renamed"}) == ["orders"]
+
+def test_unchanged_bucket_is_skipped_on_the_same_target(tmp_path, monkeypatch, _env):
+    assert _run_twice(tmp_path, monkeypatch, BASE_PARAMS) == []
+
+
+def test_service_name_change_resyncs_unchanged_buckets(tmp_path, monkeypatch, _env):
+    """After a Service Name change the new service tree is empty, so an unchanged
+    bucket must be written again (else it goes missing there and lineage into it is dropped)."""
+    assert _run_twice(tmp_path, monkeypatch, {**BASE_PARAMS, "service_name": "keboola-renamed"}) == ["orders"]
+
+
+def test_wiped_om_resyncs_unchanged_buckets(tmp_path, monkeypatch, _env):
+    """Same target, but the OM service was deleted between runs: the saved digests
+    say "already in OM" while OM holds nothing, so the run must write the bucket again."""
+    assert _run_twice(tmp_path, monkeypatch, BASE_PARAMS, same_om=False) == ["orders"]
 
 
 def test_second_run_loads_base_and_updates_changed_owned_field(tmp_path, monkeypatch, _env):

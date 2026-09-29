@@ -79,6 +79,9 @@ class StateManager:
         self.om_target_seen = target
         return changed
 
+    def has_bucket_digests(self, project_id: str) -> bool:
+        return bool((self._projects.get(project_id) or {}).get("bucket_digests"))
+
     def bucket_digest(self, project_id: str, bucket_id: str) -> str | None:
         return (self._projects.get(project_id) or {}).get("bucket_digests", {}).get(bucket_id)
 
