@@ -1,3 +1,5 @@
+import csv
+import io
 import json
 from unittest import mock
 
@@ -221,3 +223,52 @@ def test_read_snapshot_rows_no_warning_on_full_read(caplog):
         rows = reader.read_snapshot_rows("in.c-x.last_written_snapshot")
     assert len(rows) == 2
     assert caplog.records == []
+
+
+class _PreviewApi:
+    """Fake Storage ``data-preview`` honouring the real contract: ``limit`` above 1000
+    is rejected with 400, rows are ordered by ``orderBy`` and narrowed by a ``gt``
+    ``whereFilter`` (the keyset used to page)."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.calls = []
+        self.headers = {}
+
+    def get(self, url, params=None, timeout=None):
+        params = params or {}
+        self.calls.append(params)
+        if "data-preview" not in url:
+            return FakeResponse(200, {"rowsCount": len(self.rows)})
+        if int(params.get("limit", 100)) > 1000:
+            return CsvResponse('{"error":"limit: This value should be between 0 and 1000."}', status_code=400)
+        rows = sorted(self.rows, key=lambda r: r[params["orderBy[0][column]"]])
+        if "whereFilters[0][values][]" in params:
+            rows = [r for r in rows if r[params["whereFilters[0][column]"]] > params["whereFilters[0][values][]"]]
+        page = rows[: int(params["limit"])]
+        out = io.StringIO()
+        writer = csv.DictWriter(out, fieldnames=["entity_fqn", "entity_type", "written_fields_json"])
+        writer.writeheader()
+        writer.writerows(page)
+        return CsvResponse(out.getvalue())
+
+
+def test_read_snapshot_rows_pages_through_the_whole_table():
+    """The merge base must be the WHOLE snapshot. A real 13,399-row snapshot came back
+    empty: the old single call asked for limit=1000000, which Storage rejects with 400."""
+    rows = [
+        {"entity_fqn": f"svc.p.b.t{i:05d}", "entity_type": "table", "written_fields_json": "{}"} for i in range(2345)
+    ]
+    rows[7]["written_fields_json"] = json.dumps({"columns": "x" * 200_000})  # > csv's 128 KB default field limit
+    api = _PreviewApi(rows)
+    reader = StorageReader("https://connection.keboola.com", "tok", session=api)
+    got = reader.read_snapshot_rows("in.c-x.last_written_snapshot")
+    assert [r["entity_fqn"] for r in got] == sorted(r["entity_fqn"] for r in rows)
+    assert all(int(c["limit"]) <= 1000 for c in api.calls if "limit" in c)
+
+
+def test_read_snapshot_rows_first_run_is_empty():
+    session = mock.Mock()
+    session.get.return_value = CsvResponse("not found", status_code=404)
+    reader = StorageReader("https://connection.keboola.com", "tok", session=session)
+    assert reader.read_snapshot_rows("in.c-x.last_written_snapshot") == []

@@ -29,6 +29,12 @@ _BRANCH_METADATA_KEY = "KBC.createdBy.branch.id"
 _DESCRIPTION_KEY = "KBC.description"
 _CREATED_BY_PREFIX = "KBC.createdBy."
 _RETRYABLE_STATUS = frozenset({500, 502, 503, 504})
+# Storage data-preview rejects a larger ``limit`` with 400.
+_PREVIEW_MAX_ROWS = 1000
+# The snapshot table's primary key: unique and ordered, so it doubles as the page cursor.
+_SNAPSHOT_KEY = "entity_fqn"
+# A wide table's written_fields_json exceeds csv's 128 KB default field limit.
+csv.field_size_limit(2**31 - 1)
 
 
 def resolve_storage_credentials(
@@ -170,38 +176,53 @@ class StorageReader:
             return response.json()
         raise UserException(f"Keboola Storage request exhausted retries: GET {path}")
 
-    def read_snapshot_rows(self, table_id: str, *, limit: int = 1_000_000) -> list[dict]:
-        """Best-effort read of a prior snapshot table via data-preview (CSV).
+    def read_snapshot_rows(self, table_id: str) -> list[dict]:
+        """Read the whole prior snapshot table (the three-way-merge base).
 
-        Returns ``[]`` if the table does not exist yet (first run) or on any
-        read error — the merge base is then rebuilt on the next full refresh.
+        ``data-preview`` returns at most 1000 rows per call and rejects a larger
+        ``limit`` with 400, so the table is paged by its primary key: each call asks
+        for the rows after the last key seen (keyset pagination).
 
-        Limitation: ``data-preview`` is a *row-capped* endpoint that caps rows
-        server-side, *below* the requested ``limit``, so a hit on the requested
-        ``limit`` never fires. For very large catalogs (5k+ tables) it can return
-        fewer rows than the snapshot actually holds. Truncation is therefore
-        detected against the table's own server-side ``rowsCount`` (not the
-        requested ``limit``): when fewer rows come back than the table reports, the
-        merge base is truncated, so changed fields on entities beyond the cap
-        silently stop propagating (those entities fail *safe* to
-        ``skipped_diverged`` and are never clobbered). A truncated read emits a
-        ``logger.warning``; the durable fix is an async full-table export, which is
-        out of scope here.
+        Returns ``[]`` when the table does not exist yet (first run) or on a read
+        error. A failed or short read is logged loudly: without a base, every
+        already-written entity looks human-edited and is skipped as diverged.
         """
         url = f"{self.base_url}/v2/storage/tables/{table_id}/data-preview"
-        try:
-            response = self.session.get(url, params={"limit": limit}, timeout=self.timeout)
-            if response.status_code >= 400:
+        rows: list[dict] = []
+        last_key: str | None = None
+        while True:
+            params = {"limit": _PREVIEW_MAX_ROWS, "orderBy[0][column]": _SNAPSHOT_KEY, "orderBy[0][order]": "ASC"}
+            if last_key is not None:
+                params |= {
+                    "whereFilters[0][column]": _SNAPSHOT_KEY,
+                    "whereFilters[0][operator]": "gt",
+                    "whereFilters[0][values][]": last_key,
+                }
+            try:
+                response = self.session.get(url, params=params, timeout=self.timeout)
+                if response.status_code == 404:  # first run: no snapshot yet
+                    return []
+                if response.status_code >= 400:
+                    logger.warning(
+                        "Could not read the snapshot merge base '%s' (HTTP %s); existing entities will "
+                        "be skipped as diverged this run.",
+                        table_id,
+                        response.status_code,
+                    )
+                    return []
+                page = list(csv.DictReader(io.StringIO(response.text)))
+            except (requests.RequestException, csv.Error) as exc:
+                logger.warning("Could not read the snapshot merge base '%s' (%s).", table_id, exc)
                 return []
-            rows = list(csv.DictReader(io.StringIO(response.text)))
-        except requests.RequestException, csv.Error:
-            return []
+            rows += page
+            if len(page) < _PREVIEW_MAX_ROWS or not page[-1].get(_SNAPSHOT_KEY):
+                break
+            last_key = page[-1][_SNAPSHOT_KEY]
         total = self._table_rows_count(table_id)
         if total is not None and len(rows) < total:
             logger.warning(
-                "Snapshot merge base for '%s' is truncated: data-preview returned %d of %d rows "
-                "(server-side row cap); updates to existing entities beyond the cap may be skipped "
-                "for this run. This affects large catalogs (5k+ tables).",
+                "Snapshot merge base for '%s' is truncated: read %d of %d rows; updates to existing "
+                "entities missing from it may be skipped as diverged this run.",
                 table_id,
                 len(rows),
                 total,
