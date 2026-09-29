@@ -177,6 +177,32 @@ def test_service_name_change_resyncs_unchanged_buckets(tmp_path, monkeypatch, _e
     assert _run_twice(tmp_path, monkeypatch, {**BASE_PARAMS, "service_name": "keboola-renamed"}) == ["orders"]
 
 
+def _report_actions(run_dir):
+    rows = csv.DictReader(io.StringIO((run_dir / "data" / "out" / "tables" / "catalog_run_report.csv").read_text()))
+    return {(r["entity_type"], r["action"]) for r in rows}
+
+
+def test_catalog_format_change_resyncs_unchanged_buckets(tmp_path, monkeypatch, _env):
+    """When a release changes what the writer emits (e.g. public deep links), unchanged
+    buckets must be processed once more, or the fix never reaches existing entities."""
+    monkeypatch.setattr(component_mod, "StorageReader", FakeStorage)
+    om = PersistentOM()
+    monkeypatch.setattr(component_mod, "OMClient", lambda *a, **k: om)
+    monkeypatch.setenv("KBC_DATADIR", _make_datadir(tmp_path / "r1", BASE_PARAMS))
+    component_mod.Component().run()
+    state = json.loads((tmp_path / "r1" / "data" / "out" / "state.json").read_text())
+
+    monkeypatch.setenv("KBC_DATADIR", _make_datadir(tmp_path / "same", BASE_PARAMS, state=state))
+    component_mod.Component().run()
+    # A digest-skipped bucket reports only its Schema; a processed one also reports its tables.
+    assert not any(entity_type == "Table" for entity_type, _ in _report_actions(tmp_path / "same"))
+
+    monkeypatch.setattr(component_mod, "_CATALOG_FORMAT_VERSION", component_mod._CATALOG_FORMAT_VERSION + 1)
+    monkeypatch.setenv("KBC_DATADIR", _make_datadir(tmp_path / "bumped", BASE_PARAMS, state=state))
+    component_mod.Component().run()
+    assert any(entity_type == "Table" for entity_type, _ in _report_actions(tmp_path / "bumped"))
+
+
 def test_wiped_om_resyncs_unchanged_buckets(tmp_path, monkeypatch, _env):
     """Same target, but the OM service was deleted between runs: the saved digests
     say "already in OM" while OM holds nothing, so the run must write the bucket again."""

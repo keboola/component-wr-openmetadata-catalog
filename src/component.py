@@ -235,6 +235,12 @@ VCR_SANITIZERS = [
     CredentialScrubber(),
 ]
 
+# Version of the entity bodies this writer emits. Bucket digests only track Storage
+# content, so an unchanged bucket is skipped even when a release changed what would be
+# written for it (e.g. deep links moved to the public host). Bump this with any such
+# change: the saved digests are then dropped once and every bucket is written again.
+_CATALOG_FORMAT_VERSION = 2
+
 _BASE_TYPE_FACTORY = {
     "STRING": BaseType.string,
     "INTEGER": BaseType.integer,
@@ -293,8 +299,11 @@ class Component(ComponentBase):
         report = RunReport(run_id=env["run_id"], config_row_id=env["config_row_id"])
         state = StateManager(self.get_state_file() or {})
         state.run_count += 1
-        if state.bind_om_target(f"{config.om_host.rstrip('/')}/{config.resolve_service_name()}"):
-            logger.info("OpenMetadata host or service name changed since the last run; re-syncing every bucket.")
+        sync_target = f"{config.om_host.rstrip('/')}/{config.resolve_service_name()}#catalog-v{_CATALOG_FORMAT_VERSION}"
+        if state.bind_om_target(sync_target):
+            logger.info(
+                "OpenMetadata host, service name or catalog format changed since the last run; re-syncing every bucket."
+            )
 
         project = self._resolve_project(config, env)
         proxy = ssh_proxy.maybe_open_tunnel(config)
