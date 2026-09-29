@@ -75,6 +75,28 @@ def test_state_manager_per_project_keying():
     assert sm.run_count == 5
 
 
+def test_bind_om_target_clears_digests_when_target_changes():
+    sm = StateManager(
+        {"projects": {"p1": {"bucket_digests": {"in.c-a": "d1"}}}, "om_target_seen": "https://om/keboola-old"}
+    )
+    assert sm.bind_om_target("https://om/keboola") is True
+    assert sm.bucket_digest("p1", "in.c-a") is None  # nothing is "already in OM" for the new target
+    assert sm.to_dict()["om_target_seen"] == "https://om/keboola"
+
+
+def test_bind_om_target_keeps_digests_for_same_or_unrecorded_target():
+    same = StateManager(
+        {"projects": {"p1": {"bucket_digests": {"in.c-a": "d1"}}}, "om_target_seen": "https://om/keboola"}
+    )
+    assert same.bind_om_target("https://om/keboola") is False
+    assert same.bucket_digest("p1", "in.c-a") == "d1"
+    # A state written before the key existed adopts the current target (like om_version_seen).
+    legacy = StateManager({"projects": {"p1": {"bucket_digests": {"in.c-a": "d1"}}}})
+    assert legacy.bind_om_target("https://om/keboola") is False
+    assert legacy.bucket_digest("p1", "in.c-a") == "d1"
+    assert legacy.to_dict()["om_target_seen"] == "https://om/keboola"
+
+
 def test_state_manager_flat_backcompat():
     sm = StateManager({"bucket_digests": {"in.c-a": "d1"}})
     assert sm.bucket_digest("_default", "in.c-a") == "d1"

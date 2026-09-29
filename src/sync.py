@@ -61,6 +61,23 @@ class StateManager:
         self.last_full_refresh: str | None = state.get("last_full_refresh")
         self.run_count: int = int(state.get("run_count") or 0)
         self.om_version_seen: str | None = state.get("om_version_seen")
+        self.om_target_seen: str | None = state.get("om_target_seen")
+
+    def bind_om_target(self, target: str) -> bool:
+        """Forget the per-bucket digests when the OpenMetadata target changed.
+
+        A digest only means "this bucket is already in OM" for the host + service it
+        was written to. After a Service Name or OM host change the new service tree
+        starts empty, so skipping an "unchanged" bucket would leave it missing there,
+        and every lineage edge into it would be dropped. A state written before this
+        key existed (``None``) adopts the current target, like ``om_version_seen``.
+        Returns whether the digests were cleared.
+        """
+        changed = self.om_target_seen not in (None, target)
+        if changed:
+            self._projects = {}
+        self.om_target_seen = target
+        return changed
 
     def bucket_digest(self, project_id: str, bucket_id: str) -> str | None:
         return (self._projects.get(project_id) or {}).get("bucket_digests", {}).get(bucket_id)
@@ -79,6 +96,7 @@ class StateManager:
             "last_full_refresh": self.last_full_refresh,
             "run_count": self.run_count,
             "om_version_seen": self.om_version_seen,
+            "om_target_seen": self.om_target_seen,
         }
 
 

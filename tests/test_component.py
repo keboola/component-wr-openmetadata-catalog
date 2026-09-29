@@ -129,6 +129,27 @@ def test_run_catalog_happy_path(tmp_path, monkeypatch, _env):
     assert "out.c-sales" in state["projects"]["777"]["bucket_digests"]
 
 
+def test_service_name_change_resyncs_unchanged_buckets(tmp_path, monkeypatch, _env):
+    """An unchanged bucket is skipped on the next run, but only for the same OM target:
+    after a Service Name change the new service tree is empty, so the bucket must be
+    written again (else it goes missing there and lineage into it is dropped)."""
+    monkeypatch.setattr(component_mod, "StorageReader", FakeStorage)
+    monkeypatch.setenv("KBC_DATADIR", _make_datadir(tmp_path / "r1", BASE_PARAMS))
+    monkeypatch.setattr(component_mod, "OMClient", FakeOM)
+    component_mod.Component().run()
+    state_after_1 = json.loads((tmp_path / "r1" / "data" / "out" / "state.json").read_text())
+
+    def table_writes(run_dir, params):
+        om = FakeOM()
+        monkeypatch.setattr(component_mod, "OMClient", lambda *a, **k: om)
+        monkeypatch.setenv("KBC_DATADIR", _make_datadir(tmp_path / run_dir, params, state=state_after_1))
+        component_mod.Component().run()
+        return [name for kind, name in om.put_calls if kind == "tables"]
+
+    assert table_writes("same", BASE_PARAMS) == []  # same target: unchanged bucket skipped
+    assert table_writes("renamed", {**BASE_PARAMS, "service_name": "keboola-renamed"}) == ["orders"]
+
+
 def test_second_run_loads_base_and_updates_changed_owned_field(tmp_path, monkeypatch, _env):
     """BLOCKING #1 regression: the three-way-merge base must be populated on the
     second run from the prior run's snapshot, round-tripped through

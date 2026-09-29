@@ -291,6 +291,8 @@ class Component(ComponentBase):
         report = RunReport(run_id=env["run_id"], config_row_id=env["config_row_id"])
         state = StateManager(self.get_state_file() or {})
         state.run_count += 1
+        if state.bind_om_target(f"{config.om_host.rstrip('/')}/{config.resolve_service_name()}"):
+            logger.info("OpenMetadata host or service name changed since the last run; re-syncing every bucket.")
 
         project = self._resolve_project(config, env)
         proxy = ssh_proxy.maybe_open_tunnel(config)
