@@ -72,5 +72,6 @@
   "snapshot_table": "in.c-wr-openmetadata-catalog.last_written_snapshot",
   "last_full_refresh": null,
   "run_count": 1,
-  "om_version_seen": "1.13.4"
+  "om_version_seen": "1.13.4",
+  "om_target_seen": "https://34.56.130.9.nip.io/keboola-vcr-catalog6"
 }

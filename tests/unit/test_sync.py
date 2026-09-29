@@ -84,17 +84,24 @@ def test_bind_om_target_clears_digests_when_target_changes():
     assert sm.to_dict()["om_target_seen"] == "https://om/keboola"
 
 
-def test_bind_om_target_keeps_digests_for_same_or_unrecorded_target():
+def test_bind_om_target_keeps_digests_for_same_target():
     same = StateManager(
         {"projects": {"p1": {"bucket_digests": {"in.c-a": "d1"}}}, "om_target_seen": "https://om/keboola"}
     )
     assert same.bind_om_target("https://om/keboola") is False
     assert same.bucket_digest("p1", "in.c-a") == "d1"
-    # A state written before the key existed adopts the current target (like om_version_seen).
+
+
+def test_bind_om_target_clears_digests_of_unknown_origin():
+    # Digests saved before the target was recorded can't prove which service they
+    # were written to (a live run skipped 4 buckets that were never in the new one),
+    # so they are dropped once instead of trusted.
     legacy = StateManager({"projects": {"p1": {"bucket_digests": {"in.c-a": "d1"}}}})
-    assert legacy.bind_om_target("https://om/keboola") is False
-    assert legacy.bucket_digest("p1", "in.c-a") == "d1"
+    assert legacy.bind_om_target("https://om/keboola") is True
+    assert legacy.bucket_digest("p1", "in.c-a") is None
     assert legacy.to_dict()["om_target_seen"] == "https://om/keboola"
+    # A first run has nothing to clear.
+    assert StateManager({}).bind_om_target("https://om/keboola") is False
 
 
 def test_state_manager_flat_backcompat():
@@ -139,3 +146,11 @@ def test_tombstone_fails_closed_on_missing_listing():
 def test_tombstone_fails_closed_on_short_scope():
     plan = TombstonePlanner.self_diff(listed_fqns=[], seen_fqns=["svc.p.b.t1"], min_scope=1)
     assert plan.blocked is True
+
+
+def test_tombstone_empty_bucket_is_a_quiet_no_op():
+    # An empty bucket: OM lists nothing and the run saw nothing. Nothing can be stale,
+    # so it is not "implausibly short" (a live run logged 20+ such false warnings).
+    plan = TombstonePlanner.self_diff(listed_fqns=[], seen_fqns=[], min_scope=1)
+    assert plan.blocked is False
+    assert plan.to_delete == []

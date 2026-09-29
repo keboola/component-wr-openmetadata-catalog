@@ -69,11 +69,11 @@ class StateManager:
         A digest only means "this bucket is already in OM" for the host + service it
         was written to. After a Service Name or OM host change the new service tree
         starts empty, so skipping an "unchanged" bucket would leave it missing there,
-        and every lineage edge into it would be dropped. A state written before this
-        key existed (``None``) adopts the current target, like ``om_version_seen``.
-        Returns whether the digests were cleared.
+        and every lineage edge into it would be dropped. Digests saved before the
+        target was recorded (``None``) can't prove where they were written, so they
+        are dropped once too. Returns whether the digests were cleared.
         """
-        changed = self.om_target_seen not in (None, target)
+        changed = self.om_target_seen != target and bool(self._projects)
         if changed:
             self._projects = {}
         self.om_target_seen = target
@@ -156,10 +156,13 @@ class TombstonePlanner:
         """Compute stale entities (listed in OM scope but not seen this run).
 
         Fail closed when the scope listing is missing or implausibly short — do
-        not delete on partial information.
+        not delete on partial information. An empty bucket (nothing listed, nothing
+        seen) is not implausible: there is simply nothing to reconcile.
         """
         if listed_fqns is None:
             return TombstonePlan(to_delete=[], fail_closed_reason="scope listing failed")
+        if not listed_fqns and not seen_fqns:
+            return TombstonePlan(to_delete=[])
         if len(listed_fqns) < min_scope:
             return TombstonePlan(
                 to_delete=[],
