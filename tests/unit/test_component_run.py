@@ -719,7 +719,7 @@ def test_data_app_lineage_pass_emits_table_to_dashboard_edge():
     config_id = "01app"
     source_table = "in.c-main.a"
     source_fqn = fqn_mod.table_fqn_from_storage_id(svc, proj, source_table)
-    dashboard_fqn = fqn_mod.dashboard_fqn(svc, proj, config_id)
+    dashboard_fqn = fqn_mod.dashboard_fqn(svc, pid, config_id)
 
     om = _LineageOM({source_fqn: "id-src", dashboard_fqn: "id-dash"})
     run = _ProjectRun(
@@ -765,7 +765,7 @@ def test_data_app_lineage_skipped_when_write_dashboard_lineage_off():
         pipelines=PipelineBuilder(svc, proj, pid, "https://ui"),
         dashboards=DashboardBuilder(svc, proj, pid, "https://ui", "connection.keboola.com"),
     )
-    run.dashboard_fqn_by_config["01app"] = fqn_mod.dashboard_fqn(svc, proj, "01app")
+    run.dashboard_fqn_by_config["01app"] = fqn_mod.dashboard_fqn(svc, pid, "01app")
     report = component_mod.RunReport(run_id="rid")
     config = SimpleNamespace(
         write_dashboard_lineage=False,

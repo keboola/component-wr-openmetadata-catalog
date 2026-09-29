@@ -11,11 +11,8 @@ def _builder():
 def test_dashboard_service_body():
     svc = _builder().dashboard_service_body()
     assert svc["serviceType"] == "CustomDashboard"
-    assert svc["name"] == "keboola-stack"
-    assert "displayName" not in svc
-
-    default_svc = DashboardBuilder("keboola", "Acme_Project", "1234", UI, STACK).dashboard_service_body()
-    assert default_svc["displayName"] == "Keboola"
+    assert svc["name"] == "keboola-stack-1234"  # one service per project...
+    assert svc["displayName"] == "Acme_Project"  # ...shown under the project's name
 
 
 def test_is_data_app():
@@ -141,3 +138,12 @@ def test_resolver_not_called_when_no_owner_email():
     body = _builder().build_dashboard({"id": "1"}, owner_resolver=resolver).body
     assert "owners" not in body
     assert calls == []  # no owner e-mail -> resolver skipped
+
+
+def test_dashboard_extension_names_its_project():
+    built = _builder().build_dashboard({"id": "01app", "name": "App", "configuration": {"parameters": {}}})
+    ext = built.body["extension"]
+    assert built.fqn == "keboola-stack-1234.01app"
+    assert ext["kbcProjectId"] == "1234"
+    assert ext["kbcProjectName"] == "Acme_Project"
+    assert ext["kbcProjectUrl"]["url"].endswith("/admin/projects/1234")

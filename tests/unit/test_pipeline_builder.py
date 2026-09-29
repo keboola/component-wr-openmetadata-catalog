@@ -11,11 +11,8 @@ def _builder(stack_id=None):
 def test_pipeline_service_body():
     svc = _builder().pipeline_service_body()
     assert svc["serviceType"] == "CustomPipeline"
-    assert svc["name"] == "keboola-stack"
-    assert "displayName" not in svc
-
-    default_svc = PipelineBuilder("keboola", "Acme_Project", "1234", UI).pipeline_service_body()
-    assert default_svc["displayName"] == "Keboola"
+    assert svc["name"] == "keboola-stack-1234"  # one service per project...
+    assert svc["displayName"] == "Acme_Project"  # ...shown under the project's name
 
 
 def test_config_to_pipeline_with_ordered_tasks_and_sql():
@@ -32,9 +29,10 @@ def test_config_to_pipeline_with_ordered_tasks_and_sql():
         },
     }
     built = _builder().build_pipeline("keboola.snowflake-transformation", config)
-    assert built.fqn == "keboola-stack.Acme_Project__999"
+    assert built.fqn == "keboola-stack-1234.999"
     body = built.body
-    assert body["name"] == "Acme_Project__999"
+    assert body["name"] == "999"
+    assert body["service"] == "keboola-stack-1234"
     tasks = body["tasks"]
     assert [t["name"] for t in tasks] == ["block_1", "block_2"]
     assert tasks[0]["taskType"] == "QUERY"
@@ -145,8 +143,12 @@ def test_custom_properties_names_and_types():
         "kbcOwner",
         "kbcSyncedAt",
         "kbcType",
+        "kbcProjectId",
+        "kbcProjectName",
+        "kbcProjectUrl",
     }
     types = {n: t for n, t, *_ in CUSTOM_PROPERTIES}
+    assert types["kbcProjectUrl"] == "hyperlink-cp"
     assert types["kbcConfigUrl"] == "hyperlink-cp"
     assert types["kbcOwner"] == "email"
     assert types["kbcType"] == "string"
@@ -361,3 +363,11 @@ def test_pipeline_source_urls_use_public_stack_host_not_internal_kbc_url():
     assert config.body["sourceUrl"] == f"{public}/components/keboola.snowflake-transformation/999"
     flow = b.build_pipeline("keboola.orchestrator", {"id": "f1", "name": "F", "configuration": {}})
     assert flow.body["sourceUrl"] == f"{public}/flows/f1"
+
+
+def test_pipeline_extension_names_its_project():
+    built = _builder(stack_id=STACK).build_pipeline("keboola.snowflake-transformation", {"id": "9", "name": "T"})
+    ext = built.body["extension"]
+    assert ext["kbcProjectId"] == "1234"
+    assert ext["kbcProjectName"] == "Acme_Project"
+    assert ext["kbcProjectUrl"]["url"] == "https://connection.us-east4.gcp.keboola.com/admin/projects/1234"

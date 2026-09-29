@@ -102,36 +102,32 @@ def column_fqn(table_fqn_value: str, column_name: str) -> str:
     return f"{table_fqn_value}.{sanitize_name(column_name)}"
 
 
-def pipeline_name(project: str, config_or_flow_id: str) -> str:
-    """Entity ``name`` for a Pipeline (E13/E14).
+def project_service_name(service_name: str, project_id: str) -> str:
+    """Name of one project's Pipeline or Dashboard service: ``<service>-<projectId>``.
 
-    OM Pipeline FQNs are two-level (``pipelineService.pipelineName``), so the
-    project and config/flow id are encoded into one dot-free segment
-    (``<project>__<config-or-flow-id>``) rather than a dotted name OM would
-    otherwise store quoted.
+    OM's Pipelines and Dashboards trees have no level between service and entity
+    (unlike Databases -> Database -> Schema), so the service is the only place the
+    project can show. The id, not the name, keeps it stable across project renames;
+    the project name is the service's ``displayName``.
     """
-    return f"{sanitize_name(project)}__{sanitize_name(str(config_or_flow_id))}"
+    return f"{sanitize_name(service_name)}-{sanitize_name(str(project_id))}"
 
 
-def pipeline_fqn(service_name: str, project: str, config_or_flow_id: str) -> str:
+def pipeline_name(config_or_flow_id: str) -> str:
+    """Entity ``name`` for a Pipeline (E13/E14): the config/flow id; its service is per project."""
+    return sanitize_name(str(config_or_flow_id))
+
+
+def pipeline_fqn(service_name: str, project_id: str, config_or_flow_id: str) -> str:
     """FQN of a Pipeline ← component config or flow (spec 2.1)."""
-    return f"{sanitize_name(service_name)}.{pipeline_name(project, config_or_flow_id)}"
+    return f"{project_service_name(service_name, project_id)}.{pipeline_name(config_or_flow_id)}"
 
 
-def dashboard_service_fqn(service_name: str) -> str:
-    """FQN of the DashboardService (data apps) — a single sanitised segment."""
-    return sanitize_name(service_name)
+def dashboard_name(config_id: str) -> str:
+    """Entity ``name`` for a Dashboard ← Keboola data-app config; its service is per project."""
+    return sanitize_name(str(config_id))
 
 
-def dashboard_name(project: str, config_id: str) -> str:
-    """Entity ``name`` for a Dashboard ← Keboola data-app config.
-
-    Two-level OM Dashboard FQNs (``dashboardService.dashboardName``) encode the
-    project and config id into one dot-free segment, mirroring ``pipeline_name``.
-    """
-    return f"{sanitize_name(project)}__{sanitize_name(str(config_id))}"
-
-
-def dashboard_fqn(service_name: str, project: str, config_id: str) -> str:
+def dashboard_fqn(service_name: str, project_id: str, config_id: str) -> str:
     """FQN of a Dashboard ← Keboola data-app config."""
-    return f"{sanitize_name(service_name)}.{dashboard_name(project, config_id)}"
+    return f"{project_service_name(service_name, project_id)}.{dashboard_name(config_id)}"

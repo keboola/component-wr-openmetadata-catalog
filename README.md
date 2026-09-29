@@ -20,11 +20,13 @@ What it writes to OpenMetadata
   primary keys, descriptions, and deep links back into the Keboola UI.
 - **Pipelines** — transformations, components (extractors/writers/apps) and
   flows/orchestrations → Pipeline + Tasks (`taskSQL`, `downstreamTasks`), plus run
-  history → pipeline status. Each pipeline carries a `kbcType` custom property
-  (transformation / extractor / writer / application / orchestration).
+  history → pipeline status, under one PipelineService per project (`<service>-<projectId>`,
+  shown as the project name — OM's Pipelines tree has no level below the service).
+  Each pipeline carries `kbcType` (transformation / extractor / writer / application /
+  orchestration) and `kbcProjectId` / `kbcProjectName` / `kbcProjectUrl`.
 - **Dashboards** — Keboola data apps (`keboola.data-apps`) → Dashboard entities under
-  a single `CustomDashboard` service, with upstream table lineage from their input
-  mapping.
+  one `CustomDashboard` service per project (named like the pipeline service), with
+  the same project custom properties and upstream table lineage from their input mapping.
 - **Lineage** — declared table-level edges (`source=PipelineLineage`), column-level
   edges computed with SQLGlot (`source=QueryLineage`), pipeline-node edges
   (table→pipeline→table) and flow→child edges, and bucket→bucket edges aggregated from

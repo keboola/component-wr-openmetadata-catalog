@@ -35,6 +35,9 @@ CUSTOM_PROPERTIES = [
     ("kbcOwner", "email", "Pipeline owner (last configuration editor)"),
     ("kbcSyncedAt", "string", "Catalog snapshot time (UTC) — the fields above are as of this time"),
     ("kbcType", "string", "Keboola object kind"),
+    ("kbcProjectId", "string", "Keboola project id"),
+    ("kbcProjectName", "string", "Keboola project name"),
+    ("kbcProjectUrl", "hyperlink-cp", "Keboola project URL"),
 ]
 
 _FLOW_COMPONENT_IDS = frozenset({"keboola.orchestrator", "keboola.flow"})
@@ -135,14 +138,16 @@ class PipelineBuilder:
         self.stack_id = stack_id
 
     def pipeline_service_body(self) -> dict:
-        body = {
-            "name": fqn.sanitize_name(self.service_name),
-            "serviceType": _SERVICE_TYPE,
-            "description": "Keboola pipelines catalogued by keboola.wr-openmetadata-catalog.",
-        }
-        if display_name := fqn.service_display_name(body["name"]):
-            body["displayName"] = display_name
-        return body
+        """One PipelineService per project, shown under the project's name."""
+        return _drop_none(
+            {
+                "name": fqn.project_service_name(self.service_name, self.project_id),
+                "displayName": fqn.sanitize_display_name(self.project),
+                "serviceType": _SERVICE_TYPE,
+                "description": f"Pipelines of Keboola project {self.project_id}, catalogued by "
+                "keboola.wr-openmetadata-catalog.",
+            }
+        )
 
     def is_flow(self, component_id: str) -> bool:
         return is_flow_component(component_id)
@@ -155,14 +160,17 @@ class PipelineBuilder:
         """
         return enrichment.connection_base(self.stack_id, self.ui_base)
 
+    def _project_url(self) -> str:
+        return f"{self._public_base()}/admin/projects/{self.project_id}"
+
     def _component_url(self, component_id: str, config_id: str) -> str:
         return f"{self._public_base()}/admin/projects/{self.project_id}/components/{component_id}/{config_id}"
 
     def _flow_url(self, flow_id: str) -> str:
         return f"{self._public_base()}/admin/projects/{self.project_id}/flows/{flow_id}"
 
-    @staticmethod
     def _extension(
+        self,
         component_id: str,
         config_id: str,
         config: dict,
@@ -179,6 +187,9 @@ class PipelineBuilder:
             "kbcOwner": enrichment.creator_token_email(config),
             "kbcSyncedAt": synced_at,
             "kbcType": kind,
+            "kbcProjectId": self.project_id,
+            "kbcProjectName": fqn.sanitize_display_name(self.project),
+            "kbcProjectUrl": enrichment.hyperlink(self._project_url(), "Open project"),
         }
         extension = {k: v for k, v in values.items() if v is not None and (available is None or k in available)}
         return extension or None
@@ -227,10 +238,10 @@ class PipelineBuilder:
         config_url = self._component_url(component_id, config_id)
         body = _drop_none(
             {
-                "name": fqn.pipeline_name(self.project, config_id),
+                "name": fqn.pipeline_name(config_id),
                 "displayName": fqn.sanitize_display_name(config.get("name")),
                 "description": fqn.sanitize_display_name(config.get("description")),
-                "service": fqn.database_service_fqn(self.service_name),
+                "service": fqn.project_service_name(self.service_name, self.project_id),
                 "sourceUrl": self._component_url(component_id, config_id),
                 "tasks": tasks or None,
                 "extension": self._extension(component_id, config_id, config, config_url, available, synced_at, kind),
@@ -239,7 +250,7 @@ class PipelineBuilder:
         )
         return BuiltPipeline(
             body=body,
-            fqn=fqn.pipeline_fqn(self.service_name, self.project, config_id),
+            fqn=fqn.pipeline_fqn(self.service_name, self.project_id, config_id),
             component_id=component_id,
             config_id=config_id,
         )
@@ -305,10 +316,10 @@ class PipelineBuilder:
         config_url = self._flow_url(flow_id)
         body = _drop_none(
             {
-                "name": fqn.pipeline_name(self.project, flow_id),
+                "name": fqn.pipeline_name(flow_id),
                 "displayName": fqn.sanitize_display_name(config.get("name")),
                 "description": fqn.sanitize_display_name(config.get("description")),
-                "service": fqn.database_service_fqn(self.service_name),
+                "service": fqn.project_service_name(self.service_name, self.project_id),
                 "sourceUrl": self._flow_url(flow_id),
                 "tasks": tasks or None,
                 "extension": self._extension(component_id, flow_id, config, config_url, available, synced_at, kind),
@@ -317,7 +328,7 @@ class PipelineBuilder:
         )
         return BuiltPipeline(
             body=body,
-            fqn=fqn.pipeline_fqn(self.service_name, self.project, flow_id),
+            fqn=fqn.pipeline_fqn(self.service_name, self.project_id, flow_id),
             component_id=component_id,
             config_id=flow_id,
         )

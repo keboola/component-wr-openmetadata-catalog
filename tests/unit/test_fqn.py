@@ -44,6 +44,10 @@ def test_table_fqn_linked_bucket_resolves_to_owning_project():
     assert node == "svc.project_a.out_c-shared.customers"
 
 
-def test_pipeline_fqn_and_name():
-    assert fqn.pipeline_name("Proj", "12345") == "Proj__12345"
-    assert fqn.pipeline_fqn("svc", "Proj", "12345") == "svc.Proj__12345"
+def test_pipeline_and_dashboard_fqns_live_under_a_per_project_service():
+    # OM's Pipelines/Dashboards trees have no level between service and entity, so the
+    # project is the service (by stable id); the entity name is just the config id.
+    assert fqn.project_service_name("svc", "4214") == "svc-4214"
+    assert fqn.pipeline_name("12345") == "12345"
+    assert fqn.pipeline_fqn("svc", "4214", "12345") == "svc-4214.12345"
+    assert fqn.dashboard_fqn("svc", "4214", "01app") == "svc-4214.01app"

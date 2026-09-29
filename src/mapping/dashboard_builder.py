@@ -31,6 +31,9 @@ CUSTOM_PROPERTIES = [
     ("kbcSyncedAt", "string", "Catalog snapshot time (UTC) — status is as of this time"),
     ("kbcAppUrl", "hyperlink-cp", "Deployed data app URL"),
     ("kbcConfigUrl", "hyperlink-cp", "Keboola configuration URL"),
+    ("kbcProjectId", "string", "Keboola project id"),
+    ("kbcProjectName", "string", "Keboola project name"),
+    ("kbcProjectUrl", "hyperlink-cp", "Keboola project URL"),
 ]
 
 # Data Science deployment state -> the label shown in the Keboola UI Status column.
@@ -61,14 +64,16 @@ class DashboardBuilder:
         self.stack_id = stack_id
 
     def dashboard_service_body(self) -> dict:
-        body = {
-            "name": fqn.sanitize_name(self.service_name),
-            "serviceType": _SERVICE_TYPE,
-            "description": "Keboola data apps catalogued by keboola.wr-openmetadata-catalog.",
-        }
-        if display_name := fqn.service_display_name(body["name"]):
-            body["displayName"] = display_name
-        return body
+        """One DashboardService per project, shown under the project's name."""
+        return _drop_none(
+            {
+                "name": fqn.project_service_name(self.service_name, self.project_id),
+                "displayName": fqn.sanitize_display_name(self.project),
+                "serviceType": _SERVICE_TYPE,
+                "description": f"Data apps of Keboola project {self.project_id}, catalogued by "
+                "keboola.wr-openmetadata-catalog.",
+            }
+        )
 
     @staticmethod
     def is_data_app(component_id: str) -> bool:
@@ -129,6 +134,11 @@ class DashboardBuilder:
             "kbcSyncedAt": synced_at,
             "kbcAppUrl": self._hyperlink(self._app_url(slug, app_id), "Open app"),
             "kbcConfigUrl": self._hyperlink(self._config_url(config_id), "Open configuration"),
+            "kbcProjectId": self.project_id,
+            "kbcProjectName": fqn.sanitize_display_name(self.project),
+            "kbcProjectUrl": self._hyperlink(
+                f"{self._connection_base()}/admin/projects/{self.project_id}", "Open project"
+            ),
         }
         extension = {k: v for k, v in values.items() if v is not None and (available is None or k in available)}
         return extension or None
@@ -146,12 +156,12 @@ class DashboardBuilder:
         app_url = self._app_url((params.get("dataApp") or {}).get("slug"), params.get("id"))
         body = _drop_none(
             {
-                "name": fqn.dashboard_name(self.project, config_id),
+                "name": fqn.dashboard_name(config_id),
                 "displayName": fqn.sanitize_display_name(config.get("name")),
                 # Always emit description (empty when the app has none) so it overwrites
                 # any earlier value rather than leaving a stale one in place.
                 "description": fqn.sanitize_display_name(config.get("description")) or "",
-                "service": fqn.dashboard_service_fqn(self.service_name),
+                "service": fqn.project_service_name(self.service_name, self.project_id),
                 "sourceUrl": app_url or self._config_url(config_id),
                 "owners": self._owners(config, owner_resolver),
                 "extension": self._extension(config, available_properties, app_states, synced_at),
@@ -159,6 +169,6 @@ class DashboardBuilder:
         )
         return BuiltDashboard(
             body=body,
-            fqn=fqn.dashboard_fqn(self.service_name, self.project, config_id),
+            fqn=fqn.dashboard_fqn(self.service_name, self.project_id, config_id),
             config_id=config_id,
         )
