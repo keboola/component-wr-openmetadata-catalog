@@ -1,3 +1,5 @@
+import json
+
 from configuration import MergeMode
 from merge import (
     ACTION_CREATED,
@@ -13,6 +15,7 @@ from merge import (
     OWNED_TABLE_FIELDS,
     SnapshotStore,
     ThreeWayMerger,
+    content_hash,
 )
 
 TWM = ThreeWayMerger(MergeMode.THREE_WAY_MERGE)
@@ -191,7 +194,7 @@ def test_manual_lineage_source_never_dropped():
 def test_snapshot_store_roundtrip():
     store = SnapshotStore()
     store.record("svc.p.b.t", "Table", {"description": "d", "tableType": "Regular"})
-    entries = store.entries()
+    entries = list(store.entries())
     assert len(entries) == 1
     assert entries[0].entity_fqn == "svc.p.b.t"
     assert entries[0].content_hash
@@ -380,3 +383,34 @@ def test_struct_child_changed_attr_diverges():
     d = _merge(TWM, {"columns": cols}, {"columns": current}, {"columns": base}, owned=("columns",))
     assert d.action == ACTION_SKIPPED_DIVERGED
     assert d.diverged_fields == ["columns"]
+
+
+def _wide_table_row(i):
+    columns = [{"name": f"col_{c}", "dataType": "VARCHAR", "dataTypeDisplay": "VARCHAR(255)"} for c in range(120)]
+    fields = {"columns": columns, "sourceUrl": f"https://connection.example/admin/projects/1/storage/b/table/t{i}"}
+    return {"entity_fqn": f"svc.p.b.t{i:05d}", "entity_type": "Table", "written_fields_json": json.dumps(fields)}
+
+
+def test_snapshot_store_keeps_a_large_base_small_in_memory():
+    """A real 13,399-row / 57 MB snapshot OOM-killed a 244 MiB job once it was actually
+    read. The store must hold it far below its raw size, streaming rows in."""
+    import tracemalloc
+
+    raw = sum(len(_wide_table_row(i)["written_fields_json"]) for i in range(1500))
+    tracemalloc.start()
+    store = SnapshotStore()
+    store.load_rows(_wide_table_row(i) for i in range(1500))
+    held, _peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert held < raw / 4, (held, raw)
+    assert store.base_fields("svc.p.b.t00007")["columns"][3]["name"] == "col_3"
+    assert store.base_fields("svc.p.b.missing") is None
+
+
+def test_snapshot_store_entries_match_the_uncompressed_format():
+    fields = {"description": "d", "columns": [{"name": "a"}]}
+    store = SnapshotStore()
+    store.record("svc.p.b.t", "Table", fields)
+    (entry,) = list(store.entries())
+    assert entry.written_fields_json == json.dumps(fields, sort_keys=True, default=str)
+    assert entry.content_hash == content_hash(fields)

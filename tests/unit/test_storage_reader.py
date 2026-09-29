@@ -209,7 +209,7 @@ def test_read_snapshot_rows_warns_when_truncated(caplog):
     csv_text = "kind,fqn\na,1\nb,2\n"  # data-preview returns 2 rows...
     reader = _snapshot_reader(csv_text, rows_count=5)  # ...but the table holds 5
     with caplog.at_level("WARNING"):
-        rows = reader.read_snapshot_rows("in.c-x.last_written_snapshot")  # default 1M limit
+        rows = list(reader.read_snapshot_rows("in.c-x.last_written_snapshot"))
     assert len(rows) == 2
     assert any("truncat" in r.message.lower() for r in caplog.records)
 
@@ -220,7 +220,7 @@ def test_read_snapshot_rows_no_warning_on_full_read(caplog):
     csv_text = "kind,fqn\na,1\nb,2\n"  # 2 rows returned, 2 rows total
     reader = _snapshot_reader(csv_text, rows_count=2)
     with caplog.at_level("WARNING"):
-        rows = reader.read_snapshot_rows("in.c-x.last_written_snapshot")
+        rows = list(reader.read_snapshot_rows("in.c-x.last_written_snapshot"))
     assert len(rows) == 2
     assert caplog.records == []
 
@@ -262,7 +262,7 @@ def test_read_snapshot_rows_pages_through_the_whole_table():
     rows[7]["written_fields_json"] = json.dumps({"columns": "x" * 200_000})  # > csv's 128 KB default field limit
     api = _PreviewApi(rows)
     reader = StorageReader("https://connection.keboola.com", "tok", session=api)
-    got = reader.read_snapshot_rows("in.c-x.last_written_snapshot")
+    got = list(reader.read_snapshot_rows("in.c-x.last_written_snapshot"))
     assert [r["entity_fqn"] for r in got] == sorted(r["entity_fqn"] for r in rows)
     assert all(int(c["limit"]) <= 1000 for c in api.calls if "limit" in c)
 
@@ -271,4 +271,18 @@ def test_read_snapshot_rows_first_run_is_empty():
     session = mock.Mock()
     session.get.return_value = CsvResponse("not found", status_code=404)
     reader = StorageReader("https://connection.keboola.com", "tok", session=session)
-    assert reader.read_snapshot_rows("in.c-x.last_written_snapshot") == []
+    assert list(reader.read_snapshot_rows("in.c-x.last_written_snapshot")) == []
+
+
+def test_read_snapshot_rows_streams_page_by_page():
+    """Rows are yielded as each page arrives, so a 57 MB snapshot is never held whole."""
+    rows = [
+        {"entity_fqn": f"svc.p.b.t{i:05d}", "entity_type": "table", "written_fields_json": "{}"} for i in range(2500)
+    ]
+    api = _PreviewApi(rows)
+    reader = StorageReader("https://connection.keboola.com", "tok", session=api)
+    stream = reader.read_snapshot_rows("in.c-x.last_written_snapshot")
+    first = next(stream)
+    assert first["entity_fqn"] == "svc.p.b.t00000"
+    assert sum(1 for c in api.calls if "limit" in c) == 1  # only the first page fetched so far
+    assert 1 + sum(1 for _ in stream) == 2500

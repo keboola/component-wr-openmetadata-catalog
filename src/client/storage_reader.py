@@ -176,19 +176,21 @@ class StorageReader:
             return response.json()
         raise UserException(f"Keboola Storage request exhausted retries: GET {path}")
 
-    def read_snapshot_rows(self, table_id: str) -> list[dict]:
-        """Read the whole prior snapshot table (the three-way-merge base).
+    def read_snapshot_rows(self, table_id: str) -> Iterator[dict]:
+        """Stream the whole prior snapshot table (the three-way-merge base), page by page.
 
         ``data-preview`` returns at most 1000 rows per call and rejects a larger
         ``limit`` with 400, so the table is paged by its primary key: each call asks
-        for the rows after the last key seen (keyset pagination).
+        for the rows after the last key seen (keyset pagination). Rows are yielded as
+        each page arrives, so a large snapshot (57 MB for ~13k entities) is never held
+        whole in memory.
 
-        Returns ``[]`` when the table does not exist yet (first run) or on a read
-        error. A failed or short read is logged loudly: without a base, every
-        already-written entity looks human-edited and is skipped as diverged.
+        Yields nothing when the table does not exist yet (first run). A failed or short
+        read is logged loudly and ends the stream: entities missing from the base look
+        human-edited and are skipped as diverged (fail-safe, never overwritten).
         """
         url = f"{self.base_url}/v2/storage/tables/{table_id}/data-preview"
-        rows: list[dict] = []
+        read = 0
         last_key: str | None = None
         while True:
             params = {"limit": _PREVIEW_MAX_ROWS, "orderBy[0][column]": _SNAPSHOT_KEY, "orderBy[0][order]": "ASC"}
@@ -201,7 +203,7 @@ class StorageReader:
             try:
                 response = self.session.get(url, params=params, timeout=self.timeout)
                 if response.status_code == 404:  # first run: no snapshot yet
-                    return []
+                    return
                 if response.status_code >= 400:
                     logger.warning(
                         "Could not read the snapshot merge base '%s' (HTTP %s); existing entities will "
@@ -209,25 +211,25 @@ class StorageReader:
                         table_id,
                         response.status_code,
                     )
-                    return []
+                    return
                 page = list(csv.DictReader(io.StringIO(response.text)))
             except (requests.RequestException, csv.Error) as exc:
                 logger.warning("Could not read the snapshot merge base '%s' (%s).", table_id, exc)
-                return []
-            rows += page
+                return
+            read += len(page)
+            yield from page
             if len(page) < _PREVIEW_MAX_ROWS or not page[-1].get(_SNAPSHOT_KEY):
                 break
             last_key = page[-1][_SNAPSHOT_KEY]
         total = self._table_rows_count(table_id)
-        if total is not None and len(rows) < total:
+        if total is not None and read < total:
             logger.warning(
                 "Snapshot merge base for '%s' is truncated: read %d of %d rows; updates to existing "
                 "entities missing from it may be skipped as diverged this run.",
                 table_id,
-                len(rows),
+                read,
                 total,
             )
-        return rows
 
     def _table_rows_count(self, table_id: str) -> int | None:
         """Best-effort server-side ``rowsCount`` for a table (truncation detection).

@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import zlib
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 
 from configuration import MergeMode
@@ -205,39 +207,44 @@ class SnapshotEntry:
 
 
 class SnapshotStore:
-    """The three-way-merge base store (spec 2.3): entity_fqn -> last-written fields."""
+    """The three-way-merge base store (spec 2.3): entity_fqn -> last-written fields.
+
+    Entries are kept as zlib-compressed JSON and parsed only when one entity is
+    merged: a real 13,399-row snapshot is 57 MB of JSON (whole column lists and task
+    SQL), about 4x that as Python objects, which OOM-killed a 244 MiB job.
+    """
 
     def __init__(self) -> None:
-        self._data: dict[str, dict] = {}
+        self._data: dict[str, tuple[str, bytes]] = {}
 
-    def load_rows(self, rows: list[dict]) -> None:
+    def load_rows(self, rows: Iterable[dict]) -> None:
         for row in rows:
             fqn = row.get("entity_fqn")
-            if not fqn:
-                continue
-            try:
-                fields = json.loads(row.get("written_fields_json") or "{}")
-            except ValueError, TypeError:
-                fields = {}
-            self._data[fqn] = {"entity_type": row.get("entity_type"), "fields": fields}
+            if fqn:
+                raw = row.get("written_fields_json") or "{}"
+                self._data[fqn] = (row.get("entity_type") or "", zlib.compress(raw.encode()))
 
     def base_fields(self, entity_fqn: str) -> dict | None:
         entry = self._data.get(entity_fqn)
-        return entry["fields"] if entry else None
+        if entry is None:
+            return None
+        try:
+            fields = json.loads(zlib.decompress(entry[1]))
+        except ValueError, TypeError:
+            return {}
+        return fields if isinstance(fields, dict) else {}
 
     def record(self, entity_fqn: str, entity_type: str, fields: dict) -> None:
-        self._data[entity_fqn] = {"entity_type": entity_type, "fields": fields}
+        canonical = json.dumps(fields, sort_keys=True, default=str)
+        self._data[entity_fqn] = (entity_type, zlib.compress(canonical.encode()))
 
-    def entries(self) -> list[SnapshotEntry]:
-        result: list[SnapshotEntry] = []
-        for fqn, entry in sorted(self._data.items()):
-            fields_json = json.dumps(entry["fields"], sort_keys=True, default=str)
-            result.append(
-                SnapshotEntry(
-                    entity_fqn=fqn,
-                    entity_type=entry.get("entity_type") or "",
-                    written_fields_json=fields_json,
-                    content_hash=content_hash(entry["fields"]),
-                )
+    def entries(self) -> Iterator[SnapshotEntry]:
+        for fqn in sorted(self._data):
+            entity_type, _ = self._data[fqn]
+            fields = self.base_fields(fqn) or {}
+            yield SnapshotEntry(
+                entity_fqn=fqn,
+                entity_type=entity_type,
+                written_fields_json=json.dumps(fields, sort_keys=True, default=str),
+                content_hash=content_hash(fields),
             )
-        return result

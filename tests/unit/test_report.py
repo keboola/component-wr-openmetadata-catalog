@@ -59,7 +59,7 @@ def test_snapshot_rows_from_entries():
         written_fields_json = "{}"
         content_hash = "abc"
 
-    rows = snapshot_rows([E()])
+    rows = list(snapshot_rows([E()]))
     assert rows[0]["entity_fqn"] == "svc.p.b.t"
     assert rows[0]["content_hash"] == "abc"
     assert "updated_at" in rows[0]

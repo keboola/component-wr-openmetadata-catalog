@@ -11,6 +11,7 @@ the same authoritative manifest either way.
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -115,16 +116,14 @@ def report_schema() -> list[dict]:
     return schema
 
 
-def snapshot_rows(entries: list) -> list[dict]:
-    """Build ``last_written_snapshot`` rows from SnapshotStore entries."""
+def snapshot_rows(entries: Iterable) -> Iterator[dict]:
+    """Stream ``last_written_snapshot`` rows from SnapshotStore entries (never all in memory)."""
     now = datetime.now(tz=UTC).isoformat()
-    return [
-        {
+    for e in entries:
+        yield {
             "entity_fqn": e.entity_fqn,
             "entity_type": e.entity_type,
             "written_fields_json": e.written_fields_json,
             "content_hash": e.content_hash,
             "updated_at": now,
         }
-        for e in entries
-    ]
