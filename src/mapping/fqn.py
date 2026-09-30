@@ -1,0 +1,133 @@
+"""Fully-qualified-name builder and name sanitisation (clean-room).
+
+OpenMetadata addresses every entity by a dot-separated FQN
+(``service.database.schema.table``). Keboola object names can contain spaces,
+dots and other characters that would break an FQN, so names are sanitised into
+FQN-safe segments while the original is preserved as the entity ``displayName``.
+
+The functions here are pure and deterministic: the same input always yields the
+same FQN, so N independent project rows converge on one coherent catalog.
+"""
+
+from __future__ import annotations
+
+import re
+
+_UNSAFE = re.compile(r"[^0-9A-Za-z_-]+")
+_MULTI_UNDERSCORE = re.compile(r"_+")
+
+# The FQN root every service (database / pipeline / dashboard) uses unless the
+# config pins its own ``service_name``. Fixed rather than stack-derived: a customer
+# lives on one stack, and OM's Explore tree shows the service right above the
+# project, so it should read "Keboola", not "keboola-connection-<stack>".
+DEFAULT_SERVICE_NAME = "keboola"
+_DEFAULT_SERVICE_DISPLAY_NAME = "Keboola"
+
+
+def sanitize_name(name: str | None) -> str:
+    """Return an FQN-safe single segment for ``name``.
+
+    Dots (the FQN separator) and whitespace collapse to underscores; other
+    unsafe characters are replaced with underscores; dashes are preserved.
+    """
+    if name is None:
+        return "unnamed"
+    text = str(name).strip().replace(".", "_")
+    text = _UNSAFE.sub("_", text)
+    text = _MULTI_UNDERSCORE.sub("_", text).strip("_")
+    return text or "unnamed"
+
+
+def sanitize_display_name(name: str | None) -> str | None:
+    """Return the original human-readable name (trimmed), preserved as ``displayName``."""
+    if name is None:
+        return None
+    text = str(name).strip()
+    return text or None
+
+
+def service_display_name(service_name: str) -> str | None:
+    """``displayName`` for a service: "Keboola" for the default one, else ``None``.
+
+    A service name the user chose is shown exactly as typed, so two pinned
+    services (e.g. one per stack) stay distinguishable in OM's tree.
+    """
+    return _DEFAULT_SERVICE_DISPLAY_NAME if service_name == DEFAULT_SERVICE_NAME else None
+
+
+def database_service_fqn(service_name: str) -> str:
+    """FQN of the DatabaseService (E1) — a single sanitised segment."""
+    return sanitize_name(service_name)
+
+
+def database_fqn(service_name: str, project: str) -> str:
+    """FQN of a Database (E2) ← Keboola project."""
+    return f"{sanitize_name(service_name)}.{sanitize_name(project)}"
+
+
+def schema_fqn(service_name: str, project: str, bucket_path: str) -> str:
+    """FQN of a DatabaseSchema (E3) ← Keboola bucket."""
+    return f"{sanitize_name(service_name)}.{sanitize_name(project)}.{sanitize_name(bucket_path)}"
+
+
+def table_fqn(service_name: str, project: str, bucket_path: str, table_name: str) -> str:
+    """FQN of a Table (E4) ← Keboola table.
+
+    ``project`` is passed explicitly so a source table in another project (a
+    linked/shared bucket) resolves onto the node its owning project created,
+    rather than the project currently being catalogued.
+    """
+    return (
+        f"{sanitize_name(service_name)}.{sanitize_name(project)}."
+        f"{sanitize_name(bucket_path)}.{sanitize_name(table_name)}"
+    )
+
+
+def table_fqn_from_storage_id(service_name: str, project: str, storage_id: str) -> str | None:
+    """OM Table FQN from a Keboola storage id (``stage.c-bucket.table``).
+
+    The first two dotted parts are the bucket path, the remainder the table
+    name. Returns ``None`` for an unparseable id.
+    """
+    parts = str(storage_id).split(".")
+    if len(parts) < 3:
+        return None
+    bucket_path = ".".join(parts[:2])
+    table_name = ".".join(parts[2:])
+    return table_fqn(service_name, project, bucket_path, table_name)
+
+
+def column_fqn(table_fqn_value: str, column_name: str) -> str:
+    """OM Column FQN: ``<tableFqn>.<column>`` (column segment sanitised)."""
+    return f"{table_fqn_value}.{sanitize_name(column_name)}"
+
+
+def project_service_name(service_name: str, project_id: str) -> str:
+    """Name of one project's Pipeline or Dashboard service: ``<service>-<projectId>``.
+
+    OM's Pipelines and Dashboards trees have no level between service and entity
+    (unlike Databases -> Database -> Schema), so the service is the only place the
+    project can show. The id, not the name, keeps it stable across project renames;
+    the project name is the service's ``displayName``.
+    """
+    return f"{sanitize_name(service_name)}-{sanitize_name(str(project_id))}"
+
+
+def pipeline_name(config_or_flow_id: str) -> str:
+    """Entity ``name`` for a Pipeline (E13/E14): the config/flow id; its service is per project."""
+    return sanitize_name(str(config_or_flow_id))
+
+
+def pipeline_fqn(service_name: str, project_id: str, config_or_flow_id: str) -> str:
+    """FQN of a Pipeline ← component config or flow (spec 2.1)."""
+    return f"{project_service_name(service_name, project_id)}.{pipeline_name(config_or_flow_id)}"
+
+
+def dashboard_name(config_id: str) -> str:
+    """Entity ``name`` for a Dashboard ← Keboola data-app config; its service is per project."""
+    return sanitize_name(str(config_id))
+
+
+def dashboard_fqn(service_name: str, project_id: str, config_id: str) -> str:
+    """FQN of a Dashboard ← Keboola data-app config."""
+    return f"{project_service_name(service_name, project_id)}.{dashboard_name(config_id)}"

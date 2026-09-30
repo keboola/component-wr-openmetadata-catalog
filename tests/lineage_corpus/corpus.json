@@ -1,0 +1,176 @@
+{
+  "threshold": 0.7,
+  "cases": [
+    {
+      "name": "snowflake_direct",
+      "component_id": "keboola.snowflake-transformation",
+      "in_map": {
+        "src": "in.c-main.orders"
+      },
+      "out_map": {
+        "result": "out.c-out.result"
+      },
+      "statements": [
+        [
+          "c1",
+          "INSERT INTO \"result\" SELECT \"id\", \"amount\" FROM \"src\""
+        ]
+      ],
+      "expected": {
+        "resolved": 2
+      },
+      "expected_column_edges": 2
+    },
+    {
+      "name": "snowflake_ctas_chain",
+      "component_id": "keboola.snowflake-transformation",
+      "in_map": {
+        "src": "in.c-main.orders"
+      },
+      "out_map": {
+        "result": "out.c-out.result"
+      },
+      "statements": [
+        [
+          "s1",
+          "CREATE TABLE \"stg\" AS SELECT \"id\",\"amount\" FROM \"src\""
+        ],
+        [
+          "s2",
+          "CREATE TABLE \"result\" AS SELECT \"id\",\"amount\" AS \"total\" FROM \"stg\""
+        ]
+      ],
+      "expected": {
+        "resolved": 4
+      },
+      "expected_column_edges": 2
+    },
+    {
+      "name": "snowflake_literal",
+      "component_id": "keboola.snowflake-transformation",
+      "in_map": {
+        "src": "in.c-main.orders"
+      },
+      "out_map": {
+        "result": "out.c-out.result"
+      },
+      "statements": [
+        [
+          "c1",
+          "INSERT INTO \"result\" SELECT \"id\", CURRENT_TIMESTAMP() AS \"loaded\" FROM \"src\""
+        ]
+      ],
+      "expected": {
+        "resolved": 1,
+        "no_upstream": 1
+      },
+      "expected_column_edges": 1
+    },
+    {
+      "name": "bigquery_direct",
+      "component_id": "keboola.google-bigquery-transformation",
+      "in_map": {
+        "src": "in.c-bq.events"
+      },
+      "out_map": {
+        "result": "out.c-bq.agg"
+      },
+      "statements": [
+        [
+          "c1",
+          "INSERT INTO result SELECT id, ts FROM src"
+        ]
+      ],
+      "expected": {
+        "resolved": 2
+      },
+      "expected_column_edges": 2
+    },
+    {
+      "name": "redshift_direct",
+      "component_id": "keboola.redshift-transformation",
+      "in_map": {
+        "src": "in.c-rs.raw"
+      },
+      "out_map": {
+        "result": "out.c-rs.clean"
+      },
+      "statements": [
+        [
+          "c1",
+          "INSERT INTO result SELECT id, amount FROM src"
+        ]
+      ],
+      "expected": {
+        "resolved": 2
+      },
+      "expected_column_edges": 2
+    },
+    {
+      "name": "snowflake_join",
+      "component_id": "keboola.snowflake-transformation",
+      "in_map": {
+        "a": "in.c-main.orders",
+        "b": "in.c-main.customers"
+      },
+      "out_map": {
+        "result": "out.c-out.joined"
+      },
+      "statements": [
+        [
+          "c1",
+          "INSERT INTO \"result\" SELECT \"a\".\"id\", \"b\".\"name\" FROM \"a\" JOIN \"b\" ON \"a\".\"cid\"=\"b\".\"id\""
+        ]
+      ],
+      "expected": {
+        "unresolved": 2
+      },
+      "expected_column_edges": 0
+    },
+    {
+      "name": "snowflake_star_subquery",
+      "component_id": "keboola.snowflake-transformation",
+      "in_map": {
+        "src": "in.c-main.orders"
+      },
+      "out_map": {
+        "result": "out.c-out.result"
+      },
+      "statements": [
+        [
+          "c1",
+          "CREATE TABLE \"result\" AS SELECT \"s\".\"id\" FROM (SELECT * FROM \"src\") \"s\""
+        ]
+      ],
+      "expected": {
+        "needs_schema": 1
+      },
+      "expected_column_edges": 0
+    },
+    {
+      "name": "unparseable",
+      "component_id": "keboola.snowflake-transformation",
+      "in_map": {
+        "src": "in.c-main.orders"
+      },
+      "out_map": {
+        "result": "out.c-out.result"
+      },
+      "statements": [
+        [
+          "bad",
+          "SELECT FROM WHERE )))((("
+        ],
+        [
+          "c2",
+          "INSERT INTO \"result\" SELECT \"id\" FROM \"src\""
+        ]
+      ],
+      "expected": {
+        "unresolved": 1,
+        "resolved": 1
+      },
+      "expected_column_edges": 1
+    }
+  ]
+}
