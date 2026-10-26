@@ -35,6 +35,19 @@ class FailureMode(StrEnum):
     LOG_ONLY = "log_only"
 
 
+class CustomPropertiesMode(StrEnum):
+    """Whether the writer fills / defines ``kbc*`` custom properties in OpenMetadata.
+
+    An OM custom property is defined on an entity *type* (e.g. every Table in the
+    instance, BigQuery and MySQL ones included), so defining one is an
+    instance-wide change; it is opt-in.
+    """
+
+    EXISTING_ONLY = "existing_only"
+    CREATE = "create"
+    OFF = "off"
+
+
 class Ssh(BaseModel):
     """Optional SSH bastion tunnel around the OM host (spec 3.4)."""
 
@@ -59,6 +72,7 @@ class Configuration(BaseModel):
     om_host: str
     bot_token: str = Field(alias="#bot_token")
     service_name: str | None = None
+    custom_properties: CustomPropertiesMode = CustomPropertiesMode.EXISTING_ONLY
 
     # --- Behaviour (row, Advanced) ---
     merge_mode: MergeMode = MergeMode.THREE_WAY_MERGE
@@ -71,6 +85,10 @@ class Configuration(BaseModel):
     write_table_lineage: bool = True
     write_column_lineage: bool = True
     write_pipeline_lineage: bool = True
+    # Legacy layout: the pipeline as a node between tables (table -> pipeline -> table).
+    # Off by default: OM draws column lineage only on a direct table -> table edge,
+    # so the pipeline is attached to that edge instead.
+    pipeline_lineage_as_node: bool = False
     write_dashboard_lineage: bool = True
     write_pipeline_status: bool = True
     full_refresh: bool = False

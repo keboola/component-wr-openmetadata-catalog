@@ -245,3 +245,26 @@ def test_find_user_id_by_email_reraises_auth_error():
     c = _client(session)
     with pytest.raises(OMAuthError):
         c.find_user_id_by_email("x@keboola.com")
+
+
+def test_ensure_custom_properties_without_create_never_defines_a_property():
+    # A custom property applies to every entity of its type in the instance, so the
+    # default mode only reads what an OM admin defined and never PUTs a type change.
+    session = mock.Mock()
+    session.request.return_value = FakeResponse(200, {"id": "t1", "customProperties": [{"name": "kbcProjectId"}]})
+    c = _client(session)
+    out = c.ensure_custom_properties(
+        "table", [("kbcProjectId", "string", "d"), ("kbcUrl", "string", "d")], create=False
+    )
+    assert out == {"kbcProjectId"}
+    assert [call.args[0] for call in session.request.call_args_list] == ["GET"]
+
+
+def test_connection_error_names_the_host():
+    session = mock.Mock()
+    session.request.side_effect = requests.ConnectionError("boom")
+    c = OMClient("https://om.example.com", "tok", session=session, backoff_base=0, max_retries=0)
+    with pytest.raises(OMConnectionError) as exc:
+        c.probe_version()
+    assert "https://om.example.com/api/v1" in str(exc.value)
+    assert "SSH" not in str(exc.value)

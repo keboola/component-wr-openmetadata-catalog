@@ -48,6 +48,12 @@ def bucket_digest(bucket_fields: dict, table_fields: list[dict]) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
+# How pipelines sit in the lineage graph: on the table -> table edge, or as a node
+# between the tables (legacy). Recorded so a layout change cleans the old edges once.
+LINEAGE_LAYOUT_EDGE = "pipeline_on_edge"
+LINEAGE_LAYOUT_NODE = "pipeline_as_node"
+
+
 class StateManager:
     """Reads/writes the per-row ``state.json`` (pointers + per-bucket digests)."""
 
@@ -62,6 +68,7 @@ class StateManager:
         self.run_count: int = int(state.get("run_count") or 0)
         self.om_version_seen: str | None = state.get("om_version_seen")
         self.om_target_seen: str | None = state.get("om_target_seen")
+        self.lineage_layout: str | None = state.get("lineage_layout")
 
     def bind_om_target(self, target: str) -> bool:
         """Forget the per-bucket digests when the OpenMetadata target changed.
@@ -100,6 +107,7 @@ class StateManager:
             "run_count": self.run_count,
             "om_version_seen": self.om_version_seen,
             "om_target_seen": self.om_target_seen,
+            "lineage_layout": self.lineage_layout,
         }
 
 

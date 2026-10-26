@@ -86,6 +86,26 @@
         "tooltip": "Leave empty to use the default service \"keboola\" (shown as \"Keboola\" in OpenMetadata). Set a name only to pin a specific service, or when several Keboola stacks write into one OpenMetadata instance and each needs its own service. Changing it later starts a new service tree in OpenMetadata."
       },
       "propertyOrder": 60
+    },
+    "custom_properties": {
+      "type": "string",
+      "title": "Custom Properties",
+      "description": "How the writer handles its kbc* custom properties (project id, deep links, owner, last change)",
+      "enum": [
+        "existing_only",
+        "create",
+        "off"
+      ],
+      "default": "existing_only",
+      "options": {
+        "enum_titles": [
+          "Fill only properties already defined in OpenMetadata",
+          "Define missing properties, then fill them",
+          "Do not write custom properties"
+        ],
+        "tooltip": "An OpenMetadata custom property is defined per entity type, so it appears on every table, schema, pipeline or dashboard in the instance — including BigQuery, MySQL and other services. The default writes values only for properties an OpenMetadata admin has already defined. Choose 'Define missing properties' to let the bot create them (the bot needs permission to edit entity types)."
+      },
+      "propertyOrder": 70
     }
   }
 }

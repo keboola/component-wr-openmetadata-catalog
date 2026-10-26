@@ -128,8 +128,8 @@ class OMClient:
                     self._sleep(attempt)
                     continue
                 raise OMConnectionError(
-                    f"Could not reach OpenMetadata ({method} {path}) after {self.max_retries + 1} attempts: {exc}. "
-                    "Check om_host, network/proxy reachability, and the SSH tunnel if enabled."
+                    f"Could not reach OpenMetadata at {self.base_url} ({method} {path}) after "
+                    f"{self.max_retries + 1} attempts: {exc}"
                 ) from exc
 
             if response.status_code in (401, 403):
@@ -221,19 +221,24 @@ class OMClient:
 
     # -------------------------------------------------- custom properties
 
-    def ensure_custom_properties(self, entity_type: str, specs: list[tuple[str, str, str]]) -> set[str]:
-        """Ensure custom properties ``(name, field_type, description)`` exist on ``entity_type``.
+    def ensure_custom_properties(
+        self, entity_type: str, specs: list[tuple[str, str, str]], *, create: bool = True
+    ) -> set[str]:
+        """Return the custom properties ``(name, field_type, description)`` defined on ``entity_type``.
 
-        Returns the property names that exist afterwards. Defining a property is an
-        admin-level type change a bot token may be refused; such a failure is logged
-        and the property left out of the returned set, so the caller skips its value
-        instead of 400-ing the entity write.
+        With ``create`` a missing property is defined first. Defining a property is
+        an admin-level type change a bot token may be refused; such a failure is
+        logged and the property left out of the returned set, so the caller skips
+        its value instead of 400-ing the entity write. Without ``create`` only the
+        properties an OM admin already defined are returned.
         """
         entity = self._request(
             "GET", f"/metadata/types/name/{entity_type}", params={"fields": "customProperties"}
         ).json()
         type_id = entity.get("id")
         existing = {c.get("name") for c in (entity.get("customProperties") or [])}
+        if not create:
+            return existing
         for name, field_type, description in specs:
             if name in existing:
                 continue
@@ -315,6 +320,10 @@ class OMClient:
     def soft_delete(self, kind: str, entity_id: str, *, recursive: bool = True) -> None:
         params = {"hardDelete": "false", "recursive": "true" if recursive else "false"}
         self._request("DELETE", self._path_for(kind, f"/{entity_id}"), params=params)
+
+    def delete_lineage_edge(self, from_type: str, from_id: str, to_type: str, to_id: str) -> None:
+        """DELETE one edge by its endpoints (available on 1.13.4 and 2.x)."""
+        self._request("DELETE", f"/lineage/{from_type}/{from_id}/{to_type}/{to_id}")
 
     def delete_lineage_by_source(self, entity_type: str, fqn: str, source: str) -> None:
         """Drop our edges of one ``source`` from an entity.

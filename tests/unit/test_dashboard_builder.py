@@ -11,7 +11,7 @@ def _builder():
 def test_dashboard_service_body():
     svc = _builder().dashboard_service_body()
     assert svc["serviceType"] == "CustomDashboard"
-    assert svc["name"] == "keboola-stack-1234"  # one service per project...
+    assert svc["name"] == "keboola-stack-Acme_Project"  # one service per project...
     assert svc["displayName"] == "Acme_Project"  # ...shown under the project's name
 
 
@@ -143,7 +143,13 @@ def test_resolver_not_called_when_no_owner_email():
 def test_dashboard_extension_names_its_project():
     built = _builder().build_dashboard({"id": "01app", "name": "App", "configuration": {"parameters": {}}})
     ext = built.body["extension"]
-    assert built.fqn == "keboola-stack-1234.01app"
+    assert built.fqn == "keboola-stack-Acme_Project.01app"
     assert ext["kbcProjectId"] == "1234"
     assert ext["kbcProjectName"] == "Acme_Project"
     assert ext["kbcProjectUrl"]["url"].endswith("/admin/projects/1234")
+
+
+def test_dashboard_names_its_keboola_project():
+    builder = DashboardBuilder("keboola-stack", "Acme Project", "1234", "https://connection.keboola.com")
+    built = builder.build_dashboard({"id": "01app", "name": "App"})
+    assert built.body["project"] == "Acme Project"

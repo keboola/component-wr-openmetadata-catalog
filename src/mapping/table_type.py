@@ -1,12 +1,13 @@
 """Keboola bucket/table -> OpenMetadata ``tableType`` detection (clean-room).
 
-Rules (research 3 / spec 4.1):
+Rules (research 3 / spec 4.1), first match wins:
     - ``hasExternalSchema`` and no sharing        -> External
-    - stage in {out, shared, linked}, sharing in  -> Regular
-      {specific-projects, none, null}
-    - stage == in and a sourceBucket present       -> View
-    - a table alias                                -> View
+    - a linked bucket (``sourceBucket`` present)   -> View, in any stage
+    - a table alias                                -> View, in any stage
     - otherwise                                    -> Regular
+
+A linked bucket can live in the ``out`` stage as well as ``in``, so the link is
+checked before the stage: its tables are views of the source project's tables.
 """
 
 from __future__ import annotations
@@ -14,9 +15,6 @@ from __future__ import annotations
 REGULAR = "Regular"
 VIEW = "View"
 EXTERNAL = "External"
-
-_REGULAR_STAGES = frozenset({"out", "shared", "linked"})
-_REGULAR_SHARING = frozenset({"specific-projects", "none"})
 
 
 def detect_table_type(
@@ -30,10 +28,6 @@ def detect_table_type(
     """Return one of ``Regular`` / ``View`` / ``External``."""
     if has_external_schema and sharing in (None, "none"):
         return EXTERNAL
-    if stage in _REGULAR_STAGES and (sharing is None or sharing in _REGULAR_SHARING):
-        return REGULAR
-    if stage == "in" and has_source_bucket:
-        return VIEW
-    if is_alias:
+    if has_source_bucket or is_alias:
         return VIEW
     return REGULAR

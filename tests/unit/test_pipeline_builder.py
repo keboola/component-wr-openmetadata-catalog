@@ -11,7 +11,7 @@ def _builder(stack_id=None):
 def test_pipeline_service_body():
     svc = _builder().pipeline_service_body()
     assert svc["serviceType"] == "CustomPipeline"
-    assert svc["name"] == "keboola-stack-1234"  # one service per project...
+    assert svc["name"] == "keboola-stack-Acme_Project"  # one service per project...
     assert svc["displayName"] == "Acme_Project"  # ...shown under the project's name
 
 
@@ -29,10 +29,10 @@ def test_config_to_pipeline_with_ordered_tasks_and_sql():
         },
     }
     built = _builder().build_pipeline("keboola.snowflake-transformation", config)
-    assert built.fqn == "keboola-stack-1234.999"
+    assert built.fqn == "keboola-stack-Acme_Project.999"
     body = built.body
     assert body["name"] == "999"
-    assert body["service"] == "keboola-stack-1234"
+    assert body["service"] == "keboola-stack-Acme_Project"
     tasks = body["tasks"]
     assert [t["name"] for t in tasks] == ["block_1", "block_2"]
     assert tasks[0]["taskType"] == "QUERY"
