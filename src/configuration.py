@@ -92,6 +92,8 @@ class Configuration(BaseModel):
     write_dashboard_lineage: bool = True
     write_pipeline_status: bool = True
     full_refresh: bool = False
+    # OpenMetadata / Storage requests in flight at once. 1 = one at a time.
+    parallel_requests: int = Field(default=8, ge=1, le=10)
 
     # --- SSH (root) ---
     use_ssh_tunnel: bool = False

@@ -89,6 +89,13 @@ class RunReport:
     def rows(self) -> list[dict]:
         return list(self._rows)
 
+    def fork(self) -> RunReport:
+        """An empty report for one parallel task, merged back with :meth:`extend`."""
+        return RunReport(run_id=self.run_id, config_row_id=self.config_row_id)
+
+    def extend(self, other: RunReport) -> None:
+        self._rows.extend(other._rows)
+
     def counts(self) -> Counter:
         return Counter(row["action"] for row in self._rows)
 

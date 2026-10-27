@@ -81,6 +81,7 @@
     "write_table_lineage": false,
     "write_pipeline_lineage": false,
     "write_dashboard_lineage": false,
-    "service_name": "keboola-vcr-merge-kw"
+    "service_name": "keboola-vcr-merge-kw3",
+    "parallel_requests": 1
   }
 }

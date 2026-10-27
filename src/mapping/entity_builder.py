@@ -35,6 +35,14 @@ _SERVICE_TYPE = "CustomDatabase"
 # Custom properties defined on the OpenMetadata Table/DatabaseSchema/Database
 # types: (name, field type, description). om_types used across this component
 # are only ever "string", "email", "hyperlink-cp".
+# Table statistics that change on every data load -> the custom property that
+# carries each. Kept out of the incremental digest when the property is not written.
+TABLE_STAT_PROPERTIES = {
+    "row_count": "kbcRowsCount",
+    "data_size_bytes": "kbcDataSizeBytes",
+    "last_import_date": "kbcLastImport",
+}
+
 TABLE_CUSTOM_PROPERTIES = [
     ("kbcTableId", "string", "Keboola Storage table id"),
     ("kbcBucketId", "string", "Keboola Storage bucket id"),
