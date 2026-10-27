@@ -1685,3 +1685,69 @@ def test_extractor_without_inputs_keeps_its_pipeline_as_a_node():
 
     put_pairs = {(r["edge"]["fromEntity"]["id"], r["edge"]["toEntity"]["id"]) for r in om.put_calls}
     assert put_pairs == {("id-ex1", "id-orders")}
+
+
+def _one_config_lineage_run(configuration: dict, *, pipeline_fqn: str | None):
+    svc, proj, pid = "keboola-stack", "Acme_Project", "4214"
+
+    class _Reader:
+        def list_component_configs(self):
+            return [{"id": "keboola.python-transformation-v2", "configurations": [configuration]}]
+
+    run = _ProjectRun(
+        ctx=ProjectContext(project_id=pid, project_name=proj, storage_token="t", storage_url="https://s"),
+        reader=_Reader(),  # ty: ignore[invalid-argument-type]  (duck-typed test double)
+        entities=EntityBuilder(svc, proj, pid, "https://ui.example"),
+        pipelines=PipelineBuilder(svc, proj, pid, "https://ui.example"),
+        dashboards=DashboardBuilder(svc, proj, pid, "https://ui.example"),
+    )
+    if pipeline_fqn:
+        run.pipeline_fqn_by_config[configuration["id"]] = pipeline_fqn
+    config = SimpleNamespace(
+        pipeline_lineage_as_node=False,
+        write_table_lineage=True,
+        write_pipeline_lineage=True,
+        write_column_lineage=False,
+        write_bucket_lineage=False,
+    )
+    return run, config, svc, proj
+
+
+def test_pipeline_keeps_its_inputs_when_its_table_edge_cannot_be_written():
+    """The output table is not in OpenMetadata (excluded by the bucket selector), so
+    the input -> output edge cannot be written; the pipeline still shows its input."""
+    cfg = {
+        "id": "py1",
+        "configuration": {
+            "storage": {
+                "input": {"tables": [{"source": "in.c-main.a", "destination": "a.csv"}]},
+                "output": {"tables": [{"source": "x.csv", "destination": "out.c-skipped.x"}]},
+            }
+        },
+    }
+    pipe = "keboola-stack-Acme_Project.py1"
+    run, config, svc, proj = _one_config_lineage_run(cfg, pipeline_fqn=pipe)
+    om = _LineageRecordingOM({_storage_fqn(svc, proj, "in.c-main.a"): "id-a", pipe: "id-pipe"})
+
+    comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
+    comp._lineage_pass(config, om, run, component_mod.RunReport(run_id="rid"))  # ty: ignore[invalid-argument-type]
+
+    put_pairs = {(r["edge"]["fromEntity"]["id"], r["edge"]["toEntity"]["id"]) for r in om.put_calls}
+    assert put_pairs == {("id-a", "id-pipe")}
+
+
+def test_layout_switch_drops_legacy_node_edges_of_configs_without_a_pipeline_this_run():
+    """A config excluded by the selector at layout-switch time still loses its old node edges."""
+    cfg = {
+        "id": "py1",
+        "configuration": {"storage": {"input": {"tables": [{"source": "in.c-main.a", "destination": "a.csv"}]}}},
+    }
+    run, config, svc, proj = _one_config_lineage_run(cfg, pipeline_fqn=None)
+    legacy_pipe = fqn_mod.pipeline_fqn(svc, proj, "py1")
+    om = _LineageRecordingOM({_storage_fqn(svc, proj, "in.c-main.a"): "id-a", legacy_pipe: "id-pipe"})
+
+    comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
+    done = comp._lineage_pass(config, om, run, component_mod.RunReport(run_id="rid"), drop_legacy_node_edges=True)  # ty: ignore[invalid-argument-type]
+
+    assert done is True
+    assert om.delete_edge_calls == [("table", "id-a", "pipeline", "id-pipe")]

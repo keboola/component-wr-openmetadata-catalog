@@ -150,3 +150,51 @@ def test_same_named_service_of_another_project_is_not_retired():
         om, _run(), component_mod.RunReport(run_id="rid"), "pipelineServices", "PipelineService", "keboola-L0_Events"
     )
     om.soft_delete.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [component_mod.OMClientError("OM GET /system/version failed: 404"), ValueError("Expecting value: line 1")],
+)
+def test_test_connection_unexpected_answer_is_a_user_error_with_the_hint(error):
+    om = mock.Mock()
+    om.probe_version.side_effect = error
+    with (
+        mock.patch.object(component_mod, "OMClient", return_value=om) as om_cls,
+        pytest.raises(UserException) as exc,
+    ):
+        _component({"om_host": "https://om.internal/api", "#bot_token": "jwt"}).test_connection()
+    assert "not as the OpenMetadata API" in str(exc.value)
+    assert "SSH tunnel is OFF" in str(exc.value)
+    assert om_cls.call_args.kwargs["max_retries"] == 0  # one attempt: stays inside the sync-action limit
+
+
+def test_existing_only_mode_logs_the_properties_it_cannot_write(caplog):
+    om = mock.Mock()
+    om.ensure_custom_properties.return_value = {"kbcProjectId"}
+    specs = [("kbcProjectId", "string", ""), ("kbcUrl", "string", "")]
+    with caplog.at_level("INFO"):
+        component_mod.Component._ensure_custom_properties(
+            om, "table", specs, "Table", CustomPropertiesMode.EXISTING_ONLY
+        )
+    assert "kbcUrl" in caplog.text
+    assert "kbcProjectId" not in caplog.text
+    assert "Define missing properties" in caplog.text
+
+
+def test_legacy_service_is_kept_when_the_new_service_write_fails():
+    comp = component_mod.Component.__new__(component_mod.Component)
+    config = SimpleNamespace(
+        write_transformations=True, write_components=False, write_flows=False, custom_properties="existing_only"
+    )
+    pipelines = mock.Mock()
+    pipelines.pipeline_service_body.return_value = {"name": "keboola-Proj"}
+    run = SimpleNamespace(pipelines=pipelines)
+    with (
+        mock.patch.object(component_mod.Component, "_upsert", return_value=False),
+        mock.patch.object(component_mod.Component, "_retire_legacy_service") as retire,
+        mock.patch.object(component_mod.Component, "_ensure_custom_properties", side_effect=RuntimeError("stop")),
+        pytest.raises(RuntimeError, match="stop"),
+    ):
+        comp._pipeline_pass(config, mock.Mock(), run, mock.Mock(), mock.Mock(), mock.Mock(), {})  # ty: ignore[invalid-argument-type]
+    retire.assert_not_called()

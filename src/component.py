@@ -343,6 +343,8 @@ class Component(ComponentBase):
                 om.probe_version()
             except OMConnectionError as exc:
                 raise UserException(f"{exc}. {self._connection_hint(config)}") from exc
+            except (OMClientError, ValueError) as exc:
+                raise UserException(self._unexpected_answer(config, exc)) from exc
             server_version = om.server_version
             version_changed = state.om_version_seen not in (None, server_version)
             snapshot = self._load_snapshot(env, state)
@@ -401,6 +403,15 @@ class Component(ComponentBase):
             f"The SSH tunnel is OFF: the component connected directly to {config.om_host}. That host must be "
             "reachable from Keboola's static egress IP addresses; if it is on a private network, allow-list those "
             "IPs or turn on 'Use SSH Tunnel' with a bastion that can reach it."
+        )
+
+    @classmethod
+    def _unexpected_answer(cls, config: Configuration, exc: Exception) -> str:
+        """A host that answers, but not as the OpenMetadata API (wrong path, a login page)."""
+        return (
+            f"{config.om_host} answered, but not as the OpenMetadata API ({exc}). Check that OpenMetadata Host "
+            "is the base URL of the OpenMetadata UI, without '/api', and that no login page or proxy sits in "
+            f"front of it. {cls._connection_hint(config)}"
         )
 
     # ------------------------------------------------------ project resolve
@@ -515,10 +526,19 @@ class Component(ComponentBase):
         if mode == CustomPropertiesMode.OFF:
             return set()
         try:
-            return om.ensure_custom_properties(entity_type, specs, create=mode == CustomPropertiesMode.CREATE)
+            available = om.ensure_custom_properties(entity_type, specs, create=mode == CustomPropertiesMode.CREATE)
         except Exception as exc:  # noqa: BLE001 - metadata-type read/define is best-effort
             logger.warning("%s custom properties unavailable (%s); writing without extension", label, exc)
             return set()
+        missing = [name for name, _type, _description in specs if name not in available]
+        if mode == CustomPropertiesMode.EXISTING_ONLY and missing:
+            logger.info(
+                "%s custom properties not defined in OpenMetadata, so not written: %s. Set Custom Properties to "
+                "'Define missing properties' to have the writer define them.",
+                label,
+                ", ".join(missing),
+            )
+        return available
 
     def _catalog_pass(
         self,
@@ -691,7 +711,8 @@ class Component(ComponentBase):
         # is fetched under ``_lineage_pass``.)
         if not (config.write_transformations or config.write_components or config.write_flows):
             return
-        self._upsert(
+        # Retire the pre-0.2 service only once its replacement is in place.
+        if self._upsert(
             om,
             run,
             "pipelineServices",
@@ -702,10 +723,10 @@ class Component(ComponentBase):
             snapshot,
             report,
             merger,
-        )
-        self._retire_legacy_service(
-            om, run, report, "pipelineServices", "PipelineService", run.pipelines.pipeline_service_body()["name"]
-        )
+        ):
+            self._retire_legacy_service(
+                om, run, report, "pipelineServices", "PipelineService", run.pipelines.pipeline_service_body()["name"]
+            )
         available = self._ensure_custom_properties(
             om, "pipeline", PIPELINE_CUSTOM_PROPERTIES, "Pipeline", config.custom_properties
         )
@@ -852,7 +873,7 @@ class Component(ComponentBase):
         upserted as a Dashboard under one ``CustomDashboard`` service, so its metadata
         (name, description, deep link to the Keboola config) shows up in OpenMetadata.
         """
-        self._upsert(
+        if self._upsert(
             om,
             run,
             "dashboardServices",
@@ -863,10 +884,15 @@ class Component(ComponentBase):
             snapshot,
             report,
             merger,
-        )
-        self._retire_legacy_service(
-            om, run, report, "dashboardServices", "DashboardService", run.dashboards.dashboard_service_body()["name"]
-        )
+        ):
+            self._retire_legacy_service(
+                om,
+                run,
+                report,
+                "dashboardServices",
+                "DashboardService",
+                run.dashboards.dashboard_service_body()["name"],
+            )
         available = self._ensure_custom_properties(
             om, "dashboard", DASHBOARD_CUSTOM_PROPERTIES, "Dashboard", config.custom_properties
         )
@@ -971,10 +997,25 @@ class Component(ComponentBase):
                         project=run.entities.project,
                         pipeline_fqn=pipeline_fqn,
                     ) + self._inferred_input_pipeline_edges(run, storage, pipeline_fqn, column_result)
-                    if config.write_pipeline_lineage and (_pipelines_as_lineage_nodes(config) or not table_edges):
+                    # Edges that cannot be written (an endpoint outside the catalog) do
+                    # not count: the pipeline would otherwise show no lineage at all.
+                    if config.write_pipeline_lineage and (
+                        _pipelines_as_lineage_nodes(config) or not self._writable_edges(om, run, table_edges)
+                    ):
                         edges += node_edges
                     elif drop_legacy_node_edges:
                         legacy_node_edges += node_edges
+                elif drop_legacy_node_edges:
+                    # A config with no pipeline this run (selector, family switch) may
+                    # still hold node edges from the legacy layout: drop them too.
+                    legacy_node_edges += lineage_builder.pipeline_edges(
+                        storage,
+                        service_name=run.entities.service_name,
+                        project=run.entities.project,
+                        pipeline_fqn=fqn_mod.pipeline_fqn(
+                            run.entities.service_name, run.entities.project, str(cfg.get("id"))
+                        ),
+                    )
                 if config.write_column_lineage:
                     edges += self._column_edges_for(run, cfg, edge_pipeline_fqn, column_result, report)
         edges = lineage_builder.merge_edges(edges)
@@ -982,6 +1023,16 @@ class Component(ComponentBase):
             edges += lineage_builder.bucket_edges(edges)
         self._refresh_lineage(om, run, report, edges)
         return self._delete_legacy_node_edges(om, run, legacy_node_edges)
+
+    def _writable_edges(self, om, run, edges: list[lineage_builder.LineageEdge]) -> list[lineage_builder.LineageEdge]:
+        """The edges whose two endpoints exist in OM: cataloged this run, or found by name."""
+
+        def exists(fqn: str, entity_type: str) -> bool:
+            if entity_type == "table" and fqn in run.seen_table_fqns:
+                return True
+            return self._resolve_id(om, run, fqn, entity_type) is not None
+
+        return [e for e in edges if exists(e.from_fqn, e.from_type) and exists(e.to_fqn, e.to_type)]
 
     @staticmethod
     def _flow_child_edges_for(run: _ProjectRun, cfg: dict, flow_pipeline_fqn: str) -> list[lineage_builder.LineageEdge]:
@@ -1472,7 +1523,8 @@ class Component(ComponentBase):
         try:
             # Fail fast: a sync action has a short platform time limit, so the
             # run-time retry budget (5 x 60 s) would end in a bare platform timeout.
-            om = self._build_om_client(config, proxy, timeout=15, max_retries=1)
+            # One 15 s attempt leaves room for the SSH tunnel setup.
+            om = self._build_om_client(config, proxy, timeout=15, max_retries=0)
             om.probe_version()
             version = om.server_version
             # /system/version is unauthenticated (OM JwtFilter.EXCLUDED_ENDPOINTS),
@@ -1483,6 +1535,8 @@ class Component(ComponentBase):
             raise UserException(str(exc)) from exc
         except OMConnectionError as exc:
             raise UserException(f"{exc}. {self._connection_hint(config)}") from exc
+        except (OMClientError, ValueError) as exc:
+            raise UserException(self._unexpected_answer(config, exc)) from exc
         finally:
             if proxy is not None:
                 proxy.close()
