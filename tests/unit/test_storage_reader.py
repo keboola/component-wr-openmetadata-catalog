@@ -261,7 +261,7 @@ def test_read_snapshot_rows_pages_through_the_whole_table():
     ]
     rows[7]["written_fields_json"] = json.dumps({"columns": "x" * 200_000})  # > csv's 128 KB default field limit
     api = _PreviewApi(rows)
-    reader = StorageReader("https://connection.keboola.com", "tok", session=api)
+    reader = StorageReader("https://connection.keboola.com", "tok", session=api)  # ty: ignore[invalid-argument-type]  (duck-typed test double)
     got = list(reader.read_snapshot_rows("in.c-x.last_written_snapshot"))
     assert [r["entity_fqn"] for r in got] == sorted(r["entity_fqn"] for r in rows)
     assert all(int(c["limit"]) <= 1000 for c in api.calls if "limit" in c)
@@ -280,7 +280,7 @@ def test_read_snapshot_rows_streams_page_by_page():
         {"entity_fqn": f"svc.p.b.t{i:05d}", "entity_type": "table", "written_fields_json": "{}"} for i in range(2500)
     ]
     api = _PreviewApi(rows)
-    reader = StorageReader("https://connection.keboola.com", "tok", session=api)
+    reader = StorageReader("https://connection.keboola.com", "tok", session=api)  # ty: ignore[invalid-argument-type]  (duck-typed test double)
     stream = reader.read_snapshot_rows("in.c-x.last_written_snapshot")
     first = next(stream)
     assert first["entity_fqn"] == "svc.p.b.t00000"

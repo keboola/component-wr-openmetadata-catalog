@@ -403,7 +403,7 @@ def test_snapshot_store_keeps_a_large_base_small_in_memory():
     held, _peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
     assert held < raw / 4, (held, raw)
-    assert store.base_fields("svc.p.b.t00007")["columns"][3]["name"] == "col_3"
+    assert store.base_fields("svc.p.b.t00007")["columns"][3]["name"] == "col_3"  # ty: ignore[not-subscriptable]
     assert store.base_fields("svc.p.b.missing") is None
 
 

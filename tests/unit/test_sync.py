@@ -1,4 +1,5 @@
 from sync import (
+    LINEAGE_LAYOUT_EDGE,
     StateManager,
     TombstonePlanner,
     bucket_digest,
@@ -154,3 +155,10 @@ def test_tombstone_empty_bucket_is_a_quiet_no_op():
     plan = TombstonePlanner.self_diff(listed_fqns=[], seen_fqns=[], min_scope=1)
     assert plan.blocked is False
     assert plan.to_delete == []
+
+
+def test_lineage_layout_round_trips_through_state():
+    state = StateManager({})
+    assert state.lineage_layout is None  # state written before the layout was tracked
+    state.lineage_layout = LINEAGE_LAYOUT_EDGE
+    assert StateManager(state.to_dict()).lineage_layout == LINEAGE_LAYOUT_EDGE

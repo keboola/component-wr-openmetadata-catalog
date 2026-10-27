@@ -102,14 +102,21 @@ def column_fqn(table_fqn_value: str, column_name: str) -> str:
     return f"{table_fqn_value}.{sanitize_name(column_name)}"
 
 
-def project_service_name(service_name: str, project_id: str) -> str:
-    """Name of one project's Pipeline or Dashboard service: ``<service>-<projectId>``.
+def project_service_name(service_name: str, project: str) -> str:
+    """Name of one project's Pipeline or Dashboard service: ``<service>-<project name>``.
 
     OM's Pipelines and Dashboards trees have no level between service and entity
     (unlike Databases -> Database -> Schema), so the service is the only place the
-    project can show. The id, not the name, keeps it stable across project renames;
-    the project name is the service's ``displayName``.
+    project can show. It is keyed by the project name, like the project's Database
+    (``<service>.<project name>``), so an FQN or URL says which project it is from
+    without knowing Keboola project ids. A project rename starts a new service,
+    exactly as it starts a new Database.
     """
+    return f"{sanitize_name(service_name)}-{sanitize_name(project)}"
+
+
+def legacy_project_service_name(service_name: str, project_id: str) -> str:
+    """The per-project service name releases up to 0.1.x used: ``<service>-<projectId>``."""
     return f"{sanitize_name(service_name)}-{sanitize_name(str(project_id))}"
 
 
@@ -118,9 +125,9 @@ def pipeline_name(config_or_flow_id: str) -> str:
     return sanitize_name(str(config_or_flow_id))
 
 
-def pipeline_fqn(service_name: str, project_id: str, config_or_flow_id: str) -> str:
+def pipeline_fqn(service_name: str, project: str, config_or_flow_id: str) -> str:
     """FQN of a Pipeline ← component config or flow (spec 2.1)."""
-    return f"{project_service_name(service_name, project_id)}.{pipeline_name(config_or_flow_id)}"
+    return f"{project_service_name(service_name, project)}.{pipeline_name(config_or_flow_id)}"
 
 
 def dashboard_name(config_id: str) -> str:
@@ -128,6 +135,6 @@ def dashboard_name(config_id: str) -> str:
     return sanitize_name(str(config_id))
 
 
-def dashboard_fqn(service_name: str, project_id: str, config_id: str) -> str:
+def dashboard_fqn(service_name: str, project: str, config_id: str) -> str:
     """FQN of a Dashboard ← Keboola data-app config."""
-    return f"{project_service_name(service_name, project_id)}.{dashboard_name(config_id)}"
+    return f"{project_service_name(service_name, project)}.{dashboard_name(config_id)}"

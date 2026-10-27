@@ -7,6 +7,7 @@ resolving entity FQNs to ids just before ``PUT /lineage`` (entities exist first)
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from collections import defaultdict
 from collections.abc import Callable
@@ -89,28 +90,72 @@ def declared_edges(
     service_name: str,
     project: str,
     pipeline_fqn: str | None = None,
+    sql_table_edges: set[tuple[str, str]] | None = None,
 ) -> list[LineageEdge]:
-    """E16: coarse all-inputs -> all-outputs edges from a config's storage mapping."""
-    inputs = (storage.get("input") or {}).get("tables") or []
-    outputs = (storage.get("output") or {}).get("tables") or []
-    in_fqns = [f for t in inputs if (f := fqn.table_fqn_from_storage_id(service_name, project, t.get("source", "")))]
-    out_fqns = [
-        f for t in outputs if (f := fqn.table_fqn_from_storage_id(service_name, project, t.get("destination", "")))
-    ]
+    """E16: table -> table edges for one config, its pipeline attached to each edge.
+
+    The pipeline rides on the edge (``lineageDetails.pipeline``) instead of being a
+    node between the tables, so OpenMetadata keeps the table -> table path that
+    column-level lineage is drawn on.
+
+    Edges are the coarse all-declared-inputs x all-declared-outputs product, plus
+    ``sql_table_edges``: the ``(input, output)`` storage-id pairs the SQL parser
+    resolved, which add inputs read by a direct fully-qualified ref with no input
+    mapping. The declared product is kept even where the SQL resolved an output: a
+    statement the parser missed must not drop a real dependency.
+    """
+    inputs = [t.get("source", "") for t in (storage.get("input") or {}).get("tables") or []]
+    outputs = [t.get("destination", "") for t in (storage.get("output") or {}).get("tables") or []]
+    pairs = [(source, dest) for source in inputs for dest in outputs]
+    pairs += sorted(sql_table_edges or ())
+
     edges: list[LineageEdge] = []
-    for source_fqn in in_fqns:
-        for dest_fqn in out_fqns:
-            if _is_self_loop(source_fqn, dest_fqn, SOURCE_PIPELINE):
-                continue
-            edges.append(
-                LineageEdge(
-                    from_fqn=source_fqn,
-                    to_fqn=dest_fqn,
-                    source=SOURCE_PIPELINE,
-                    pipeline_fqn=pipeline_fqn,
-                )
+    seen: set[tuple[str, str]] = set()
+    for source_id, dest_id in pairs:
+        source_fqn = fqn.table_fqn_from_storage_id(service_name, project, source_id)
+        dest_fqn = fqn.table_fqn_from_storage_id(service_name, project, dest_id)
+        if not source_fqn or not dest_fqn or (source_fqn, dest_fqn) in seen:
+            continue
+        seen.add((source_fqn, dest_fqn))
+        if _is_self_loop(source_fqn, dest_fqn, SOURCE_PIPELINE):
+            continue
+        edges.append(
+            LineageEdge(
+                from_fqn=source_fqn,
+                to_fqn=dest_fqn,
+                source=SOURCE_PIPELINE,
+                pipeline_fqn=pipeline_fqn,
             )
+        )
     return edges
+
+
+def merge_edges(edges: list[LineageEdge]) -> list[LineageEdge]:
+    """Collapse edges that share both endpoints into one.
+
+    OpenMetadata stores one edge per (from, to) pair; a second ``PUT /lineage`` for
+    the pair replaces the first one's details. So a coarse declared edge must not
+    overwrite the column-level edge for the same pair: the column-bearing edge wins,
+    and column mappings from several edges of one pair are unioned. First-seen
+    order is kept, so the output is a stable function of the input.
+    """
+    merged: dict[tuple[str, str, str, str], LineageEdge] = {}
+    for edge in edges:
+        key = (edge.from_type, edge.from_fqn, edge.to_type, edge.to_fqn)
+        kept = merged.get(key)
+        if kept is None:
+            merged[key] = edge
+            continue
+        if edge.columns_lineage and not kept.columns_lineage:
+            merged[key] = dataclasses.replace(edge, pipeline_fqn=edge.pipeline_fqn or kept.pipeline_fqn)
+        elif edge.columns_lineage:
+            known = {(tuple(c["fromColumns"]), c["toColumn"]) for c in kept.columns_lineage}
+            kept.columns_lineage = kept.columns_lineage + [
+                c for c in edge.columns_lineage if (tuple(c["fromColumns"]), c["toColumn"]) not in known
+            ]
+        elif not kept.pipeline_fqn and edge.pipeline_fqn:
+            kept.pipeline_fqn = edge.pipeline_fqn
+    return list(merged.values())
 
 
 def pipeline_edges(
@@ -164,9 +209,17 @@ def pipeline_edges(
     return edges
 
 
-def view_edge(view_fqn: str, source_fqn: str) -> LineageEdge:
-    """ViewLineage edge for a linked/shared bucket (base table -> view)."""
-    return LineageEdge(from_fqn=source_fqn, to_fqn=view_fqn, source=SOURCE_VIEW)
+def view_edge(view_fqn: str, source_fqn: str, columns: list[str] | None = None) -> LineageEdge:
+    """ViewLineage edge for a linked/shared bucket (base table -> view).
+
+    A linked table is an alias of its source table: each of its ``columns`` is the
+    same-named source column, so the edge carries a 1:1 column mapping.
+    """
+    columns_lineage = [
+        {"fromColumns": [fqn.column_fqn(source_fqn, col)], "toColumn": fqn.column_fqn(view_fqn, col)}
+        for col in columns or []
+    ]
+    return LineageEdge(from_fqn=source_fqn, to_fqn=view_fqn, source=SOURCE_VIEW, columns_lineage=columns_lineage)
 
 
 def data_app_edges(

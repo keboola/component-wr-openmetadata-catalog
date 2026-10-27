@@ -238,7 +238,7 @@
               "format": "checkbox",
               "title": "Table lineage",
               "default": true,
-              "description": "Emit declared table-level lineage",
+              "description": "Emit table-to-table lineage from input/output mappings and transformation SQL",
               "options": {
                 "grid_columns": 6,
                 "tooltip": "Enabled by default."
@@ -262,10 +262,10 @@
               "format": "checkbox",
               "title": "Pipeline lineage",
               "default": true,
-              "description": "Emit lineage between pipelines and the tables they read or write",
+              "description": "Show the producing pipeline on each table lineage edge, and flow-to-task lineage",
               "options": {
                 "grid_columns": 6,
-                "tooltip": "Enabled by default."
+                "tooltip": "Enabled by default. OpenMetadata shows the pipeline on the edge between the input and output tables, so column lineage stays visible."
               },
               "propertyOrder": 4
             },
@@ -280,6 +280,21 @@
                 "tooltip": "Enabled by default."
               },
               "propertyOrder": 5
+            },
+            "pipeline_lineage_as_node": {
+              "type": "boolean",
+              "format": "checkbox",
+              "title": "Pipeline as lineage node (legacy)",
+              "default": false,
+              "description": "Also draw each pipeline as its own node between the tables (table → pipeline → table)",
+              "options": {
+                "grid_columns": 6,
+                "dependencies": {
+                  "write_pipeline_lineage": true
+                },
+                "tooltip": "Disabled by default. The extra node edges clutter the lineage graph and OpenMetadata does not draw column lineage through them."
+              },
+              "propertyOrder": 6
             }
           }
         },
@@ -319,7 +334,7 @@
               "Three-way merge",
               "Keboola overwrites"
             ],
-            "tooltip": "Three-way merge keeps fields a person edited in OpenMetadata and logs the change; Keboola overwrites replaces them."
+            "tooltip": "Three-way merge: the writer remembers what it wrote last time. A field that a person changed in OpenMetadata since then (for example a description) is kept, and the run report marks it 'skipped_diverged'. Keboola overwrites: Keboola is the source of truth, and every field the writer owns is overwritten on each run."
           },
           "propertyOrder": 40
         },

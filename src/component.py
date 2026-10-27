@@ -10,6 +10,7 @@ snapshot/state/report -> raise at the end in collect_and_fail mode.
 from __future__ import annotations
 
 import csv
+import dataclasses
 import json
 import logging
 import os
@@ -29,9 +30,16 @@ import report as report_mod
 from client import ssh_proxy
 from client.data_app_reader import fetch_app_states
 from client.job_queue_reader import JobQueueReader
-from client.om_client import OMAuthError, OMClient, OMClientError, OMPreconditionFailed
+from client.om_client import (
+    OMAuthError,
+    OMClient,
+    OMClientError,
+    OMConnectionError,
+    OMNotFound,
+    OMPreconditionFailed,
+)
 from client.storage_reader import SourceBucket, SourceTable, StorageReader, resolve_storage_credentials
-from configuration import Configuration, FailureMode
+from configuration import Configuration, CustomPropertiesMode, FailureMode
 from lineage.column_lineage import LineageResult, extract_column_lineage
 from lineage.dialect import dialect_for
 from mapping import fqn as fqn_mod
@@ -59,7 +67,15 @@ from merge import (
     ThreeWayMerger,
 )
 from report import RunReport
-from sync import StateManager, TombstonePlanner, bucket_digest, digest_fields, should_process_bucket
+from sync import (
+    LINEAGE_LAYOUT_EDGE,
+    LINEAGE_LAYOUT_NODE,
+    StateManager,
+    TombstonePlanner,
+    bucket_digest,
+    digest_fields,
+    should_process_bucket,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -239,7 +255,17 @@ VCR_SANITIZERS = [
 # content, so an unchanged bucket is skipped even when a release changed what would be
 # written for it (e.g. deep links moved to the public host). Bump this with any such
 # change: the saved digests are then dropped once and every bucket is written again.
-_CATALOG_FORMAT_VERSION = 2
+_CATALOG_FORMAT_VERSION = 3
+
+
+def _pipelines_as_lineage_nodes(config: Configuration) -> bool:
+    """Whether pipelines are lineage nodes (table -> pipeline -> table).
+
+    Normally the pipeline rides on the table -> table edge. With table lineage off
+    there is no such edge to carry it, so pipeline lineage keeps the node layout.
+    """
+    return config.pipeline_lineage_as_node or not config.write_table_lineage
+
 
 _BASE_TYPE_FACTORY = {
     "STRING": BaseType.string,
@@ -313,7 +339,12 @@ class Component(ComponentBase):
         synced_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
         try:
             om = self._build_om_client(config, proxy)
-            om.probe_version()
+            try:
+                om.probe_version()
+            except OMConnectionError as exc:
+                raise UserException(f"{exc}. {self._connection_hint(config)}") from exc
+            except (OMClientError, ValueError) as exc:
+                raise UserException(self._unexpected_answer(config, exc)) from exc
             server_version = om.server_version
             version_changed = state.om_version_seen not in (None, server_version)
             snapshot = self._load_snapshot(env, state)
@@ -355,10 +386,33 @@ class Component(ComponentBase):
     def _ui_base(storage_url: str) -> str:
         return storage_url.rstrip("/")
 
-    def _build_om_client(self, config: Configuration, proxy: ssh_proxy.SshProxy | None) -> OMClient:
+    def _build_om_client(self, config: Configuration, proxy: ssh_proxy.SshProxy | None, **client_kwargs) -> OMClient:
         host = proxy.local_om_host if proxy and proxy.local_om_host else config.om_host
         verify_ssl = proxy is None  # a loopback tunnel terminates TLS at the bastion
-        return OMClient(host, config.bot_token, verify_ssl=verify_ssl)
+        return OMClient(host, config.bot_token, verify_ssl=verify_ssl, **client_kwargs)
+
+    @staticmethod
+    def _connection_hint(config: Configuration) -> str:
+        """Say which network path was used, so a reachability error is not misread."""
+        if config.use_ssh_tunnel and config.ssh is not None:
+            return (
+                f"The SSH tunnel is ON: the component connected through bastion {config.ssh.host}:{config.ssh.port} "
+                f"to {config.om_host}. Check that the bastion can reach that host and port."
+            )
+        return (
+            f"The SSH tunnel is OFF: the component connected directly to {config.om_host}. That host must be "
+            "reachable from Keboola's static egress IP addresses; if it is on a private network, allow-list those "
+            "IPs or turn on 'Use SSH Tunnel' with a bastion that can reach it."
+        )
+
+    @classmethod
+    def _unexpected_answer(cls, config: Configuration, exc: Exception) -> str:
+        """A host that answers, but not as the OpenMetadata API (wrong path, a login page)."""
+        return (
+            f"{config.om_host} answered, but not as the OpenMetadata API ({exc}). Check that OpenMetadata Host "
+            "is the base URL of the OpenMetadata UI, without '/api', and that no login page or proxy sits in "
+            f"front of it. {cls._connection_hint(config)}"
+        )
 
     # ------------------------------------------------------ project resolve
 
@@ -435,14 +489,32 @@ class Component(ComponentBase):
             or config.write_dashboard_lineage
             or config.write_bucket_lineage
         ):
-            self._lineage_pass(config, om, run, report)
+            layout = LINEAGE_LAYOUT_NODE if _pipelines_as_lineage_nodes(config) else LINEAGE_LAYOUT_EDGE
+            cleaned = self._lineage_pass(
+                config,
+                om,
+                run,
+                report,
+                drop_legacy_node_edges=layout == LINEAGE_LAYOUT_EDGE and state.lineage_layout == LINEAGE_LAYOUT_NODE,
+            )
+            if cleaned:
+                state.lineage_layout = layout
         self._tombstone_pass(om, run, report)
 
     @staticmethod
     def _ensure_custom_properties(
-        om: OMClient, entity_type: str, specs: list[tuple[str, str, str]], label: str
+        om: OMClient,
+        entity_type: str,
+        specs: list[tuple[str, str, str]],
+        label: str,
+        mode: CustomPropertiesMode = CustomPropertiesMode.CREATE,
     ) -> set[str]:
         """Guarded ``ensure_custom_properties`` — never fails the run.
+
+        ``mode`` OFF writes no ``extension`` at all; EXISTING_ONLY fills only the
+        properties an OM admin defined (a custom property applies to every entity
+        of its type in the instance, so the writer does not define it unasked);
+        CREATE defines the missing ones first.
 
         Defining a custom-property type is an admin-level change a bot token
         may be refused; such a failure (or any other type-registration error)
@@ -451,11 +523,22 @@ class Component(ComponentBase):
         write. Shared by every pass (catalog/pipeline/dashboard) that
         registers one entity type's custom properties.
         """
+        if mode == CustomPropertiesMode.OFF:
+            return set()
         try:
-            return om.ensure_custom_properties(entity_type, specs)
+            available = om.ensure_custom_properties(entity_type, specs, create=mode == CustomPropertiesMode.CREATE)
         except Exception as exc:  # noqa: BLE001 - metadata-type read/define is best-effort
             logger.warning("%s custom properties unavailable (%s); writing without extension", label, exc)
             return set()
+        missing = [name for name, _type, _description in specs if name not in available]
+        if mode == CustomPropertiesMode.EXISTING_ONLY and missing:
+            logger.info(
+                "%s custom properties not defined in OpenMetadata, so not written: %s. Set Custom Properties to "
+                "'Define missing properties' to have the writer define them.",
+                label,
+                ", ".join(missing),
+            )
+        return available
 
     def _catalog_pass(
         self,
@@ -469,11 +552,15 @@ class Component(ComponentBase):
         version_changed: bool,
         synced_at: str | None = None,
     ) -> None:
-        available_database = self._ensure_custom_properties(om, "database", DATABASE_CUSTOM_PROPERTIES, "Database")
-        available_schema = self._ensure_custom_properties(
-            om, "databaseSchema", SCHEMA_CUSTOM_PROPERTIES, "DatabaseSchema"
+        available_database = self._ensure_custom_properties(
+            om, "database", DATABASE_CUSTOM_PROPERTIES, "Database", config.custom_properties
         )
-        available_table = self._ensure_custom_properties(om, "table", TABLE_CUSTOM_PROPERTIES, "Table")
+        available_schema = self._ensure_custom_properties(
+            om, "databaseSchema", SCHEMA_CUSTOM_PROPERTIES, "DatabaseSchema", config.custom_properties
+        )
+        available_table = self._ensure_custom_properties(
+            om, "table", TABLE_CUSTOM_PROPERTIES, "Table", config.custom_properties
+        )
 
         def resolve_owner(email: str) -> str | None:
             return self._resolve_owner(om, run, email)
@@ -570,7 +657,14 @@ class Component(ComponentBase):
                 )
                 bucket_ok = bucket_ok and ok
                 if built.view_source_fqn:
-                    self._put_lineage(om, run, report, lineage_builder.view_edge(built.fqn, built.view_source_fqn))
+                    view_columns = [col["name"] for col in built.body.get("columns") or []]
+                    self._put_lineage(
+                        om,
+                        run,
+                        report,
+                        lineage_builder.view_edge(built.fqn, built.view_source_fqn, view_columns),
+                        retry_table_level=True,
+                    )
             # advance-after-success: persist the digest only once the bucket's writes succeeded
             if bucket_ok:
                 state.set_bucket_digest(run.ctx.project_id, bucket.id, digest)
@@ -617,7 +711,8 @@ class Component(ComponentBase):
         # is fetched under ``_lineage_pass``.)
         if not (config.write_transformations or config.write_components or config.write_flows):
             return
-        self._upsert(
+        # Retire the pre-0.2 service only once its replacement is in place.
+        if self._upsert(
             om,
             run,
             "pipelineServices",
@@ -628,8 +723,13 @@ class Component(ComponentBase):
             snapshot,
             report,
             merger,
+        ):
+            self._retire_legacy_service(
+                om, run, report, "pipelineServices", "PipelineService", run.pipelines.pipeline_service_body()["name"]
+            )
+        available = self._ensure_custom_properties(
+            om, "pipeline", PIPELINE_CUSTOM_PROPERTIES, "Pipeline", config.custom_properties
         )
-        available = self._ensure_custom_properties(om, "pipeline", PIPELINE_CUSTOM_PROPERTIES, "Pipeline")
 
         def resolve_owner(email: str) -> str | None:
             return self._resolve_owner(om, run, email)
@@ -668,6 +768,43 @@ class Component(ComponentBase):
                 )
                 if config.write_pipeline_status:
                     self._push_pipeline_status(run, built.fqn, cfg, env, om, report)
+
+    @staticmethod
+    def _retire_legacy_service(
+        om: OMClient, run: _ProjectRun, report: RunReport, kind: str, entity_type: str, name: str
+    ) -> None:
+        """Soft-delete the project's service under its pre-0.2 name ``<service>-<projectId>``.
+
+        Pipeline and dashboard services are now named after the project. The old
+        service (and, recursively, its pipelines / dashboards and their lineage
+        edges) would otherwise stay in OpenMetadata as a duplicate. A soft delete
+        keeps it restorable in OpenMetadata; once deleted, the lookup no longer
+        finds it, so this is a single GET on every later run.
+        """
+        legacy = fqn_mod.legacy_project_service_name(run.entities.service_name, run.ctx.project_id)
+        if legacy == name:
+            return
+        try:
+            entity = om.get_by_fqn(kind, legacy)
+            if not entity or not entity.get("id"):
+                return
+            # Our services say "Keboola project <id>" in their description; anything
+            # else (e.g. another project that happens to be named like this id) is kept.
+            if f"Keboola project {run.ctx.project_id}," not in (entity.get("description") or ""):
+                return
+            om.soft_delete(kind, entity["id"], recursive=True)
+            logger.info("Soft-deleted legacy %s %s (renamed to %s).", entity_type, legacy, name)
+            report.record(
+                project_id=run.ctx.project_id,
+                entity_type=entity_type,
+                entity_fqn=legacy,
+                action=report_mod.ACTION_TOMBSTONED,
+                detail=f"renamed to {name}",
+            )
+        except OMAuthError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - cleanup of a renamed service is best-effort
+            logger.warning("Could not soft-delete legacy %s %s: %s", entity_type, legacy, exc)
 
     @staticmethod
     def _pipeline_config_in_scope(config: Configuration, kind: str, cfg_id: str) -> bool:
@@ -736,7 +873,7 @@ class Component(ComponentBase):
         upserted as a Dashboard under one ``CustomDashboard`` service, so its metadata
         (name, description, deep link to the Keboola config) shows up in OpenMetadata.
         """
-        self._upsert(
+        if self._upsert(
             om,
             run,
             "dashboardServices",
@@ -747,8 +884,18 @@ class Component(ComponentBase):
             snapshot,
             report,
             merger,
+        ):
+            self._retire_legacy_service(
+                om,
+                run,
+                report,
+                "dashboardServices",
+                "DashboardService",
+                run.dashboards.dashboard_service_body()["name"],
+            )
+        available = self._ensure_custom_properties(
+            om, "dashboard", DASHBOARD_CUSTOM_PROPERTIES, "Dashboard", config.custom_properties
         )
-        available = self._ensure_custom_properties(om, "dashboard", DASHBOARD_CUSTOM_PROPERTIES, "Dashboard")
         stack_id = run.dashboards.stack_id
         app_states = (
             fetch_app_states(f"https://data-science.{stack_id.removeprefix('connection.')}", run.ctx.storage_token)
@@ -780,8 +927,23 @@ class Component(ComponentBase):
                     merger,
                 )
 
-    def _lineage_pass(self, config: Configuration, om: OMClient, run: _ProjectRun, report: RunReport) -> None:
+    def _lineage_pass(
+        self,
+        config: Configuration,
+        om: OMClient,
+        run: _ProjectRun,
+        report: RunReport,
+        *,
+        drop_legacy_node_edges: bool = False,
+    ) -> bool:
+        """Emit every lineage edge of the project.
+
+        ``drop_legacy_node_edges`` deletes the table -> pipeline -> table node edges an
+        earlier run wrote in the legacy layout (when the layout changed). Returns
+        ``False`` when some of those deletes failed, so the caller retries them.
+        """
         edges: list[lineage_builder.LineageEdge] = []
+        legacy_node_edges: list[lineage_builder.LineageEdge] = []
         for component in run.reader.list_component_configs():
             component_id = str(component.get("id") or component.get("componentId") or "")
             kind = component_kind(component_id, component.get("type"))
@@ -803,40 +965,74 @@ class Component(ComponentBase):
                 # Phase B: the column-lineage engine also recovers input/output
                 # tables a transform reads/writes via a DIRECT fully-qualified SQL
                 # ref instead of a declared mapping. Parsed once here whenever ANY
-                # lineage is wanted — the table-level inferred inputs feed the
-                # pipeline edges below even when column lineage is off — and reused
-                # for both the column edges and the inferred-input -> pipeline
-                # wiring, so the SQL is never parsed twice.
+                # lineage is wanted and reused for the table edges, the column edges
+                # and the legacy pipeline-node wiring, so the SQL is never parsed twice.
                 column_result = (
                     self._column_lineage_for(run, component_id, cfg, storage)
                     if (config.write_table_lineage or config.write_pipeline_lineage or config.write_column_lineage)
                     else None
                 )
-                if pipeline_fqn and config.write_pipeline_lineage:
-                    # The pipeline is a first-class lineage node, wired from the
-                    # DECLARED input/output mapping (plus the Phase B SQL-inferred
-                    # input, when nothing was declared).
-                    edges += lineage_builder.pipeline_edges(
+                # The pipeline rides on each table -> table edge (lineageDetails.pipeline),
+                # so OM keeps the table -> table path its column lineage is drawn on.
+                edge_pipeline_fqn = pipeline_fqn if config.write_pipeline_lineage else None
+                table_edges = (
+                    lineage_builder.declared_edges(
+                        storage,
+                        service_name=run.entities.service_name,
+                        project=run.entities.project,
+                        pipeline_fqn=edge_pipeline_fqn,
+                        sql_table_edges=column_result.table_edges if column_result else None,
+                    )
+                    if config.write_table_lineage
+                    else []
+                )
+                edges += table_edges
+                if pipeline_fqn:
+                    # The pipeline as its own node between tables: the legacy layout, and
+                    # the only way to show an extractor (outputs only) or a writer (inputs
+                    # only), which has no table -> table edge to carry its pipeline.
+                    node_edges = lineage_builder.pipeline_edges(
                         storage,
                         service_name=run.entities.service_name,
                         project=run.entities.project,
                         pipeline_fqn=pipeline_fqn,
-                    )
-                    edges += self._inferred_input_pipeline_edges(run, storage, pipeline_fqn, column_result)
-                elif config.write_table_lineage:
-                    # No pipeline node (no pipeline built this run, or pipeline
-                    # lineage off) -> fall back to the coarse table->table cartesian
-                    # edges so lineage still exists without a pipeline to hang it on.
-                    edges += lineage_builder.declared_edges(
+                    ) + self._inferred_input_pipeline_edges(run, storage, pipeline_fqn, column_result)
+                    # Edges that cannot be written (an endpoint outside the catalog) do
+                    # not count: the pipeline would otherwise show no lineage at all.
+                    if config.write_pipeline_lineage and (
+                        _pipelines_as_lineage_nodes(config) or not self._writable_edges(om, run, table_edges)
+                    ):
+                        edges += node_edges
+                    elif drop_legacy_node_edges:
+                        legacy_node_edges += node_edges
+                elif drop_legacy_node_edges:
+                    # A config with no pipeline this run (selector, family switch) may
+                    # still hold node edges from the legacy layout: drop them too.
+                    legacy_node_edges += lineage_builder.pipeline_edges(
                         storage,
                         service_name=run.entities.service_name,
                         project=run.entities.project,
+                        pipeline_fqn=fqn_mod.pipeline_fqn(
+                            run.entities.service_name, run.entities.project, str(cfg.get("id"))
+                        ),
                     )
                 if config.write_column_lineage:
-                    edges += self._column_edges_for(run, cfg, pipeline_fqn, column_result, report)
+                    edges += self._column_edges_for(run, cfg, edge_pipeline_fqn, column_result, report)
+        edges = lineage_builder.merge_edges(edges)
         if config.write_bucket_lineage:
             edges += lineage_builder.bucket_edges(edges)
         self._refresh_lineage(om, run, report, edges)
+        return self._delete_legacy_node_edges(om, run, legacy_node_edges)
+
+    def _writable_edges(self, om, run, edges: list[lineage_builder.LineageEdge]) -> list[lineage_builder.LineageEdge]:
+        """The edges whose two endpoints exist in OM: cataloged this run, or found by name."""
+
+        def exists(fqn: str, entity_type: str) -> bool:
+            if entity_type == "table" and fqn in run.seen_table_fqns:
+                return True
+            return self._resolve_id(om, run, fqn, entity_type) is not None
+
+        return [e for e in edges if exists(e.from_fqn, e.from_type) and exists(e.to_fqn, e.to_type)]
 
     @staticmethod
     def _flow_child_edges_for(run: _ProjectRun, cfg: dict, flow_pipeline_fqn: str) -> list[lineage_builder.LineageEdge]:
@@ -1000,6 +1196,28 @@ class Component(ComponentBase):
             statements.append(("legacy", query))
         return statements
 
+    def _delete_legacy_node_edges(self, om: OMClient, run: _ProjectRun, edges) -> bool:
+        """Delete exact legacy node edges; return whether every delete went through.
+
+        An absent edge or endpoint is fine (404). Any other failure is logged and
+        reported back, so the caller keeps the migration pending for the next run.
+        """
+        complete = True
+        for edge in edges:
+            try:
+                from_id = self._resolve_id(om, run, edge.from_fqn, edge.from_type)
+                to_id = self._resolve_id(om, run, edge.to_fqn, edge.to_type)
+                if from_id and to_id:
+                    om.delete_lineage_edge(edge.from_type, from_id, edge.to_type, to_id)
+            except OMAuthError:
+                raise
+            except OMNotFound:
+                continue
+            except Exception as exc:  # noqa: BLE001 - retried by the next run
+                complete = False
+                logger.warning("Legacy lineage edge %s -> %s not deleted: %s", edge.from_fqn, edge.to_fqn, exc)
+        return complete
+
     def _refresh_lineage(self, om, run, report, edges) -> None:
         # drop our stale edges (never Manual) on affected targets, then add current.
         # Keyed on each edge's TARGET type: an input->pipeline edge's target is the
@@ -1019,7 +1237,13 @@ class Component(ComponentBase):
         for edge in edges:
             self._put_lineage(om, run, report, edge)
 
-    def _put_lineage(self, om, run, report, edge) -> None:
+    def _put_lineage(self, om, run, report, edge, *, retry_table_level: bool = False) -> None:
+        """PUT one edge; record the outcome in the run report.
+
+        ``retry_table_level`` re-sends a rejected column-level edge without its
+        column mappings — for a linked table whose source table (cataloged by
+        another project's row) may not hold every column under the same name.
+        """
         request = lineage_builder.to_add_lineage_request(edge, lambda f, t: self._resolve_id(om, run, f, t))
         if request is None:
             return
@@ -1035,6 +1259,15 @@ class Component(ComponentBase):
         except OMAuthError:
             raise
         except Exception as exc:  # noqa: BLE001 - a single edge failure is per-entity
+            if retry_table_level and edge.columns_lineage and isinstance(exc, OMClientError):
+                logger.warning(
+                    "Column-level lineage %s -> %s rejected (%s); writing it table-level.",
+                    edge.from_fqn,
+                    edge.to_fqn,
+                    exc,
+                )
+                self._put_lineage(om, run, report, dataclasses.replace(edge, columns_lineage=[]))
+                return
             report.record(
                 project_id=run.ctx.project_id,
                 entity_type="Lineage",
@@ -1285,8 +1518,13 @@ class Component(ComponentBase):
     def test_connection(self) -> ValidationResult:
         config = Configuration(**self.configuration.parameters)
         env = self._read_environment()
-        om = OMClient(config.om_host, config.bot_token)
+        # Same network path as run(): through the bastion when the tunnel is on.
+        proxy = ssh_proxy.maybe_open_tunnel(config)
         try:
+            # Fail fast: a sync action has a short platform time limit, so the
+            # run-time retry budget (5 x 60 s) would end in a bare platform timeout.
+            # One 15 s attempt leaves room for the SSH tunnel setup.
+            om = self._build_om_client(config, proxy, timeout=15, max_retries=0)
             om.probe_version()
             version = om.server_version
             # /system/version is unauthenticated (OM JwtFilter.EXCLUDED_ENDPOINTS),
@@ -1295,6 +1533,13 @@ class Component(ComponentBase):
             om.verify_auth()
         except OMAuthError as exc:
             raise UserException(str(exc)) from exc
+        except OMConnectionError as exc:
+            raise UserException(f"{exc}. {self._connection_hint(config)}") from exc
+        except (OMClientError, ValueError) as exc:
+            raise UserException(self._unexpected_answer(config, exc)) from exc
+        finally:
+            if proxy is not None:
+                proxy.close()
         token, url = resolve_storage_credentials(
             row_token=config.storage_token, injected_token=env["token"], injected_url=env["url"]
         )

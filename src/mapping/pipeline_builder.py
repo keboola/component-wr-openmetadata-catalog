@@ -141,7 +141,7 @@ class PipelineBuilder:
         """One PipelineService per project, shown under the project's name."""
         return _drop_none(
             {
-                "name": fqn.project_service_name(self.service_name, self.project_id),
+                "name": fqn.project_service_name(self.service_name, self.project),
                 "displayName": fqn.sanitize_display_name(self.project),
                 "serviceType": _SERVICE_TYPE,
                 "description": f"Pipelines of Keboola project {self.project_id}, catalogued by "
@@ -241,7 +241,7 @@ class PipelineBuilder:
                 "name": fqn.pipeline_name(config_id),
                 "displayName": fqn.sanitize_display_name(config.get("name")),
                 "description": fqn.sanitize_display_name(config.get("description")),
-                "service": fqn.project_service_name(self.service_name, self.project_id),
+                "service": fqn.project_service_name(self.service_name, self.project),
                 "sourceUrl": self._component_url(component_id, config_id),
                 "tasks": tasks or None,
                 "extension": self._extension(component_id, config_id, config, config_url, available, synced_at, kind),
@@ -250,7 +250,7 @@ class PipelineBuilder:
         )
         return BuiltPipeline(
             body=body,
-            fqn=fqn.pipeline_fqn(self.service_name, self.project_id, config_id),
+            fqn=fqn.pipeline_fqn(self.service_name, self.project, config_id),
             component_id=component_id,
             config_id=config_id,
         )
@@ -319,7 +319,7 @@ class PipelineBuilder:
                 "name": fqn.pipeline_name(flow_id),
                 "displayName": fqn.sanitize_display_name(config.get("name")),
                 "description": fqn.sanitize_display_name(config.get("description")),
-                "service": fqn.project_service_name(self.service_name, self.project_id),
+                "service": fqn.project_service_name(self.service_name, self.project),
                 "sourceUrl": self._flow_url(flow_id),
                 "tasks": tasks or None,
                 "extension": self._extension(component_id, flow_id, config, config_url, available, synced_at, kind),
@@ -328,7 +328,7 @@ class PipelineBuilder:
         )
         return BuiltPipeline(
             body=body,
-            fqn=fqn.pipeline_fqn(self.service_name, self.project_id, flow_id),
+            fqn=fqn.pipeline_fqn(self.service_name, self.project, flow_id),
             component_id=component_id,
             config_id=flow_id,
         )

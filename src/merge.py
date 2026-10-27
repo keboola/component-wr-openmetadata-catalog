@@ -42,7 +42,7 @@ OWNED_TABLE_FIELDS = (
     "owners",
 )
 OWNED_PIPELINE_FIELDS = ("displayName", "description", "tasks", "sourceUrl", "extension", "owners")
-OWNED_DASHBOARD_FIELDS = ("displayName", "description", "sourceUrl", "extension", "owners")
+OWNED_DASHBOARD_FIELDS = ("displayName", "description", "project", "sourceUrl", "extension", "owners")
 OWNED_SCHEMA_FIELDS = ("displayName", "description", "sourceUrl", "extension", "owners")
 OWNED_DATABASE_FIELDS = ("displayName", "sourceUrl", "extension")
 
