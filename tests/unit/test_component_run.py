@@ -1730,6 +1730,7 @@ def _one_config_lineage_run(configuration: dict, *, pipeline_fqn: str | None):
     if pipeline_fqn:
         run.pipeline_fqn_by_config[configuration["id"]] = pipeline_fqn
     config = SimpleNamespace(
+        parallel_requests=1,
         pipeline_lineage_as_node=False,
         write_table_lineage=True,
         write_pipeline_lineage=True,
@@ -1756,7 +1757,7 @@ def test_pipeline_keeps_its_inputs_when_its_table_edge_cannot_be_written():
     om = _LineageRecordingOM({_storage_fqn(svc, proj, "in.c-main.a"): "id-a", pipe: "id-pipe"})
 
     comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
-    comp._lineage_pass(config, om, run, component_mod.RunReport(run_id="rid"))  # ty: ignore[invalid-argument-type]
+    comp._lineage_pass(config, om, run, component_mod.RunReport(run_id="rid"), StateManager())  # ty: ignore[invalid-argument-type]
 
     put_pairs = {(r["edge"]["fromEntity"]["id"], r["edge"]["toEntity"]["id"]) for r in om.put_calls}
     assert put_pairs == {("id-a", "id-pipe")}
@@ -1773,7 +1774,8 @@ def test_layout_switch_drops_legacy_node_edges_of_configs_without_a_pipeline_thi
     om = _LineageRecordingOM({_storage_fqn(svc, proj, "in.c-main.a"): "id-a", legacy_pipe: "id-pipe"})
 
     comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
-    done = comp._lineage_pass(config, om, run, component_mod.RunReport(run_id="rid"), drop_legacy_node_edges=True)  # ty: ignore[invalid-argument-type]
+    report = component_mod.RunReport(run_id="rid")
+    done = comp._lineage_pass(config, om, run, report, StateManager(), drop_legacy_node_edges=True)  # ty: ignore[invalid-argument-type]
 
     assert done is True
     assert om.delete_edge_calls == [("table", "id-a", "pipeline", "id-pipe")]
