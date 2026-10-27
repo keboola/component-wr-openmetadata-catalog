@@ -111,7 +111,7 @@ class FakeOM:
     def put_lineage(self, edge):
         return {}
 
-    def delete_lineage_by_source(self, *a):
+    def delete_lineage_by_source(self, *a, **k):
         return None
 
     def soft_delete(self, *a, **k):
@@ -336,7 +336,10 @@ def test_incremental_skip_is_tombstone_safe_and_writes_nothing():
     # force a reprocess this run. Seeded via digest_fields() (not raw vars()) so it
     # matches what production computes — vars() would also carry the provenance-only
     # created_by_metadata field, which digest_fields() deliberately excludes.
-    digest = bucket_digest(digest_fields(bucket), [digest_fields(t) for t in tables])
+    # The fake OM defines no custom properties, so the table statistics are left out
+    # of the digest, as production does when nothing writes them.
+    volatile = frozenset(entity_builder.TABLE_STAT_PROPERTIES)
+    digest = bucket_digest(digest_fields(bucket), [digest_fields(t, exclude=volatile) for t in tables])
     state = StateManager({"projects": {pid: {"bucket_digests": {bucket.id: digest}}}, "run_count": 1})
 
     entities = EntityBuilder(svc, proj, pid, "https://ui.example")
@@ -360,7 +363,11 @@ def test_incremental_skip_is_tombstone_safe_and_writes_nothing():
     comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
     comp._config = SimpleNamespace(failure_mode=FailureMode.COLLECT_AND_FAIL)  # ty: ignore[invalid-assignment]
     config = SimpleNamespace(
-        full_refresh=False, buckets=[], write_buckets=True, custom_properties=CustomPropertiesMode.CREATE
+        parallel_requests=1,
+        full_refresh=False,
+        buckets=[],
+        write_buckets=True,
+        custom_properties=CustomPropertiesMode.CREATE,
     )
 
     # config/om are duck-typed test doubles (SimpleNamespace / _RecordingOM).
@@ -519,9 +526,14 @@ def _run_custom_props_passes(om, *, fail_entity_type: str | None = None):
     comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
     comp._config = SimpleNamespace(failure_mode=FailureMode.COLLECT_AND_FAIL)  # ty: ignore[invalid-assignment]
     catalog_config = SimpleNamespace(
-        full_refresh=True, buckets=[], write_buckets=True, custom_properties=CustomPropertiesMode.CREATE
+        parallel_requests=1,
+        full_refresh=True,
+        buckets=[],
+        write_buckets=True,
+        custom_properties=CustomPropertiesMode.CREATE,
     )
     pipeline_config = SimpleNamespace(
+        parallel_requests=1,
         custom_properties=CustomPropertiesMode.CREATE,
         write_flows=True,
         flows=[],
@@ -712,7 +724,7 @@ class _LineageOM:
         self.put_edges.append(edge)
         return {}
 
-    def delete_lineage_by_source(self, entity_type, fqn, source):
+    def delete_lineage_by_source(self, entity_type, fqn, source, entity_id=None):
         self.deletes.append((entity_type, fqn, source))
 
 
@@ -737,6 +749,7 @@ def test_data_app_lineage_pass_emits_table_to_dashboard_edge():
     run.dashboard_fqn_by_config[config_id] = dashboard_fqn  # the dashboard pass ran first
     report = component_mod.RunReport(run_id="rid")
     config = SimpleNamespace(
+        parallel_requests=1,
         pipeline_lineage_as_node=False,
         write_dashboard_lineage=True,
         write_data_apps=True,
@@ -745,7 +758,7 @@ def test_data_app_lineage_pass_emits_table_to_dashboard_edge():
     )
 
     comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
-    comp._lineage_pass(config, om, run, report)  # ty: ignore[invalid-argument-type]
+    comp._lineage_pass(config, om, run, report, StateManager())  # ty: ignore[invalid-argument-type]
 
     assert len(om.put_edges) == 1
     edge = om.put_edges[0]["edge"]
@@ -774,6 +787,7 @@ def test_data_app_lineage_skipped_when_write_dashboard_lineage_off():
     run.dashboard_fqn_by_config["01app"] = fqn_mod.dashboard_fqn(svc, proj, "01app")
     report = component_mod.RunReport(run_id="rid")
     config = SimpleNamespace(
+        parallel_requests=1,
         pipeline_lineage_as_node=False,
         write_dashboard_lineage=False,
         write_data_apps=True,
@@ -782,7 +796,7 @@ def test_data_app_lineage_skipped_when_write_dashboard_lineage_off():
     )
 
     comp = component_mod.Component.__new__(component_mod.Component)
-    comp._lineage_pass(config, om, run, report)  # ty: ignore[invalid-argument-type]
+    comp._lineage_pass(config, om, run, report, StateManager())  # ty: ignore[invalid-argument-type]
 
     assert om.put_edges == []
 
@@ -841,6 +855,7 @@ class _LineageRecordingOM:
         self.put_calls: list[dict] = []
         self.delete_calls: list[tuple[str, str, str]] = []
         self.delete_edge_calls: list[tuple[str, str, str, str]] = []
+        self.is_2_0_or_newer = False
 
     def get_by_fqn(self, kind, fqn, fields=None):
         entity_id = self.known_ids.get(fqn)
@@ -849,7 +864,7 @@ class _LineageRecordingOM:
     def put_lineage(self, request):
         self.put_calls.append(request)
 
-    def delete_lineage_by_source(self, entity_type, fqn, source):
+    def delete_lineage_by_source(self, entity_type, fqn, source, entity_id=None):
         self.delete_calls.append((entity_type, fqn, source))
 
     def delete_lineage_edge(self, from_type, from_id, to_type, to_id):
@@ -918,6 +933,7 @@ def test_lineage_pass_puts_pipeline_on_table_edge_not_as_node():
     om = _LineageRecordingOM(known_ids)
     report = component_mod.RunReport(run_id="rid")
     config = SimpleNamespace(
+        parallel_requests=1,
         pipeline_lineage_as_node=False,
         write_table_lineage=True,
         write_pipeline_lineage=True,
@@ -926,7 +942,7 @@ def test_lineage_pass_puts_pipeline_on_table_edge_not_as_node():
     )
 
     comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
-    comp._lineage_pass(config, om, run, report, drop_legacy_node_edges=True)  # ty: ignore[invalid-argument-type]
+    comp._lineage_pass(config, om, run, report, StateManager(), drop_legacy_node_edges=True)  # ty: ignore[invalid-argument-type]
 
     edges_by_ids = {(r["edge"]["fromEntity"]["id"], r["edge"]["toEntity"]["id"]): r["edge"] for r in om.put_calls}
     assert set(edges_by_ids) == {("id-in-a", "id-out-x"), ("id-in-b", "id-out-y")}  # no pipeline endpoint
@@ -986,6 +1002,7 @@ def test_lineage_pass_pipeline_as_node_keeps_legacy_node_edges():
     }
     om = _LineageRecordingOM(known_ids)
     config = SimpleNamespace(
+        parallel_requests=1,
         pipeline_lineage_as_node=True,
         write_table_lineage=True,
         write_pipeline_lineage=True,
@@ -994,7 +1011,7 @@ def test_lineage_pass_pipeline_as_node_keeps_legacy_node_edges():
     )
 
     comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
-    comp._lineage_pass(config, om, run, component_mod.RunReport(run_id="rid"))  # ty: ignore[invalid-argument-type]
+    comp._lineage_pass(config, om, run, component_mod.RunReport(run_id="rid"), StateManager())  # ty: ignore[invalid-argument-type]
 
     put_pairs = {(r["edge"]["fromEntity"]["id"], r["edge"]["toEntity"]["id"]) for r in om.put_calls}
     assert put_pairs == {("id-in-a", "id-out-x"), ("id-in-a", "id-pipeline"), ("id-pipeline", "id-out-x")}
@@ -1061,6 +1078,7 @@ def test_lineage_pass_infers_input_pipeline_edge_from_direct_sql_when_declared_i
     om = _LineageRecordingOM(known_ids)
     report = component_mod.RunReport(run_id="rid")
     config = SimpleNamespace(
+        parallel_requests=1,
         pipeline_lineage_as_node=True,
         write_table_lineage=True,
         write_pipeline_lineage=True,
@@ -1069,7 +1087,7 @@ def test_lineage_pass_infers_input_pipeline_edge_from_direct_sql_when_declared_i
     )
 
     comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
-    comp._lineage_pass(config, om, run, report)  # ty: ignore[invalid-argument-type]
+    comp._lineage_pass(config, om, run, report, StateManager())  # ty: ignore[invalid-argument-type]
 
     edges_by_ids = {(r["edge"]["fromEntity"]["id"], r["edge"]["toEntity"]["id"]): r["edge"] for r in om.put_calls}
 
@@ -1142,6 +1160,7 @@ def test_lineage_pass_skips_sql_inference_when_declared_input_present():
     om = _LineageRecordingOM(known_ids)
     report = component_mod.RunReport(run_id="rid")
     config = SimpleNamespace(
+        parallel_requests=1,
         pipeline_lineage_as_node=True,
         write_table_lineage=True,
         write_pipeline_lineage=True,
@@ -1150,7 +1169,7 @@ def test_lineage_pass_skips_sql_inference_when_declared_input_present():
     )
 
     comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
-    comp._lineage_pass(config, om, run, report)  # ty: ignore[invalid-argument-type]
+    comp._lineage_pass(config, om, run, report, StateManager())  # ty: ignore[invalid-argument-type]
 
     put_pairs = {(r["edge"]["fromEntity"]["id"], r["edge"]["toEntity"]["id"]) for r in om.put_calls}
     assert ("id-in-declared", "id-pipeline") in put_pairs  # Phase A: declared input, unaffected
@@ -1186,7 +1205,7 @@ def test_refresh_lineage_deletes_stale_edges_keyed_on_target_type():
     report = component_mod.RunReport(run_id="rid")
     comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
 
-    comp._refresh_lineage(om, run, report, edges)
+    comp._refresh_lineage(SimpleNamespace(parallel_requests=1), om, run, report, StateManager(), edges, force=False)
 
     delete_targets = {(entity_type, fqn) for entity_type, fqn, _source in om.delete_calls}
     assert ("pipeline", pipeline_fqn_value) in delete_targets
@@ -1296,6 +1315,7 @@ def _run_pipeline_pass(config_overrides: dict) -> tuple[_PipelineRecordingOM, co
     run = _family_gating_run()
     report = component_mod.RunReport(run_id="rid")
     base = {
+        "parallel_requests": 1,
         "custom_properties": CustomPropertiesMode.CREATE,
         "write_transformations": True,
         "transformations": [],
@@ -1364,6 +1384,7 @@ def test_pipeline_pass_all_families_off_skips_component_fetch():
         dashboards=DashboardBuilder("keboola-stack", "Proj", "4214", "https://ui.example"),
     )
     config = SimpleNamespace(
+        parallel_requests=1,
         write_transformations=False,
         transformations=[],
         write_components=False,
@@ -1486,6 +1507,7 @@ def test_flow_child_lineage_emits_pipeline_to_pipeline_edge_when_gated_on():
     om = _LineageRecordingOM(known_ids)
     report = component_mod.RunReport(run_id="rid")
     config = SimpleNamespace(
+        parallel_requests=1,
         pipeline_lineage_as_node=False,
         write_pipeline_lineage=True,
         write_table_lineage=False,
@@ -1494,7 +1516,7 @@ def test_flow_child_lineage_emits_pipeline_to_pipeline_edge_when_gated_on():
     )
 
     comp = component_mod.Component.__new__(component_mod.Component)
-    comp._lineage_pass(config, om, run, report)  # ty: ignore[invalid-argument-type]
+    comp._lineage_pass(config, om, run, report, StateManager())  # ty: ignore[invalid-argument-type]
 
     assert len(om.put_calls) == 1
     edge = om.put_calls[0]["edge"]
@@ -1518,6 +1540,7 @@ def test_flow_child_lineage_absent_when_pipeline_lineage_off():
     om = _LineageRecordingOM({})
     report = component_mod.RunReport(run_id="rid")
     config = SimpleNamespace(
+        parallel_requests=1,
         pipeline_lineage_as_node=False,
         write_pipeline_lineage=False,
         write_table_lineage=False,
@@ -1526,7 +1549,7 @@ def test_flow_child_lineage_absent_when_pipeline_lineage_off():
     )
 
     comp = component_mod.Component.__new__(component_mod.Component)
-    comp._lineage_pass(config, om, run, report)  # ty: ignore[invalid-argument-type]
+    comp._lineage_pass(config, om, run, report, StateManager())  # ty: ignore[invalid-argument-type]
 
     assert om.put_calls == []
 
@@ -1577,6 +1600,7 @@ def test_lineage_pass_aggregates_bucket_edges_when_gated_on():
     om = _LineageRecordingOM(known_ids)
     report = component_mod.RunReport(run_id="rid")
     config = SimpleNamespace(
+        parallel_requests=1,
         pipeline_lineage_as_node=False,
         write_table_lineage=True,
         write_pipeline_lineage=False,
@@ -1585,7 +1609,7 @@ def test_lineage_pass_aggregates_bucket_edges_when_gated_on():
     )
 
     comp = component_mod.Component.__new__(component_mod.Component)
-    comp._lineage_pass(config, om, run, report)  # ty: ignore[invalid-argument-type]
+    comp._lineage_pass(config, om, run, report, StateManager())  # ty: ignore[invalid-argument-type]
 
     edges_by_ids = {(r["edge"]["fromEntity"]["id"], r["edge"]["toEntity"]["id"]): r["edge"] for r in om.put_calls}
     assert ("id-in-a", "id-out-x") in edges_by_ids  # the table->table fallback edge
@@ -1629,6 +1653,7 @@ def test_lineage_pass_no_bucket_edge_when_gated_off():
     om = _LineageRecordingOM({in_fqn: "id-in-a", out_fqn: "id-out-x"})
     report = component_mod.RunReport(run_id="rid")
     config = SimpleNamespace(
+        parallel_requests=1,
         pipeline_lineage_as_node=False,
         write_table_lineage=True,
         write_pipeline_lineage=False,
@@ -1637,7 +1662,7 @@ def test_lineage_pass_no_bucket_edge_when_gated_off():
     )
 
     comp = component_mod.Component.__new__(component_mod.Component)
-    comp._lineage_pass(config, om, run, report)  # ty: ignore[invalid-argument-type]
+    comp._lineage_pass(config, om, run, report, StateManager())  # ty: ignore[invalid-argument-type]
 
     assert len(om.put_calls) == 1  # only the table->table edge; no schema->schema edge
 
@@ -1673,6 +1698,7 @@ def test_extractor_without_inputs_keeps_its_pipeline_as_a_node():
         {_storage_fqn(svc, proj, "in.c-db.orders"): "id-orders", "keboola-stack-Acme_Project.ex1": "id-ex1"}
     )
     config = SimpleNamespace(
+        parallel_requests=1,
         pipeline_lineage_as_node=False,
         write_table_lineage=True,
         write_pipeline_lineage=True,
@@ -1681,7 +1707,7 @@ def test_extractor_without_inputs_keeps_its_pipeline_as_a_node():
     )
 
     comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
-    comp._lineage_pass(config, om, run, component_mod.RunReport(run_id="rid"))  # ty: ignore[invalid-argument-type]
+    comp._lineage_pass(config, om, run, component_mod.RunReport(run_id="rid"), StateManager())  # ty: ignore[invalid-argument-type]
 
     put_pairs = {(r["edge"]["fromEntity"]["id"], r["edge"]["toEntity"]["id"]) for r in om.put_calls}
     assert put_pairs == {("id-ex1", "id-orders")}

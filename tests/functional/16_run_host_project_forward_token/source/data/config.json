@@ -79,6 +79,7 @@
     "write_table_lineage": false,
     "write_pipeline_lineage": false,
     "write_dashboard_lineage": false,
-    "service_name": "keboola-vcr-forward"
+    "service_name": "keboola-vcr-forward2",
+    "parallel_requests": 1
   }
 }

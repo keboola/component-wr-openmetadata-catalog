@@ -16,6 +16,8 @@ import logging
 import os
 import re
 import sys
+from collections.abc import Callable
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, ClassVar
@@ -38,7 +40,13 @@ from client.om_client import (
     OMNotFound,
     OMPreconditionFailed,
 )
-from client.storage_reader import SourceBucket, SourceTable, StorageReader, resolve_storage_credentials
+from client.storage_reader import (
+    SourceBucket,
+    SourceTable,
+    StorageReader,
+    needs_detail,
+    resolve_storage_credentials,
+)
 from configuration import Configuration, CustomPropertiesMode, FailureMode
 from lineage.column_lineage import LineageResult, extract_column_lineage
 from lineage.dialect import dialect_for
@@ -50,6 +58,7 @@ from mapping.entity_builder import (
     DATABASE_CUSTOM_PROPERTIES,
     SCHEMA_CUSTOM_PROPERTIES,
     TABLE_CUSTOM_PROPERTIES,
+    TABLE_STAT_PROPERTIES,
     EntityBuilder,
 )
 from mapping.pipeline_builder import CUSTOM_PROPERTIES as PIPELINE_CUSTOM_PROPERTIES
@@ -74,6 +83,7 @@ from sync import (
     TombstonePlanner,
     bucket_digest,
     digest_fields,
+    lineage_digest,
     should_process_bucket,
 )
 
@@ -292,10 +302,12 @@ class _ProjectRun:
     pipelines: PipelineBuilder
     dashboards: DashboardBuilder
     seen_table_fqns: set[str] = field(default_factory=set)
-    # DatabaseSchema FQNs this run actually enumerated (in-scope buckets only) —
-    # the tombstone pass reconciles *only* within these, so allowlist/denylist
-    # excluded buckets are never a deletion scope (spec risk #4).
+    # DatabaseSchema FQNs this run re-wrote (in-scope, changed buckets only) — the
+    # tombstone pass reconciles *only* within these, so allowlist/denylist excluded
+    # buckets are never a deletion scope (spec risk #4), and an unchanged bucket
+    # (no table removed since its last sync) costs no listing.
     seen_schema_fqns: set[str] = field(default_factory=set)
+    bucket_id_by_schema: dict[str, str] = field(default_factory=dict)
     # Cataloged table FQN -> its (sanitised) column names. The column-lineage pass
     # validates each columnsLineage entry against this so it never references a
     # column an endpoint table lacks (empty-stub tables map to an empty set).
@@ -495,11 +507,41 @@ class Component(ComponentBase):
                 om,
                 run,
                 report,
+                state,
+                force=config.full_refresh or version_changed or state.full_refresh_due(),
                 drop_legacy_node_edges=layout == LINEAGE_LAYOUT_EDGE and state.lineage_layout == LINEAGE_LAYOUT_NODE,
             )
             if cleaned:
                 state.lineage_layout = layout
-        self._tombstone_pass(om, run, report)
+        self._tombstone_pass(config, om, run, report, state)
+
+    @staticmethod
+    def _parallel[T](
+        config: Configuration, items: list[T], task: Callable[[T, RunReport], None], report: RunReport
+    ) -> None:
+        """Run ``task(item, item_report)`` for every item on ``config.parallel_requests`` threads.
+
+        Each item records into its own report, merged back in input order, so the
+        run report reads the same as a sequential run. The first exception (an auth
+        error, fail-fast mode) cancels the items not yet started and is re-raised;
+        when several items failed, the one earliest in input order wins.
+        """
+        if config.parallel_requests <= 1 or len(items) <= 1:
+            for item in items:
+                task(item, report)
+            return
+        item_reports = [report.fork() for _ in items]
+        pool = ThreadPoolExecutor(max_workers=config.parallel_requests)
+        try:
+            futures = [pool.submit(task, item, r) for item, r in zip(items, item_reports, strict=True)]
+            wait(futures, return_when=FIRST_EXCEPTION)
+            for future in futures:
+                if future.done() and not future.cancelled():
+                    future.result()  # re-raises the item's exception
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+            for item_report in item_reports:
+                report.extend(item_report)
 
     @staticmethod
     def _ensure_custom_properties(
@@ -601,14 +643,15 @@ class Component(ComponentBase):
         if catalog_is_new and state.has_bucket_digests(run.ctx.project_id):
             logger.info("OpenMetadata holds none of this project's catalog (was it deleted?); syncing every bucket.")
         full_refresh_due = state.full_refresh_due()
-        for bucket in run.reader.list_buckets():
-            if not self._bucket_in_scope(config, bucket):
-                continue
-            # This bucket is in scope this run: its schema is a valid tombstone scope.
+        # Row count, size and last import change on every data load. Unless their
+        # custom properties are written, they must not mark the bucket as changed.
+        volatile = frozenset(f for f, prop in TABLE_STAT_PROPERTIES.items() if prop not in available_table)
+        buckets = [bucket for bucket in run.reader.list_buckets() if self._bucket_in_scope(config, bucket)]
+
+        def sync_bucket(bucket: SourceBucket, bucket_report: RunReport) -> None:
             schema_fqn = fqn_mod.schema_fqn(run.entities.service_name, run.entities.project, bucket.path or bucket.name)
-            run.seen_schema_fqns.add(schema_fqn)
             tables = list(run.reader.iter_tables(bucket.id))
-            digest = bucket_digest(digest_fields(bucket), [digest_fields(t) for t in tables])
+            digest = bucket_digest(digest_fields(bucket), [digest_fields(t, exclude=volatile) for t in tables])
             if not should_process_bucket(
                 previous_digest=state.bucket_digest(run.ctx.project_id, bucket.id),
                 current_digest=digest,
@@ -616,7 +659,7 @@ class Component(ComponentBase):
                 version_changed=version_changed,
                 full_refresh_due=full_refresh_due,
             ):
-                report.record(
+                bucket_report.record(
                     project_id=run.ctx.project_id,
                     entity_type="Schema",
                     entity_fqn=bucket.id,
@@ -629,8 +672,14 @@ class Component(ComponentBase):
                     )
                     run.seen_table_fqns.add(table_fqn)
                     self._record_column_catalog(run, table_fqn, table)
-                continue
+                return
 
+            # Re-written this run: its schema is a valid tombstone scope. An unchanged
+            # bucket lost no table since its last sync, so it has nothing to tombstone.
+            run.seen_schema_fqns.add(schema_fqn)
+            run.bucket_id_by_schema[schema_fqn] = bucket.id
+            linked = bucket.source_bucket is not None
+            tables = [run.reader.get_table(t.id) if linked or needs_detail(t) else t for t in tables]
             self._upsert(
                 om,
                 run,
@@ -642,7 +691,7 @@ class Component(ComponentBase):
                 ),
                 OWNED_SCHEMA_FIELDS,
                 snapshot,
-                report,
+                bucket_report,
                 merger,
             )
             bucket_ok = True
@@ -653,7 +702,16 @@ class Component(ComponentBase):
                 run.seen_table_fqns.add(built.fqn)
                 self._record_column_catalog(run, built.fqn, table)
                 ok = self._upsert(
-                    om, run, "tables", "Table", built.fqn, built.body, OWNED_TABLE_FIELDS, snapshot, report, merger
+                    om,
+                    run,
+                    "tables",
+                    "Table",
+                    built.fqn,
+                    built.body,
+                    OWNED_TABLE_FIELDS,
+                    snapshot,
+                    bucket_report,
+                    merger,
                 )
                 bucket_ok = bucket_ok and ok
                 if built.view_source_fqn:
@@ -661,13 +719,15 @@ class Component(ComponentBase):
                     self._put_lineage(
                         om,
                         run,
-                        report,
+                        bucket_report,
                         lineage_builder.view_edge(built.fqn, built.view_source_fqn, view_columns),
                         retry_table_level=True,
                     )
             # advance-after-success: persist the digest only once the bucket's writes succeeded
             if bucket_ok:
                 state.set_bucket_digest(run.ctx.project_id, bucket.id, digest)
+
+        self._parallel(config, buckets, sync_bucket, report)
 
     @staticmethod
     def _record_column_catalog(run: _ProjectRun, table_fqn: str, table: SourceTable) -> None:
@@ -734,6 +794,7 @@ class Component(ComponentBase):
         def resolve_owner(email: str) -> str | None:
             return self._resolve_owner(om, run, email)
 
+        selected: list[tuple[str, str, dict]] = []
         for component in run.reader.list_component_configs():
             component_id = str(component.get("id") or component.get("componentId") or "")
             kind = component_kind(component_id, component.get("type"))
@@ -742,32 +803,36 @@ class Component(ComponentBase):
             for cfg in component.get("configurations") or []:
                 if kind != "orchestration" and not self._is_producing(cfg):
                     continue
-                cfg_id = str(cfg.get("id"))
-                if not self._pipeline_config_in_scope(config, kind, cfg_id):
-                    continue
-                built = run.pipelines.build_pipeline(
-                    component_id,
-                    cfg,
-                    kind=kind,
-                    available_properties=available,
-                    synced_at=synced_at,
-                    owner_resolver=resolve_owner,
-                )
-                run.pipeline_fqn_by_config[cfg_id] = built.fqn
-                self._upsert(
-                    om,
-                    run,
-                    "pipelines",
-                    "Pipeline",
-                    built.fqn,
-                    built.body,
-                    OWNED_PIPELINE_FIELDS,
-                    snapshot,
-                    report,
-                    merger,
-                )
-                if config.write_pipeline_status:
-                    self._push_pipeline_status(run, built.fqn, cfg, env, om, report)
+                if self._pipeline_config_in_scope(config, kind, str(cfg.get("id"))):
+                    selected.append((component_id, kind, cfg))
+
+        def sync_pipeline(item: tuple[str, str, dict], item_report: RunReport) -> None:
+            component_id, kind, cfg = item
+            built = run.pipelines.build_pipeline(
+                component_id,
+                cfg,
+                kind=kind,
+                available_properties=available,
+                synced_at=synced_at,
+                owner_resolver=resolve_owner,
+            )
+            run.pipeline_fqn_by_config[str(cfg.get("id"))] = built.fqn
+            self._upsert(
+                om,
+                run,
+                "pipelines",
+                "Pipeline",
+                built.fqn,
+                built.body,
+                OWNED_PIPELINE_FIELDS,
+                snapshot,
+                item_report,
+                merger,
+            )
+            if config.write_pipeline_status:
+                self._push_pipeline_status(run, built.fqn, cfg, env, om, item_report)
+
+        self._parallel(config, selected, sync_pipeline, report)
 
     @staticmethod
     def _retire_legacy_service(
@@ -933,11 +998,14 @@ class Component(ComponentBase):
         om: OMClient,
         run: _ProjectRun,
         report: RunReport,
+        state: StateManager,
         *,
+        force: bool = False,
         drop_legacy_node_edges: bool = False,
     ) -> bool:
         """Emit every lineage edge of the project.
 
+        ``force`` re-writes targets whose edges did not change since the last run.
         ``drop_legacy_node_edges`` deletes the table -> pipeline -> table node edges an
         earlier run wrote in the legacy layout (when the layout changed). Returns
         ``False`` when some of those deletes failed, so the caller retries them.
@@ -1021,7 +1089,7 @@ class Component(ComponentBase):
         edges = lineage_builder.merge_edges(edges)
         if config.write_bucket_lineage:
             edges += lineage_builder.bucket_edges(edges)
-        self._refresh_lineage(om, run, report, edges)
+        self._refresh_lineage(config, om, run, report, state, edges, force=force)
         return self._delete_legacy_node_edges(om, run, legacy_node_edges)
 
     def _writable_edges(self, om, run, edges: list[lineage_builder.LineageEdge]) -> list[lineage_builder.LineageEdge]:
@@ -1218,27 +1286,100 @@ class Component(ComponentBase):
                 logger.warning("Legacy lineage edge %s -> %s not deleted: %s", edge.from_fqn, edge.to_fqn, exc)
         return complete
 
-    def _refresh_lineage(self, om, run, report, edges) -> None:
-        # drop our stale edges (never Manual) on affected targets, then add current.
-        # Keyed on each edge's TARGET type: an input->pipeline edge's target is the
-        # pipeline itself (cleanup must hit /lineage/.../pipeline/..., not a hardcoded
-        # "table"), dashboard (data-app) targets carry DashboardLineage and bucket
-        # (databaseSchema) targets carry ChildAssets — clean each target with the
-        # lineage sources it can actually hold.
-        sources_by_type = {"dashboard": OUR_DASHBOARD_LINEAGE_SOURCES, "databaseSchema": OUR_SCHEMA_LINEAGE_SOURCES}
-        targets = {(e.to_type, e.to_fqn) for e in edges}
-        for to_type, target_fqn in targets:
-            sources = sources_by_type.get(to_type, OUR_LINEAGE_SOURCES)
-            for source in sources:
-                try:
-                    om.delete_lineage_by_source(to_type, target_fqn, source)
-                except Exception:
-                    logger.debug("lineage cleanup skipped for %s/%s", target_fqn, source, exc_info=True)
-        for edge in edges:
-            self._put_lineage(om, run, report, edge)
+    def _refresh_lineage(self, config, om, run, report, state, edges, *, force: bool) -> None:
+        """Re-write the lineage of every target whose edges changed since the last run.
 
-    def _put_lineage(self, om, run, report, edge, *, retry_table_level: bool = False) -> None:
-        """PUT one edge; record the outcome in the run report.
+        Drop our stale edges (never Manual) on each changed target first, then add
+        the current ones — all deletes before any write, because a delete on a
+        pipeline also removes every edge that carries that pipeline, wherever it
+        points. The cleanup is keyed on each edge's TARGET type: an input->pipeline
+        edge's target is the pipeline itself (cleanup must hit
+        /lineage/.../pipeline/..., not a hardcoded "table"), dashboard (data-app)
+        targets carry DashboardLineage and bucket (databaseSchema) targets carry
+        ChildAssets — each target is cleaned with the lineage sources it can hold.
+
+        A target whose edges match the digest saved after its last complete write
+        is skipped, unless ``force``, an entity on its edges was created this run (a
+        new entity id means OM holds none of its edges), or its edges carry or start
+        at a pipeline whose own lineage is re-written (whose delete drops them).
+        """
+        sources_by_type = {"dashboard": OUR_DASHBOARD_LINEAGE_SOURCES, "databaseSchema": OUR_SCHEMA_LINEAGE_SOURCES}
+        by_target: dict[tuple[str, str], list[lineage_builder.LineageEdge]] = {}
+        for edge in edges:
+            by_target.setdefault((edge.to_type, edge.to_fqn), []).append(edge)
+        previous = state.lineage_digests(run.ctx.project_id)
+        digests = {target: lineage_digest(target_edges) for target, target_edges in by_target.items()}
+
+        def touches(target_edges, fqns: set[str]) -> bool:
+            return any(fqn in fqns for e in target_edges for fqn in (e.from_fqn, e.to_fqn, e.pipeline_fqn))
+
+        changed = {
+            target
+            for target, target_edges in by_target.items()
+            if force
+            or touches(target_edges, run.created_fqns)
+            or previous.get(f"{target[0]}:{target[1]}") != digests[target]
+        }
+        # A cleaned pipeline can pull in another pipeline target (a flow inside a flow),
+        # so repeat until no target is added.
+        while True:
+            cleaned_pipelines = {fqn for to_type, fqn in changed if to_type == "pipeline"}
+            added = {t for t, t_edges in by_target.items() if t not in changed and touches(t_edges, cleaned_pipelines)}
+            if not added:
+                break
+            changed |= added
+
+        # A target whose stale edges could not all be dropped gets no digest, so the
+        # next run cleans it again.
+        cleanup_failed: set[tuple[str, str]] = set()
+
+        def clean_target(target: tuple[str, str], _report: RunReport) -> None:
+            to_type, target_fqn = target
+            try:
+                # 2.0+ deletes by name; 1.13.4 needs the entity id.
+                target_id = None if om.is_2_0_or_newer else self._resolve_id(om, run, target_fqn, to_type)
+            except OMAuthError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - cleanup is best-effort, retried next run
+                logger.warning("Lineage cleanup skipped for %s: %s", target_fqn, exc)
+                cleanup_failed.add(target)
+                return
+            if target_id is None and not om.is_2_0_or_newer:
+                return  # not in OM: it holds no edges to drop
+            for source in sources_by_type.get(to_type, OUR_LINEAGE_SOURCES):
+                try:
+                    om.delete_lineage_by_source(to_type, target_fqn, source, entity_id=target_id)
+                except OMAuthError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - cleanup is best-effort, retried next run
+                    logger.warning("Lineage cleanup of %s edges on %s failed: %s", source, target_fqn, exc)
+                    cleanup_failed.add(target)
+
+        written: dict[str, str] = {}
+
+        def write_target(target: tuple[str, str], item_report: RunReport) -> None:
+            target_edges = by_target[target]
+            if target in changed:
+                ok = [self._put_lineage(om, run, item_report, edge) for edge in target_edges]
+                if not all(ok) or target in cleanup_failed:
+                    return
+            else:
+                for edge in target_edges:
+                    item_report.record(
+                        project_id=run.ctx.project_id,
+                        entity_type="Lineage",
+                        entity_fqn=f"{edge.from_fqn}->{edge.to_fqn}",
+                        action=report_mod.ACTION_SKIPPED_UNCHANGED,
+                        detail=edge.source,
+                    )
+            written[f"{target[0]}:{target[1]}"] = digests[target]
+
+        self._parallel(config, [t for t in by_target if t in changed], clean_target, report)
+        self._parallel(config, list(by_target), write_target, report)
+        state.set_lineage_digests(run.ctx.project_id, written)
+
+    def _put_lineage(self, om, run, report, edge, *, retry_table_level: bool = False) -> bool:
+        """PUT one edge; record the outcome in the run report. Returns whether it was written.
 
         ``retry_table_level`` re-sends a rejected column-level edge without its
         column mappings — for a linked table whose source table (cataloged by
@@ -1246,7 +1387,7 @@ class Component(ComponentBase):
         """
         request = lineage_builder.to_add_lineage_request(edge, lambda f, t: self._resolve_id(om, run, f, t))
         if request is None:
-            return
+            return False
         try:
             om.put_lineage(request)
             report.record(
@@ -1256,6 +1397,7 @@ class Component(ComponentBase):
                 action=report_mod.ACTION_UPDATED,
                 detail=edge.source,
             )
+            return True
         except OMAuthError:
             raise
         except Exception as exc:  # noqa: BLE001 - a single edge failure is per-entity
@@ -1266,8 +1408,7 @@ class Component(ComponentBase):
                     edge.to_fqn,
                     exc,
                 )
-                self._put_lineage(om, run, report, dataclasses.replace(edge, columns_lineage=[]))
-                return
+                return self._put_lineage(om, run, report, dataclasses.replace(edge, columns_lineage=[]))
             report.record(
                 project_id=run.ctx.project_id,
                 entity_type="Lineage",
@@ -1275,6 +1416,7 @@ class Component(ComponentBase):
                 action=report_mod.ACTION_FAILED,
                 detail=str(exc),
             )
+            return False
 
     _KIND_BY_LINEAGE_TYPE: ClassVar[dict[str, str]] = {
         "pipeline": "pipelines",
@@ -1302,8 +1444,10 @@ class Component(ComponentBase):
             run.id_cache[cache_key] = om.find_user_id_by_email(email)
         return run.id_cache[cache_key]
 
-    def _tombstone_pass(self, om: OMClient, run: _ProjectRun, report: RunReport) -> None:
-        """Reconcile stale OM tables — scoped to the buckets this run enumerated.
+    def _tombstone_pass(
+        self, config: Configuration, om: OMClient, run: _ProjectRun, report: RunReport, state: StateManager
+    ) -> None:
+        """Reconcile stale OM tables — scoped to the buckets this run re-wrote.
 
         Scope-safety (spec risk #4 / §6.2 step 8): reconciliation happens *per
         DatabaseSchema* the run actually enumerated, never over the whole Database.
@@ -1313,9 +1457,17 @@ class Component(ComponentBase):
         The delete path stays fail-closed within each schema (skip on a listing
         error or an implausibly short scope).
         """
-        for schema_fqn in sorted(run.seen_schema_fqns):
+
+        def tombstone(schema_fqn: str, item_report: RunReport) -> None:
             seen_in_schema = sorted(f for f in run.seen_table_fqns if f.startswith(f"{schema_fqn}."))
-            self._tombstone_schema(om, run, report, schema_fqn, seen_in_schema)
+            if not self._tombstone_schema(om, run, item_report, schema_fqn, seen_in_schema):
+                # Forget the bucket's digest: an unchanged bucket is not tombstoned
+                # again, so the next run must re-sync it to retry.
+                bucket_id = run.bucket_id_by_schema.get(schema_fqn)
+                if bucket_id:
+                    state.forget_bucket_digest(run.ctx.project_id, bucket_id)
+
+        self._parallel(config, sorted(run.seen_schema_fqns), tombstone, report)
 
     def _tombstone_schema(
         self,
@@ -1324,7 +1476,8 @@ class Component(ComponentBase):
         report: RunReport,
         schema_fqn: str,
         seen_in_schema: list[str],
-    ) -> None:
+    ) -> bool:
+        """Soft-delete the schema's stale tables. Returns False when it could not reconcile."""
         if om.is_2_0_or_newer:
             # 2.0+ deleteStale, scoped to this DatabaseSchema (not the whole Database).
             body = TombstonePlanner.deletestale_body(schema_fqn, "databaseSchema", seen_in_schema, dry_run=False)
@@ -1332,7 +1485,8 @@ class Component(ComponentBase):
                 om.delete_stale(body)
             except Exception as exc:  # noqa: BLE001 - tombstoning never fails the run
                 logger.warning("deleteStale failed for %s (fail-closed): %s", schema_fqn, exc)
-            return
+                return False
+            return True
         try:
             listed = [
                 fqn
@@ -1341,11 +1495,11 @@ class Component(ComponentBase):
             ]
         except Exception as exc:  # noqa: BLE001 - fail closed on listing error
             logger.warning("Tombstone listing failed for %s (fail-closed): %s", schema_fqn, exc)
-            return
+            return False
         plan = TombstonePlanner.self_diff(listed, seen_in_schema)
         if plan.blocked:
             logger.warning("Tombstoning skipped for %s (fail-closed): %s", schema_fqn, plan.fail_closed_reason)
-            return
+            return False
         for stale_fqn in plan.to_delete:
             entity = om.get_by_fqn("tables", stale_fqn)
             if entity and entity.get("id"):
@@ -1356,6 +1510,7 @@ class Component(ComponentBase):
                     entity_fqn=stale_fqn,
                     action=report_mod.ACTION_TOMBSTONED,
                 )
+        return True
 
     # ---------------------------------------------------------- merge upsert
 

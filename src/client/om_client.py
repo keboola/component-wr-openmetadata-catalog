@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Entity kinds whose collection lives under ``/services/``.
 _SERVICE_KINDS = frozenset({"databaseServices", "pipelineServices", "dashboardServices"})
 
-_RETRYABLE_STATUS = frozenset({500, 502, 503, 504})
+_RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 _JSON_PATCH_CT = "application/json-patch+json"
 
 
@@ -325,17 +325,20 @@ class OMClient:
         """DELETE one edge by its endpoints (available on 1.13.4 and 2.x)."""
         self._request("DELETE", f"/lineage/{from_type}/{from_id}/{to_type}/{to_id}")
 
-    def delete_lineage_by_source(self, entity_type: str, fqn: str, source: str) -> None:
+    def delete_lineage_by_source(
+        self, entity_type: str, fqn: str, source: str, *, entity_id: str | None = None
+    ) -> None:
         """Drop our edges of one ``source`` from an entity.
 
-        2.0+: by-name convenience endpoint. 1.13.4: resolve the id then use the
-        by-id form (spec 3.5). The capability exists on both; only the path differs.
+        2.0+: by-name convenience endpoint. 1.13.4: the by-id form (spec 3.5), with
+        the id looked up unless the caller already holds it. The capability exists
+        on both; only the path differs.
         """
         if self.is_2_0_or_newer:
             path = f"/lineage/source/name/{entity_type}/{quote(fqn, safe='')}/type/{quote(source, safe='')}"
             self._request("DELETE", path)
             return
-        entity_id = self._resolve_entity_id(entity_type, fqn)
+        entity_id = entity_id or self._resolve_entity_id(entity_type, fqn)
         if entity_id is None:
             logger.debug("delete_lineage_by_source: entity %s not found, skipping", fqn)
             return

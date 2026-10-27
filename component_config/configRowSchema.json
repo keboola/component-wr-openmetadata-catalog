@@ -314,9 +314,9 @@
           "format": "checkbox",
           "title": "Full Refresh",
           "default": false,
-          "description": "Ignore per-bucket digests and re-push everything this run",
+          "description": "Ignore the change checks and re-push every bucket and lineage edge this run",
           "options": {
-            "tooltip": "Disabled by default; incremental digests skip unchanged buckets."
+            "tooltip": "Disabled by default: a run skips the buckets and lineage that did not change since the last run. Every 20th run re-pushes everything anyway."
           },
           "propertyOrder": 30
         },
@@ -357,6 +357,18 @@
             "tooltip": "Collect and fail at end records every per-entity failure in the run report and fails the job once all entities are processed. Fail fast stops on the first failure. Log only never fails the job."
           },
           "propertyOrder": 50
+        },
+        "parallel_requests": {
+          "type": "integer",
+          "title": "Parallel Requests",
+          "default": 8,
+          "minimum": 1,
+          "maximum": 10,
+          "description": "How many OpenMetadata and Storage requests run at the same time",
+          "options": {
+            "tooltip": "8 by default. Lower it if the OpenMetadata server is slow or overloaded; 1 sends one request at a time."
+          },
+          "propertyOrder": 60
         }
       }
     }

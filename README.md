@@ -105,9 +105,29 @@ Row (one Keboola project)
 | Objects | Which families to catalog — buckets, transformations, components, flows, data apps — each with an optional "only these" selector (empty = all). |
 | Advanced → Lineage | One switch per lineage type: bucket, table, column, pipeline (pipeline on the edge + flow → task lineage), dashboard. **Pipeline as lineage node (legacy)** also draws each pipeline as its own node between the tables; off by default. |
 | Write Pipeline Status | Push each pipeline's last job result as OpenMetadata pipeline status. |
-| Full Refresh | Ignore the per-bucket change digests and re-push everything this run. |
+| Full Refresh | Ignore the change checks and re-push every bucket and every lineage edge this run. |
 | Merge Mode | **Three-way merge** (default): the writer remembers what it wrote last time (the `last_written_snapshot` table). If a person changed a field in OpenMetadata since then — for example a description — the writer keeps the person's value and marks the entity `skipped_diverged` in the run report. **Keboola overwrites**: Keboola is the source of truth; every field the writer owns is overwritten on every run. Fields the writer does not own (tags, glossary terms, …) are never touched in either mode. |
 | Failure Mode | **Collect and fail at end** (default), **Fail fast**, or **Log only**. |
+| Parallel Requests | How many OpenMetadata and Storage requests run at the same time (1–10, default 8). Lower it if the OpenMetadata server is slow or overloaded. |
+
+Incremental runs
+----------------
+
+A run re-writes only what changed since the last successful run:
+
+- **Buckets** — a bucket whose tables, columns and descriptions did not change is
+  skipped. Row count, data size and last import date count as a change only when
+  their `kbcRowsCount` / `kbcDataSizeBytes` / `kbcLastImport` custom properties are
+  written, so a daily data load alone does not re-sync a bucket. A change of only a
+  typed column's native type (for example `VARCHAR(10)` to `VARCHAR(100)`) is not
+  seen until the next full refresh.
+- **Lineage** — a table, pipeline or bucket whose incoming lineage edges did not
+  change is skipped. Lineage that someone deleted by hand in OpenMetadata comes back
+  on the next full refresh.
+- **Tombstoning** (soft-deleting tables removed from Storage) runs only in buckets
+  that changed.
+
+Every 20th run, and every run with **Full Refresh** on, re-writes everything.
 
 Sync actions: **testConnection**, **listBuckets**, **listTransformations**,
 **listComponents**, **listFlows**, **listDataApps**.
@@ -144,7 +164,8 @@ Version 0.2 changes what an existing configuration writes on its next run:
 - **Custom properties** are no longer defined automatically. Properties that
   already exist keep being filled; choose *Define missing properties* to restore
   the old behaviour.
-- The first run re-writes every bucket once (the catalog format version changed).
+- The first run re-writes every bucket and every lineage edge once (the catalog
+  format version changed, and lineage change tracking starts with that run).
 
 Development
 ===========

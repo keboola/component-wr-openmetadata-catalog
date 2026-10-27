@@ -7,4 +7,4 @@ Every run publishes:
 - **Lineage** — table-to-table lineage from input/output mappings and transformation SQL, with the producing pipeline shown on each edge; column-level lineage parsed from transformation SQL; linked buckets as views of their source project's tables.
 - **Data apps** — as OpenMetadata dashboards, with the tables they read.
 
-Writes use a three-way merge that preserves manual edits made in OpenMetadata, and an incremental per-bucket digest skips unchanged buckets between runs. Connect to your OpenMetadata host with a JWT bot token — optionally through an SSH bastion — and catalog one project per configuration row: the configuration's own project, or another project on the same stack via a Storage token.
+Writes use a three-way merge that preserves manual edits made in OpenMetadata, and incremental runs skip the buckets and lineage that did not change since the last run. Connect to your OpenMetadata host with a JWT bot token — optionally through an SSH bastion — and catalog one project per configuration row: the configuration's own project, or another project on the same stack via a Storage token.

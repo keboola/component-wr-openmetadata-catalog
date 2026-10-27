@@ -6,6 +6,9 @@ is skipped unless ``full_refresh``, a version change, or the auto-cadence fires.
 Digests advance only *after* that bucket's OM writes succeed (advance-after-
 success), so a mid-run failure re-processes the affected buckets next run.
 
+Lineage is skipped the same way: a per-target digest of the edges last written
+into each lineage target, so an unchanged target is not deleted and re-written.
+
 Tombstoning is fail-closed: on 2.0+ via ``deleteStale`` (dryRun then apply); on
 1.13.4 via a self-diff soft-delete; skipped entirely if the scope listing errors
 or looks implausibly short.
@@ -13,6 +16,7 @@ or looks implausibly short.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 from dataclasses import dataclass
@@ -28,14 +32,15 @@ DEFAULT_FULL_REFRESH_EVERY = 20
 _DIGEST_EXCLUDED_FIELDS = frozenset({"created_by_metadata"})
 
 
-def digest_fields(obj: object) -> dict:
+def digest_fields(obj: object, *, exclude: frozenset[str] = frozenset()) -> dict:
     """``vars(obj)`` minus fields that are provenance metadata, not catalog content.
 
     Use this (not raw ``vars()``) wherever a ``SourceBucket``/``SourceTable``
     is fed into :func:`bucket_digest`, so a future metadata-only field never
-    silently perturbs the incremental digest.
+    silently perturbs the incremental digest. ``exclude`` drops more fields — the
+    table statistics that change on every data load, when nothing writes them.
     """
-    return {k: v for k, v in vars(obj).items() if k not in _DIGEST_EXCLUDED_FIELDS}
+    return {k: v for k, v in vars(obj).items() if k not in _DIGEST_EXCLUDED_FIELDS and k not in exclude}
 
 
 def bucket_digest(bucket_fields: dict, table_fields: list[dict]) -> str:
@@ -96,6 +101,17 @@ class StateManager:
         project = self._projects.setdefault(project_id, {"bucket_digests": {}})
         project.setdefault("bucket_digests", {})[bucket_id] = digest
 
+    def forget_bucket_digest(self, project_id: str, bucket_id: str) -> None:
+        (self._projects.get(project_id) or {}).get("bucket_digests", {}).pop(bucket_id, None)
+
+    def lineage_digests(self, project_id: str) -> dict[str, str]:
+        """Lineage target key -> digest of the edges last written into it."""
+        return dict((self._projects.get(project_id) or {}).get("lineage_digests") or {})
+
+    def set_lineage_digests(self, project_id: str, digests: dict[str, str]) -> None:
+        project = self._projects.setdefault(project_id, {"bucket_digests": {}})
+        project["lineage_digests"] = dict(digests)
+
     def full_refresh_due(self, *, every: int = DEFAULT_FULL_REFRESH_EVERY) -> bool:
         return self.run_count % every == 0
 
@@ -109,6 +125,12 @@ class StateManager:
             "om_target_seen": self.om_target_seen,
             "lineage_layout": self.lineage_layout,
         }
+
+
+def lineage_digest(edges: list) -> str:
+    """Content digest of the lineage edges one target receives (order-independent)."""
+    canonical = sorted(json.dumps(dataclasses.asdict(edge), sort_keys=True, default=str) for edge in edges)
+    return hashlib.sha256(json.dumps(canonical).encode()).hexdigest()
 
 
 def should_process_bucket(
