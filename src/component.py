@@ -20,6 +20,7 @@ from collections.abc import Callable
 from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any, ClassVar
 
 from keboola.component.base import ComponentBase, sync_action
@@ -268,6 +269,15 @@ VCR_SANITIZERS = [
 _CATALOG_FORMAT_VERSION = 3
 
 
+class EdgeOutcome(StrEnum):
+    """What happened to one lineage edge PUT."""
+
+    WRITTEN = "written"
+    SKIPPED = "skipped"  # a self-loop or malformed edge: never sent, nothing to retry
+    UNRESOLVED = "unresolved"  # an endpoint is not in OpenMetadata
+    FAILED = "failed"
+
+
 def _pipelines_as_lineage_nodes(config: Configuration) -> bool:
     """Whether pipelines are lineage nodes (table -> pipeline -> table).
 
@@ -513,6 +523,10 @@ class Component(ComponentBase):
             )
             if cleaned:
                 state.lineage_layout = layout
+        else:
+            # Lineage written later must not be skipped against digests from before a
+            # pause: entities re-created meanwhile hold none of their old edges.
+            state.set_lineage_digests(ctx.project_id, {})
         self._tombstone_pass(config, om, run, report, state)
 
     @staticmethod
@@ -647,6 +661,9 @@ class Component(ComponentBase):
         # custom properties are written, they must not mark the bucket as changed.
         volatile = frozenset(f for f, prop in TABLE_STAT_PROPERTIES.items() if prop not in available_table)
         buckets = [bucket for bucket in run.reader.list_buckets() if self._bucket_in_scope(config, bucket)]
+        # Written after every bucket: an alias may sit in another bucket than its
+        # source table, which a parallel worker may still be creating.
+        view_edges: list[lineage_builder.LineageEdge] = []
 
         def sync_bucket(bucket: SourceBucket, bucket_report: RunReport) -> None:
             schema_fqn = fqn_mod.schema_fqn(run.entities.service_name, run.entities.project, bucket.path or bucket.name)
@@ -716,18 +733,16 @@ class Component(ComponentBase):
                 bucket_ok = bucket_ok and ok
                 if built.view_source_fqn:
                     view_columns = [col["name"] for col in built.body.get("columns") or []]
-                    self._put_lineage(
-                        om,
-                        run,
-                        bucket_report,
-                        lineage_builder.view_edge(built.fqn, built.view_source_fqn, view_columns),
-                        retry_table_level=True,
-                    )
+                    view_edges.append(lineage_builder.view_edge(built.fqn, built.view_source_fqn, view_columns))
             # advance-after-success: persist the digest only once the bucket's writes succeeded
             if bucket_ok:
                 state.set_bucket_digest(run.ctx.project_id, bucket.id, digest)
 
+        def write_view_edge(edge: lineage_builder.LineageEdge, item_report: RunReport) -> None:
+            self._put_lineage(om, run, item_report, edge, retry_table_level=True)
+
         self._parallel(config, buckets, sync_bucket, report)
+        self._parallel(config, view_edges, write_view_edge, report)
 
     @staticmethod
     def _record_column_catalog(run: _ProjectRun, table_fqn: str, table: SourceTable) -> None:
@@ -1308,6 +1323,7 @@ class Component(ComponentBase):
         for edge in edges:
             by_target.setdefault((edge.to_type, edge.to_fqn), []).append(edge)
         previous = state.lineage_digests(run.ctx.project_id)
+        previous_unresolved = state.lineage_unresolved(run.ctx.project_id)
         digests = {target: lineage_digest(target_edges) for target, target_edges in by_target.items()}
 
         def touches(target_edges, fqns: set[str]) -> bool:
@@ -1320,6 +1336,9 @@ class Component(ComponentBase):
             or touches(target_edges, run.created_fqns)
             or previous.get(f"{target[0]}:{target[1]}") != digests[target]
         }
+        changed |= self._targets_with_appeared_endpoints(
+            config, om, run, [t for t in by_target if t not in changed], previous_unresolved
+        )
         # A cleaned pipeline can pull in another pipeline target (a flow inside a flow),
         # so repeat until no target is added.
         while True:
@@ -1356,14 +1375,30 @@ class Component(ComponentBase):
                     cleanup_failed.add(target)
 
         written: dict[str, str] = {}
+        unresolved: dict[str, list[str]] = {}
 
         def write_target(target: tuple[str, str], item_report: RunReport) -> None:
+            key = f"{target[0]}:{target[1]}"
             target_edges = by_target[target]
             if target in changed:
-                ok = [self._put_lineage(om, run, item_report, edge) for edge in target_edges]
-                if not all(ok) or target in cleanup_failed:
+                outcomes = [(edge, self._put_lineage(om, run, item_report, edge)) for edge in target_edges]
+                if target in cleanup_failed or any(o == EdgeOutcome.FAILED for _e, o in outcomes):
                     return
+                # An endpoint absent from OM does not block the digest: it is looked up
+                # again next run, and the target is re-written once it appears.
+                missing = sorted(
+                    {
+                        m
+                        for edge, o in outcomes
+                        if o == EdgeOutcome.UNRESOLVED
+                        for m in self._missing_endpoints(run, edge)
+                    }
+                )
+                if missing:
+                    unresolved[key] = missing
             else:
+                if key in previous_unresolved:
+                    unresolved[key] = previous_unresolved[key]
                 for edge in target_edges:
                     item_report.record(
                         project_id=run.ctx.project_id,
@@ -1372,32 +1407,85 @@ class Component(ComponentBase):
                         action=report_mod.ACTION_SKIPPED_UNCHANGED,
                         detail=edge.source,
                     )
-            written[f"{target[0]}:{target[1]}"] = digests[target]
+            written[key] = digests[target]
 
         self._parallel(config, [t for t in by_target if t in changed], clean_target, report)
         self._parallel(config, list(by_target), write_target, report)
-        state.set_lineage_digests(run.ctx.project_id, written)
+        state.set_lineage_digests(run.ctx.project_id, written, unresolved)
 
-    def _put_lineage(self, om, run, report, edge, *, retry_table_level: bool = False) -> bool:
-        """PUT one edge; record the outcome in the run report. Returns whether it was written.
+    def _targets_with_appeared_endpoints(
+        self, config, om, run, candidates: list[tuple[str, str]], previous_unresolved: dict[str, list[str]]
+    ) -> set[tuple[str, str]]:
+        """Skipped targets whose endpoints were missing last run and exist in OM now."""
+        pending = {
+            t: previous_unresolved[f"{t[0]}:{t[1]}"] for t in candidates if f"{t[0]}:{t[1]}" in previous_unresolved
+        }
+        endpoints = sorted({e for keys in pending.values() for e in keys})
+        appeared: set[str] = set()
+
+        def look_up(endpoint: str, _report: RunReport) -> None:
+            entity_type, fqn = endpoint.split(":", 1)
+            try:
+                found = self._resolve_id(om, run, fqn, entity_type) is not None
+            except OMAuthError:
+                raise
+            except Exception:  # noqa: BLE001 - unsure counts as appeared: re-write the target
+                found = True
+            if found:
+                appeared.add(endpoint)
+
+        self._parallel(config, endpoints, look_up, RunReport(run_id=run.ctx.project_id))
+        return {t for t, keys in pending.items() if appeared & set(keys)}
+
+    @staticmethod
+    def _missing_endpoints(run: _ProjectRun, edge: lineage_builder.LineageEdge) -> list[str]:
+        """``type:fqn`` of the edge endpoints the run found absent from OM."""
+        ends = ((edge.from_type, edge.from_fqn), (edge.to_type, edge.to_fqn))
+        return [f"{t}:{f}" for t, f in ends if f"{t}:{f}" in run.id_cache and run.id_cache[f"{t}:{f}"] is None]
+
+    def _put_lineage(self, om, run, report, edge, *, retry_table_level: bool = False) -> EdgeOutcome:
+        """PUT one edge; record the outcome in the run report.
 
         ``retry_table_level`` re-sends a rejected column-level edge without its
         column mappings — for a linked table whose source table (cataloged by
         another project's row) may not hold every column under the same name.
         """
-        request = lineage_builder.to_add_lineage_request(edge, lambda f, t: self._resolve_id(om, run, f, t))
+        edge_fqn = f"{edge.from_fqn}->{edge.to_fqn}"
+        try:
+            request = lineage_builder.to_add_lineage_request(edge, lambda f, t: self._resolve_id(om, run, f, t))
+        except OMAuthError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - an id lookup failure is per-edge, retried next run
+            report.record(
+                project_id=run.ctx.project_id,
+                entity_type="Lineage",
+                entity_fqn=edge_fqn,
+                action=report_mod.ACTION_FAILED,
+                detail=f"entity lookup: {exc}",
+            )
+            return EdgeOutcome.FAILED
         if request is None:
-            return False
+            missing = self._missing_endpoints(run, edge)
+            if not missing:
+                return EdgeOutcome.SKIPPED
+            report.record(
+                project_id=run.ctx.project_id,
+                entity_type="Lineage",
+                entity_fqn=edge_fqn,
+                action=report_mod.ACTION_UNRESOLVED,
+                detail=f"not in OpenMetadata: {', '.join(missing)}",
+            )
+            return EdgeOutcome.UNRESOLVED
         try:
             om.put_lineage(request)
             report.record(
                 project_id=run.ctx.project_id,
                 entity_type="Lineage",
-                entity_fqn=f"{edge.from_fqn}->{edge.to_fqn}",
+                entity_fqn=edge_fqn,
                 action=report_mod.ACTION_UPDATED,
                 detail=edge.source,
             )
-            return True
+            return EdgeOutcome.WRITTEN
         except OMAuthError:
             raise
         except Exception as exc:  # noqa: BLE001 - a single edge failure is per-entity
@@ -1412,11 +1500,11 @@ class Component(ComponentBase):
             report.record(
                 project_id=run.ctx.project_id,
                 entity_type="Lineage",
-                entity_fqn=f"{edge.from_fqn}->{edge.to_fqn}",
+                entity_fqn=edge_fqn,
                 action=report_mod.ACTION_FAILED,
                 detail=str(exc),
             )
-            return False
+            return EdgeOutcome.FAILED
 
     _KIND_BY_LINEAGE_TYPE: ClassVar[dict[str, str]] = {
         "pipeline": "pipelines",

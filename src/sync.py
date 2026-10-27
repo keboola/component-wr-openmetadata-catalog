@@ -108,9 +108,16 @@ class StateManager:
         """Lineage target key -> digest of the edges last written into it."""
         return dict((self._projects.get(project_id) or {}).get("lineage_digests") or {})
 
-    def set_lineage_digests(self, project_id: str, digests: dict[str, str]) -> None:
+    def lineage_unresolved(self, project_id: str) -> dict[str, list[str]]:
+        """Lineage target key -> ``type:fqn`` endpoints that were absent from OM last run."""
+        return dict((self._projects.get(project_id) or {}).get("lineage_unresolved") or {})
+
+    def set_lineage_digests(
+        self, project_id: str, digests: dict[str, str], unresolved: dict[str, list[str]] | None = None
+    ) -> None:
         project = self._projects.setdefault(project_id, {"bucket_digests": {}})
         project["lineage_digests"] = dict(digests)
+        project["lineage_unresolved"] = dict(unresolved or {})
 
     def full_refresh_due(self, *, every: int = DEFAULT_FULL_REFRESH_EVERY) -> bool:
         return self.run_count % every == 0

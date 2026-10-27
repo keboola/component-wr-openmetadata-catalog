@@ -50,3 +50,16 @@ def test_get_lineage_events_unwraps_dict():
     reader = JobQueueReader("https://queue.keboola.com", "tok", session=session)
     events = reader.get_lineage_events("job-1")
     assert len(events) == 1
+
+
+def test_rate_limited_queue_call_is_retried():
+    from unittest import mock
+
+    busy = mock.Mock(status_code=429)
+    ok = mock.Mock(status_code=200)
+    ok.json.return_value = []
+    session = mock.Mock()
+    session.get.side_effect = [busy, ok]
+    reader = JobQueueReader("https://queue.keboola.com", "tok", session=session, backoff_base=0)
+    assert reader.get_lineage_events("job-1") == []
+    assert session.get.call_count == 2

@@ -514,3 +514,97 @@ def test_om_client_retries_429():
     om = OMClient("https://om.example.com", "tok", session=session, backoff_base=0)
     om.put_lineage({"edge": {}})
     assert session.request.call_count == 2
+
+
+# ------------------------------------------------------- review round 2 (PR #6)
+
+
+def test_lookup_error_fails_only_its_target_and_the_run_goes_on():
+    class LookupFailsOM(_LineageOM):
+        def get_by_fqn(self, kind, fqn, fields=None):
+            if fqn == _t("a"):
+                raise component_mod.OMClientError("500 after retries")
+            return super().get_by_fqn(kind, fqn, fields)
+
+    state = StateManager()
+    om = LookupFailsOM(_known())
+    report = _refresh(om, state, _edges(pipeline=None))
+
+    assert ("put", "id-b", "id-c") in om.calls  # the sibling target is written
+    digests = state.lineage_digests(PID)
+    assert f"table:{_t('c')}" in digests
+    assert f"table:{_t('b')}" not in digests  # retried next run
+    failed = [r for r in report.rows() if r["action"] == report_mod.ACTION_FAILED]
+    assert len(failed) == 1 and "entity lookup" in failed[0]["detail"]
+
+
+def test_absent_endpoint_takes_a_digest_and_is_rewritten_once_it_appears():
+    known = _known()
+    del known[_t("a")]  # the input table is not in OpenMetadata
+    state = StateManager()
+    report = _refresh(_LineageOM(known), state, _edges(pipeline=None))
+    assert {r["action"] for r in report.rows() if r["entity_fqn"].startswith(_t("a"))} == {report_mod.ACTION_UNRESOLVED}
+    assert f"table:{_t('b')}" in state.lineage_digests(PID)
+    assert state.lineage_unresolved(PID) == {f"table:{_t('b')}": [f"table:{_t('a')}"]}
+
+    still_absent = _LineageOM(known)
+    _refresh(still_absent, state, _edges(pipeline=None))
+    assert _puts(still_absent) == []  # nothing changed: no delete, no write
+
+    appeared = _LineageOM(_known())
+    _refresh(appeared, state, _edges(pipeline=None))
+    assert _puts(appeared) == [("put", "id-a", "id-b")]
+    assert state.lineage_unresolved(PID) == {}
+
+
+def test_alias_view_edge_is_written_after_its_source_bucket_is_created():
+    class AliasReader(_CatalogReader):
+        def __init__(self):
+            super().__init__()
+            # the alias bucket is listed (and synced) before its source bucket
+            self.buckets = [
+                SourceBucket(id="in.c-b2", name="c-b2", stage="in", path="in.c-b2"),
+                SourceBucket(id="in.c-b1", name="c-b1", stage="in", path="in.c-b1"),
+            ]
+
+        def iter_tables(self, bucket_id):
+            if bucket_id == "in.c-b2":
+                return iter([self.get_table("in.c-b2.t")])
+            return iter([SourceTable(id="in.c-b1.t", name="t", columns=[SourceColumn(name="id")])])
+
+        def get_table(self, table_id):
+            return SourceTable(
+                id=table_id,
+                name="t",
+                columns=[SourceColumn(name="id")],
+                is_alias=True,
+                source_table={"id": "in.c-b1.t"},
+            )
+
+    class CreatingOM(_CatalogOM):
+        def __init__(self):
+            super().__init__()
+            self.created: dict[str, str] = {}
+            self.lineage: list[dict] = []
+
+        def get_by_fqn(self, kind, fqn, fields=None):
+            if kind == "tables":
+                return {"id": self.created[fqn]} if fqn in self.created else None
+            return super().get_by_fqn(kind, fqn, fields)
+
+        def put_entity(self, kind, body):
+            created = super().put_entity(kind, body)
+            if kind == "tables":
+                fqn = f"{body['databaseSchema']}.{body['name']}"
+                created = {"id": f"id-{fqn}"}  # both tables are named "t": keep their ids apart
+                self.created[fqn] = created["id"]
+            return created
+
+        def put_lineage(self, request):
+            self.lineage.append(request)
+            return {}
+
+    om = CreatingOM()
+    _sync_catalog(AliasReader(), om, StateManager({"run_count": 1}), _catalog_config(parallel_requests=1))
+    assert len(om.lineage) == 1
+    assert om.lineage[0]["edge"]["lineageDetails"]["source"] == "ViewLineage"

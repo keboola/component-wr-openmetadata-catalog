@@ -406,3 +406,26 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_lineage_off_forgets_lineage_digests(tmp_path, monkeypatch, _env):
+    """Digests from before a lineage pause must not skip targets once lineage is back on."""
+    monkeypatch.setattr(component_mod, "StorageReader", FakeStorage)
+    monkeypatch.setattr(component_mod, "OMClient", lambda *a, **k: PersistentOM())
+    off = {
+        **BASE_PARAMS,
+        "write_table_lineage": False,
+        "write_column_lineage": False,
+        "write_pipeline_lineage": False,
+        "write_dashboard_lineage": False,
+        "write_bucket_lineage": False,
+    }
+    target = f"https://om.example.com/keboola#catalog-v{component_mod._CATALOG_FORMAT_VERSION}"
+    state = {
+        "om_target_seen": target,
+        "projects": {"777": {"bucket_digests": {}, "lineage_digests": {"table:x": "d"}}},
+    }
+    monkeypatch.setenv("KBC_DATADIR", _make_datadir(tmp_path, off, state=state))
+    component_mod.Component().run()
+    out = json.loads((tmp_path / "data" / "out" / "state.json").read_text())
+    assert out["projects"]["777"]["lineage_digests"] == {}
