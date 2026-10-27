@@ -557,54 +557,103 @@ def test_absent_endpoint_takes_a_digest_and_is_rewritten_once_it_appears():
     assert state.lineage_unresolved(PID) == {}
 
 
+class _AliasReader(_CatalogReader):
+    """An alias bucket listed (and synced) before the bucket of its source table."""
+
+    def __init__(self):
+        super().__init__()
+        self.buckets = [
+            SourceBucket(id="in.c-b2", name="c-b2", stage="in", path="in.c-b2"),
+            SourceBucket(id="in.c-b1", name="c-b1", stage="in", path="in.c-b1"),
+        ]
+
+    def iter_tables(self, bucket_id):
+        if bucket_id == "in.c-b2":
+            return iter([self.get_table("in.c-b2.t")])
+        return iter([SourceTable(id="in.c-b1.t", name="t", columns=[SourceColumn(name="id")])])
+
+    def get_table(self, table_id):
+        return SourceTable(
+            id=table_id,
+            name="t",
+            columns=[SourceColumn(name="id")],
+            is_alias=True,
+            source_table={"id": "in.c-b1.t"},
+        )
+
+
+class _CreatingOM(_CatalogOM):
+    """Finds the tables it created; looking up ``fail_fqn`` raises, ``hide`` is never found."""
+
+    def __init__(self, *, fail_fqn: str | None = None, hide: str | None = None):
+        super().__init__()
+        self.created: dict[str, str] = {}
+        self.lineage: list[dict] = []
+        self.fail_fqn = fail_fqn
+        self.hide = hide
+
+    def get_by_fqn(self, kind, fqn, fields=None):
+        if kind == "tables":
+            if fqn == self.fail_fqn:
+                raise component_mod.OMClientError("500 after retries")
+            return {"id": self.created[fqn]} if fqn in self.created and fqn != self.hide else None
+        return super().get_by_fqn(kind, fqn, fields)
+
+    def put_entity(self, kind, body):
+        created = super().put_entity(kind, body)
+        if kind == "tables":
+            fqn = f"{body['databaseSchema']}.{body['name']}"
+            created = {"id": f"id-{fqn}"}  # both tables are named "t": keep their ids apart
+            self.created[fqn] = created["id"]
+        return created
+
+    def put_lineage(self, request):
+        self.lineage.append(request)
+        return {}
+
+
 def test_alias_view_edge_is_written_after_its_source_bucket_is_created():
-    class AliasReader(_CatalogReader):
-        def __init__(self):
-            super().__init__()
-            # the alias bucket is listed (and synced) before its source bucket
-            self.buckets = [
-                SourceBucket(id="in.c-b2", name="c-b2", stage="in", path="in.c-b2"),
-                SourceBucket(id="in.c-b1", name="c-b1", stage="in", path="in.c-b1"),
-            ]
-
-        def iter_tables(self, bucket_id):
-            if bucket_id == "in.c-b2":
-                return iter([self.get_table("in.c-b2.t")])
-            return iter([SourceTable(id="in.c-b1.t", name="t", columns=[SourceColumn(name="id")])])
-
-        def get_table(self, table_id):
-            return SourceTable(
-                id=table_id,
-                name="t",
-                columns=[SourceColumn(name="id")],
-                is_alias=True,
-                source_table={"id": "in.c-b1.t"},
-            )
-
-    class CreatingOM(_CatalogOM):
-        def __init__(self):
-            super().__init__()
-            self.created: dict[str, str] = {}
-            self.lineage: list[dict] = []
-
-        def get_by_fqn(self, kind, fqn, fields=None):
-            if kind == "tables":
-                return {"id": self.created[fqn]} if fqn in self.created else None
-            return super().get_by_fqn(kind, fqn, fields)
-
-        def put_entity(self, kind, body):
-            created = super().put_entity(kind, body)
-            if kind == "tables":
-                fqn = f"{body['databaseSchema']}.{body['name']}"
-                created = {"id": f"id-{fqn}"}  # both tables are named "t": keep their ids apart
-                self.created[fqn] = created["id"]
-            return created
-
-        def put_lineage(self, request):
-            self.lineage.append(request)
-            return {}
-
-    om = CreatingOM()
-    _sync_catalog(AliasReader(), om, StateManager({"run_count": 1}), _catalog_config(parallel_requests=1))
+    om = _CreatingOM()
+    _sync_catalog(_AliasReader(), om, StateManager({"run_count": 1}), _catalog_config(parallel_requests=1))
     assert len(om.lineage) == 1
     assert om.lineage[0]["edge"]["lineageDetails"]["source"] == "ViewLineage"
+
+
+class _ForeignAliasReader(_AliasReader):
+    """The alias's source table lives in another project, cataloged (or not) by another row."""
+
+    def __init__(self):
+        super().__init__()
+        self.buckets = self.buckets[:1]
+
+    def get_table(self, table_id):
+        table = super().get_table(table_id)
+        table.source_table = {"id": "in.c-b1.t", "project": {"name": "Other"}}
+        return table
+
+
+def test_failed_view_edge_resyncs_its_bucket_but_an_unresolved_one_does_not():
+    source = f"{SVC}.Other.in_c-b1.t"
+    failing = StateManager({"run_count": 1})
+    _sync_catalog(_ForeignAliasReader(), _CreatingOM(fail_fqn=source), failing, _catalog_config())
+    assert failing.bucket_digest(PID, "in.c-b2") is None  # the lookup failed: retry next run
+
+    unresolved = StateManager({"run_count": 1})
+    om = _CreatingOM(hide=source)  # the other project is not cataloged
+    _, report = _sync_catalog(_ForeignAliasReader(), om, unresolved, _catalog_config())
+    assert unresolved.bucket_digest(PID, "in.c-b2") is not None
+    assert any(r["action"] == report_mod.ACTION_UNRESOLVED for r in report.rows())
+
+
+def test_absent_target_on_om_2_0_is_nothing_to_clean():
+    class Om20Absent(_LineageOM):
+        is_2_0_or_newer = True
+
+        def delete_lineage_by_source(self, entity_type, fqn, source, entity_id=None):
+            raise component_mod.OMNotFound("404")
+
+    om = Om20Absent(_known())
+    om.is_2_0_or_newer = True
+    state = StateManager()
+    _refresh(om, state, _edges(pipeline=None))
+    assert f"table:{_t('b')}" in state.lineage_digests(PID)

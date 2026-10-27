@@ -663,7 +663,7 @@ class Component(ComponentBase):
         buckets = [bucket for bucket in run.reader.list_buckets() if self._bucket_in_scope(config, bucket)]
         # Written after every bucket: an alias may sit in another bucket than its
         # source table, which a parallel worker may still be creating.
-        view_edges: list[lineage_builder.LineageEdge] = []
+        view_edges: list[tuple[str, lineage_builder.LineageEdge]] = []
 
         def sync_bucket(bucket: SourceBucket, bucket_report: RunReport) -> None:
             schema_fqn = fqn_mod.schema_fqn(run.entities.service_name, run.entities.project, bucket.path or bucket.name)
@@ -733,15 +733,22 @@ class Component(ComponentBase):
                 bucket_ok = bucket_ok and ok
                 if built.view_source_fqn:
                     view_columns = [col["name"] for col in built.body.get("columns") or []]
-                    view_edges.append(lineage_builder.view_edge(built.fqn, built.view_source_fqn, view_columns))
+                    view_edges.append(
+                        (bucket.id, lineage_builder.view_edge(built.fqn, built.view_source_fqn, view_columns))
+                    )
             # advance-after-success: persist the digest only once the bucket's writes succeeded
             if bucket_ok:
                 state.set_bucket_digest(run.ctx.project_id, bucket.id, digest)
 
-        def write_view_edge(edge: lineage_builder.LineageEdge, item_report: RunReport) -> None:
-            self._put_lineage(om, run, item_report, edge, retry_table_level=True)
+        def write_view_edge(item: tuple[str, lineage_builder.LineageEdge], item_report: RunReport) -> None:
+            bucket_id, edge = item
+            if self._put_lineage(om, run, item_report, edge, retry_table_level=True) == EdgeOutcome.FAILED:
+                # Re-sync the bucket next run so its view edge is written again. An
+                # unresolved source keeps the digest: it may never be cataloged.
+                state.forget_bucket_digest(run.ctx.project_id, bucket_id)
 
         self._parallel(config, buckets, sync_bucket, report)
+        view_edges.sort(key=lambda item: (item[1].to_fqn, item[1].from_fqn))  # buckets finish in any order
         self._parallel(config, view_edges, write_view_edge, report)
 
     @staticmethod
@@ -1370,6 +1377,8 @@ class Component(ComponentBase):
                     om.delete_lineage_by_source(to_type, target_fqn, source, entity_id=target_id)
                 except OMAuthError:
                     raise
+                except OMNotFound:
+                    continue  # target not in OM (2.0+ deletes by name): nothing to drop
                 except Exception as exc:  # noqa: BLE001 - cleanup is best-effort, retried next run
                     logger.warning("Lineage cleanup of %s edges on %s failed: %s", source, target_fqn, exc)
                     cleanup_failed.add(target)
