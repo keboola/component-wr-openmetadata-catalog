@@ -104,7 +104,7 @@ Row (one Keboola project)
 | Project Name Override | Name of the project's Database (and of its pipeline/dashboard services) in OpenMetadata. Default: the Keboola project name. |
 | Objects | Which families to catalog — buckets, transformations, components, flows, data apps — each with an optional "only these" selector (empty = all). |
 | Advanced → Lineage | One switch per lineage type: bucket, table, column, pipeline (pipeline on the edge + flow → task lineage), dashboard. **Pipeline as lineage node (legacy)** also draws each pipeline as its own node between the tables; off by default. |
-| Write Pipeline Status | Push each pipeline's last job result as OpenMetadata pipeline status. |
+| Write Pipeline Status | Push each pipeline's latest job result (success, failure, still running) as its OpenMetadata pipeline status; a flow also gets the result of each task. |
 | Full Refresh | Ignore the change checks and re-push every bucket and every lineage edge this run. |
 | Merge Mode | **Three-way merge** (default): the writer remembers what it wrote last time (the `last_written_snapshot` table). If a person changed a field in OpenMetadata since then — for example a description — the writer keeps the person's value and marks the entity `skipped_diverged` in the run report. **Keboola overwrites**: Keboola is the source of truth; every field the writer owns is overwritten on every run. Fields the writer does not own (tags, glossary terms, …) are never touched in either mode. |
 | Failure Mode | **Collect and fail at end** (default), **Fail fast**, or **Log only**. |
@@ -164,6 +164,13 @@ Version 0.2 changes what an existing configuration writes on its next run:
 - **Custom properties** are no longer defined automatically. Properties that
   already exist keep being filled; choose *Define missing properties* to restore
   the old behaviour.
+- **Pipeline status** is now written: before, *Write Pipeline Status* found no job
+  and wrote nothing.
+- **SSH tunnel** now works: before, every tunnel failed (an incompatible SSH
+  library, the private key not being used, and TLS sent to `127.0.0.1` instead of
+  the OpenMetadata host).
+- **Flows migrated from orchestrations**: when a legacy orchestration and its
+  migrated flow share an id, only the flow is cataloged.
 - The first run re-writes every bucket and every lineage edge once (the catalog
   format version changed, and lineage change tracking starts with that run).
 
