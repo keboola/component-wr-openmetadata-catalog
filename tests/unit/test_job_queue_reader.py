@@ -52,7 +52,7 @@ def test_latest_job_asks_for_the_newest_job_of_one_config():
     assert params == {
         "componentId": "keboola.ex-db-mysql",
         "configId": "123",
-        "limit": 1,
+        "limit": 20,
         "sortBy": "id",
         "sortOrder": "desc",
     }
@@ -72,3 +72,26 @@ def test_rate_limited_queue_call_is_retried():
     reader = JobQueueReader("https://queue.keboola.com", "tok", session=session, backoff_base=0)
     assert reader.latest_job("keboola.ex-db-mysql", "1") is None
     assert session.get.call_count == 2
+
+
+def test_dev_branch_jobs_are_ignored():
+    """A dev branch keeps the production config id: only a production job sets the status."""
+    session = mock.Mock()
+    session.get.return_value = _response(
+        [{"id": "3", "status": "error", "branchId": "777"}, {"id": "2", "status": "success", "branchId": "10893"}]
+    )
+    reader = JobQueueReader("https://queue.keboola.com", "tok", session=session)
+    assert reader.latest_job("keboola.ex-db-mysql", "1", branch_id="10893") == {
+        "id": "2",
+        "status": "success",
+        "branchId": "10893",
+    }
+
+
+def test_a_retried_task_reports_its_newest_job():
+    children = [
+        {"id": "10", "component": "keboola.ex-db-mysql", "config": "1", "status": "error"},
+        {"id": "12", "component": "keboola.ex-db-mysql", "config": "1", "status": "success"},
+    ]
+    record = status_record({"status": "success"}, children, {"keboola.ex-db-mysql-1": "Extract"})
+    assert record.task_status == [{"name": "Extract", "executionStatus": "Successful"}]

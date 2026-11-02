@@ -33,6 +33,7 @@ _EXECUTION_STATUS = {
     "cancelled": _FAILED_STATUS,
 }
 _MAX_CHILD_JOBS = 500
+_LATEST_JOBS = 20
 
 
 @dataclass
@@ -75,10 +76,13 @@ def status_record(job: dict, children: list[dict], task_names: dict[str, str]) -
         or _epoch_ms(job.get("createdTime"))
         or int(time.time() * 1000)
     )
+    newest: dict[str, dict] = {}  # a retried task leaves several child jobs: the newest one counts
+    for child in sorted(children, key=lambda c: int(c.get("id") or 0), reverse=True):
+        newest.setdefault(f"{child.get('component')}-{child.get('config')}", child)
     tasks = [
         {"name": task_names[key], "executionStatus": execution_status(child.get("status"))}
-        for child in children
-        if (key := f"{child.get('component')}-{child.get('config')}") in task_names
+        for key, child in newest.items()
+        if key in task_names
     ]
     return PipelineStatusRecord(execution_status(job.get("status")), timestamp, tasks)
 
@@ -121,13 +125,18 @@ class JobQueueReader:
             return response.json()
         raise UserException(f"Job Queue request exhausted retries: GET {path}")
 
-    def latest_job(self, component_id: str, config_id: str) -> dict | None:
-        """The configuration's most recent job, or ``None`` if it never ran."""
-        jobs = self._get(
-            "/search/jobs",
-            {"componentId": component_id, "configId": config_id, "limit": 1, "sortBy": "id", "sortOrder": "desc"},
-        )
-        return jobs[0] if isinstance(jobs, list) and jobs else None
+    def latest_job(self, component_id: str, config_id: str, *, branch_id: str | None = None) -> dict | None:
+        """The configuration's most recent job on ``branch_id`` (production), or ``None``.
+
+        A dev branch keeps the production config id, so its jobs are skipped; among
+        the newest few jobs the first production one wins.
+        """
+        params = {"componentId": component_id, "configId": config_id, "limit": _LATEST_JOBS}
+        jobs = self._get("/search/jobs", params | {"sortBy": "id", "sortOrder": "desc"})
+        for job in jobs if isinstance(jobs, list) else []:
+            if branch_id is None or job.get("branchId") is None or str(job.get("branchId")) == str(branch_id):
+                return job
+        return None
 
     def child_jobs(self, run_id: str) -> list[dict]:
         """The jobs a flow job started (its tasks)."""

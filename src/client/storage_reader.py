@@ -15,13 +15,15 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import tempfile
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Any
+from typing import IO, Any
 
 import ijson
 import requests
+import urllib3
 from keboola.component.exceptions import UserException
 
 logger = logging.getLogger(__name__)
@@ -273,7 +275,8 @@ class StorageReader:
                         page_rows += 1
                         last_key = row.get(_SNAPSHOT_KEY) or last_key
                         yield row
-            except (requests.RequestException, csv.Error, UnicodeDecodeError) as exc:
+            except (requests.RequestException, urllib3.exceptions.HTTPError, csv.Error, UnicodeDecodeError) as exc:
+                # urllib3 errors: the body is read from the raw stream, past requests' wrapping.
                 logger.warning("Could not read the snapshot merge base '%s' (%s).", table_id, exc)
                 return
             read += page_rows
@@ -459,19 +462,39 @@ class StorageReader:
         ``componentId`` downstream.
 
         The response is the whole project's configuration (tens of MB on a large
-        project, several times that once parsed), so it is parsed as a stream:
-        only one component is held in memory at a time.
+        project, several times that once parsed), so it is parsed as a stream: only
+        one component is held in memory at a time. It is first saved to a temporary
+        file, so a broken download is retried whole and no connection stays open
+        while the caller does slow work between components.
         """
         branch = self.branch_id or "default"
         path = f"/v2/storage/branch/{branch}/components"
-        response = self._get_stream(path, params={"include": "configuration,rows"})
-        try:
-            response.raw.decode_content = True
-            yield from ijson.items(response.raw, "item", use_float=True)
-        except (requests.RequestException, ijson.JSONError) as exc:
-            raise UserException(f"Keboola Storage response was cut off: GET {path}: {exc}") from exc
-        finally:
-            response.close()
+        with self._download(path, params={"include": "configuration,rows"}) as body:
+            try:
+                yield from ijson.items(body, "item", use_float=True)
+            except ijson.JSONError as exc:
+                raise UserException(f"Keboola Storage returned invalid JSON: GET {path}: {exc}") from exc
+
+    def _download(self, path: str, params: dict | None = None) -> IO[bytes]:
+        """Save a response body to a temporary file (deleted on close); retry a broken body."""
+        for attempt in range(self.max_retries + 1):
+            body = tempfile.TemporaryFile()  # noqa: SIM115 - returned open; the caller closes it
+            try:
+                with self._get_stream(path, params=params) as response:
+                    for chunk in response.iter_content(chunk_size=1 << 20):
+                        body.write(chunk)
+            except (requests.RequestException, urllib3.exceptions.HTTPError) as exc:
+                body.close()
+                if attempt < self.max_retries:
+                    time.sleep(self.backoff_base * (2**attempt))
+                    continue
+                raise UserException(f"Keboola Storage download failed: GET {path}: {exc}") from exc
+            except BaseException:
+                body.close()
+                raise
+            body.seek(0)
+            return body
+        raise UserException(f"Keboola Storage request exhausted retries: GET {path}")
 
     def get_component_config(self, component_id: str, config_id: str) -> dict:
         branch = self.branch_id or "default"

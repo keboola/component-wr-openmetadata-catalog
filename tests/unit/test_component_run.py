@@ -122,6 +122,8 @@ class FakeOM:
 
 
 class OneBucketStorage:
+    branch_id = None
+
     def __init__(self, *a, **k):
         pass
 
@@ -642,7 +644,7 @@ class _StatusJobReader:
     def __init__(self, *a, **k):
         pass
 
-    def latest_job(self, component_id, config_id):
+    def latest_job(self, component_id, config_id, branch_id=None):
         return {"id": "999", "runId": "999", "status": "success", "endTime": "2026-08-24T10:02:00+00:00"}
 
     def child_jobs(self, run_id):
@@ -1784,7 +1786,7 @@ def test_pipeline_status_comes_from_the_latest_job_of_the_config(monkeypatch):
     lookups = []
 
     class Reader(_StatusJobReader):
-        def latest_job(self, component_id, config_id):
+        def latest_job(self, component_id, config_id, branch_id=None):
             lookups.append((component_id, config_id))
             return super().latest_job(component_id, config_id) if config_id == "ran" else None
 

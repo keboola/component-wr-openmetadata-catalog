@@ -34,13 +34,17 @@ def _load_private_key(text: str):
     """Parse the configured private key; sshtunnel ignores a key given as text."""
     import paramiko
 
+    if "\n" not in text and "\\n" in text:
+        text = text.replace("\\n", "\n")  # a key pasted with literal "\n" escapes
     for key_class in (paramiko.Ed25519Key, paramiko.ECDSAKey, paramiko.RSAKey, paramiko.DSSKey):
         try:
             return key_class.from_private_key(io.StringIO(text))
         except paramiko.SSHException, ValueError:
             continue
     raise UserException(
-        "The SSH private key could not be read. Use an unencrypted RSA, ECDSA or Ed25519 key (OpenSSH or PEM format)."
+        "The SSH private key could not be read. Use an unencrypted RSA, ECDSA or Ed25519 key that starts "
+        "with '-----BEGIN OPENSSH PRIVATE KEY-----', '-----BEGIN RSA PRIVATE KEY-----' or "
+        "'-----BEGIN EC PRIVATE KEY-----'."
     )
 
 
@@ -122,7 +126,8 @@ class SshProxy:
         if self.local_om_host is None:
             raise RuntimeError("the tunnel is not open")
         session = requests.Session()
-        session.mount(self.local_om_host, _TunnelAdapter(urlparse(f"//{self._remote_netloc}").hostname or ""))
+        if urlparse(self.local_om_host).scheme == "https":  # plain http has no TLS name to present
+            session.mount(self.local_om_host, _TunnelAdapter(urlparse(f"//{self._remote_netloc}").hostname or ""))
         session.headers["Host"] = self._remote_netloc
         return session
 

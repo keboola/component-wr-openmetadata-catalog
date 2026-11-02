@@ -139,3 +139,22 @@ def test_tunnel_session_keeps_a_non_default_port_in_the_host_header():
     proxy.local_om_host = "https://127.0.0.1:40000"
     proxy._remote_netloc = "om.example.com:8585"
     assert proxy.session().headers["Host"] == "om.example.com:8585"
+
+
+def test_plain_http_om_through_the_tunnel_gets_no_tls_settings():
+    """An http OM (e.g. port 8585) must not get TLS pool settings: urllib3 rejects them for http."""
+    proxy = SshProxy(mock.Mock(), "http://om.internal:8585")
+    proxy.local_om_host = "http://127.0.0.1:40000"
+    proxy._remote_netloc = "om.internal:8585"
+    session = proxy.session()
+    adapter = session.get_adapter("http://127.0.0.1:40000/api/v1/system/version")
+    assert isinstance(adapter, HTTPAdapter)
+    adapter.poolmanager.connection_from_url("http://127.0.0.1:40000")._new_conn()  # raised TypeError before
+    assert session.headers["Host"] == "om.internal:8585"
+
+
+def test_key_pasted_with_literal_newline_escapes_is_read():
+    from client.ssh_proxy import _load_private_key
+
+    escaped = _Ssh.private_key.replace("\n", "\\n")
+    assert _load_private_key(escaped).get_name() == "ssh-rsa"

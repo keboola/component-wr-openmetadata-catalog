@@ -429,3 +429,22 @@ def test_lineage_off_forgets_lineage_digests(tmp_path, monkeypatch, _env):
     component_mod.Component().run()
     out = json.loads((tmp_path / "data" / "out" / "state.json").read_text())
     assert out["projects"]["777"]["lineage_digests"] == {}
+
+
+def test_snapshot_is_read_under_the_sanitized_service_name(tmp_path, monkeypatch, _env):
+    """FQNs use the sanitized service name ("Keboola Prod" -> "Keboola_Prod"); so must the snapshot read."""
+    prefixes = []
+
+    class SnapshotStorage(FakeStorage):
+        def read_snapshot_rows(self, table_id, **kwargs):
+            prefixes.append(kwargs.get("key_prefix"))
+            return []
+
+    monkeypatch.setattr(component_mod, "StorageReader", SnapshotStorage)
+    monkeypatch.setattr(component_mod, "OMClient", lambda *a, **k: PersistentOM())
+    state = {"snapshot_table": "in.c-wr-openmetadata-catalog.last_written_snapshot"}
+    monkeypatch.setenv(
+        "KBC_DATADIR", _make_datadir(tmp_path, {**BASE_PARAMS, "service_name": "Keboola Prod"}, state=state)
+    )
+    component_mod.Component().run()
+    assert prefixes == ["Keboola_Prod"]

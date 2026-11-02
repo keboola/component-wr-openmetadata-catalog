@@ -328,3 +328,71 @@ def test_read_snapshot_rows_does_not_stop_on_a_short_page():
     rows = [{"entity_fqn": f"svc.t{i}", "entity_type": "table", "written_fields_json": "{}"} for i in range(10)]
     reader = StorageReader("https://connection.keboola.com", "tok", session=ShortPages(rows))  # ty: ignore[invalid-argument-type]  (duck-typed test double)
     assert len(list(reader.read_snapshot_rows("in.c-x.last_written_snapshot", key_prefix="svc"))) == 10
+
+
+class _BrokenStream(io.RawIOBase):
+    """A response body that breaks after some bytes, like a dropped connection."""
+
+    def __init__(self, data: bytes, fail_after: int):
+        self._data, self._pos, self._fail_after = data, 0, fail_after
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        if self._pos >= self._fail_after:
+            import urllib3
+
+            raise urllib3.exceptions.ProtocolError("Connection broken: IncompleteRead")
+        chunk = self._data[self._pos : min(self._fail_after, self._pos + len(buffer))]
+        buffer[: len(chunk)] = chunk
+        self._pos += len(chunk)
+        return len(chunk)
+
+
+def test_snapshot_read_broken_mid_body_is_a_warning_not_a_crash(caplog):
+    body = b"entity_fqn,entity_type,written_fields_json\nsvc.a,table,{}\nsvc.b,table,{}\n"
+    response = CsvResponse("")
+    response.raw = _BrokenStream(body, fail_after=len(body) - 5)  # ty: ignore[invalid-assignment]
+    session = mock.Mock()
+    session.get.return_value = response
+    reader = StorageReader("https://connection.keboola.com", "tok", session=session)
+    with caplog.at_level("WARNING"):
+        rows = list(reader.read_snapshot_rows("in.c-x.last_written_snapshot", key_prefix="svc"))
+    assert [r["entity_fqn"] for r in rows] == ["svc.a"]
+    assert any("Could not read the snapshot merge base" in r.message for r in caplog.records)
+
+
+def test_config_listing_retries_a_broken_download():
+    import urllib3
+
+    class Streamed:
+        status_code = 200
+
+        def __init__(self, chunks):
+            self._chunks = chunks
+
+        def iter_content(self, chunk_size=None):
+            for chunk in self._chunks:
+                if isinstance(chunk, Exception):
+                    raise chunk
+                yield chunk
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def close(self):
+            pass
+
+    good = json.dumps([{"id": "keboola.ex-db-mysql", "configurations": [{"id": "1"}]}]).encode()
+    session = mock.Mock()
+    session.get.side_effect = [
+        FakeResponse(200, [{"id": "10893", "isDefault": True}]),  # default branch lookup
+        Streamed([good[:10], urllib3.exceptions.ProtocolError("Connection broken")]),
+        Streamed([good]),
+    ]
+    reader = StorageReader("https://connection.keboola.com", "tok", session=session, backoff_base=0)
+    assert [c["id"] for c in reader.list_component_configs()] == ["keboola.ex-db-mysql"]

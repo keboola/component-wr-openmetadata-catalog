@@ -334,6 +334,7 @@ class _ProjectRun:
     dashboard_fqn_by_config: dict[str, str] = field(default_factory=dict)
     # Legacy orchestration ids that a migrated flow of the same id supersedes.
     migrated_orchestration_ids: set[str] = field(default_factory=set)
+    job_queue: JobQueueReader | None = None
     id_cache: dict[str, str | None] = field(default_factory=dict)
     # FQNs this run had to create (they were absent from OM when the run started).
     created_fqns: set[str] = field(default_factory=set)
@@ -377,7 +378,7 @@ class Component(ComponentBase):
                 raise UserException(self._unexpected_answer(config, exc)) from exc
             server_version = om.server_version
             version_changed = state.om_version_seen not in (None, server_version)
-            snapshot = self._load_snapshot(env, state, config.resolve_service_name())
+            snapshot = self._load_snapshot(env, state, fqn_mod.sanitize_name(config.resolve_service_name()))
             self._process_project(config, om, project, env, state, snapshot, report, version_changed, synced_at)
             state.om_version_seen = server_version
         finally:
@@ -943,10 +944,13 @@ class Component(ComponentBase):
     def _push_pipeline_status(self, run, pipeline_fqn, component_id, cfg, om, report) -> None:
         if not run.ctx.storage_url:
             return
-        queue = JobQueueReader(run.ctx.storage_url.replace("connection.", "queue."), run.ctx.storage_token)
+        if run.job_queue is None:
+            run.job_queue = JobQueueReader(run.ctx.storage_url.replace("connection.", "queue."), run.ctx.storage_token)
+        queue = run.job_queue
         try:
-            # The configuration listing carries no job id: ask the queue for the latest job.
-            job = queue.latest_job(component_id, str(cfg.get("id")))
+            # The configuration listing carries no job id: ask the queue for the latest job
+            # on the production branch (the listing is production-only too).
+            job = queue.latest_job(component_id, str(cfg.get("id")), branch_id=run.reader.branch_id)
             if job is None:
                 return  # never ran
             # Only a flow's child jobs map to tasks of its pipeline; others keep the overall status.
