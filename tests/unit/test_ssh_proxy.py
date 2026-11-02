@@ -71,14 +71,22 @@ def test_tunnel_uses_the_configured_key_only(tmp_path, monkeypatch, key_type):
     which the platform container does not have. It also reads paramiko.DSSKey while it
     builds the forwarder, which paramiko 4 removed.
     """
-    import subprocess
-
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
     from sshtunnel import SSHTunnelForwarder
 
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
-    key_file = tmp_path / "id_test"
-    subprocess.run(["ssh-keygen", "-q", "-t", key_type, "-N", "", "-f", str(key_file)], check=True)
+    generate = {
+        "ed25519": ed25519.Ed25519PrivateKey.generate,
+        "ecdsa": lambda: ec.generate_private_key(ec.SECP256R1()),
+        "rsa": lambda: rsa.generate_private_key(public_exponent=65537, key_size=2048),
+    }[key_type]
+    key_text = (
+        generate()
+        .private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.OpenSSH, serialization.NoEncryption())
+        .decode()
+    )
     captured = {}
 
     class Forwarder(SSHTunnelForwarder):
@@ -95,7 +103,7 @@ def test_tunnel_uses_the_configured_key_only(tmp_path, monkeypatch, key_type):
 
     with mock.patch("sshtunnel.SSHTunnelForwarder", Forwarder):
         proxy = SshProxy(
-            mock.Mock(host="127.0.0.1", port=2222, user="kbc", private_key=key_file.read_text()),
+            mock.Mock(host="127.0.0.1", port=2222, user="kbc", private_key=key_text),
             "https://om.example.com",
         )
         assert proxy.open() == "https://127.0.0.1:40000"
