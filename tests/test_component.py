@@ -42,6 +42,7 @@ class FakeOM:
         self.is_2_0_or_newer = False
         self.fail_tables = fail_tables
         self.put_calls = []
+        self.tables: list[str] = []
 
     def probe_version(self):
         self.server_version = "1.13.4"
@@ -57,18 +58,21 @@ class FakeOM:
         if kind == "tables" and self.fail_tables:
             raise RuntimeError("boom")
         self.put_calls.append((kind, body.get("name")))
+        if kind == "tables":
+            self.tables.append(f"{body.get('databaseSchema')}.{body.get('name')}")
         return {"id": f"id-{body.get('name')}"}
 
     def patch_entity(self, kind, fqn, patch):
         return {"id": "x"}
 
     def list_entities(self, kind, params=None, page_size=200):
-        return iter([])
+        schema = (params or {}).get("databaseSchema", "")
+        return iter([{"fullyQualifiedName": fqn} for fqn in self.tables if fqn.startswith(f"{schema}.")])
 
     def put_lineage(self, edge):
         return {}
 
-    def delete_lineage_by_source(self, *a):
+    def delete_lineage_by_source(self, *a, **k):
         return None
 
     def soft_delete(self, *a, **k):
@@ -249,9 +253,12 @@ def test_second_run_loads_base_and_updates_changed_owned_field(tmp_path, monkeyp
             return {"id": "x"}
 
         def list_entities(self, kind, params=None, page_size=200):
-            return iter([])
+            schema = (params or {}).get("databaseSchema", "")
+            return iter(
+                [{"fullyQualifiedName": fqn} for (k, fqn) in om_store if k == kind and fqn.startswith(f"{schema}.")]
+            )
 
-        def delete_lineage_by_source(self, *a):
+        def delete_lineage_by_source(self, *a, **k):
             return None
 
         def soft_delete(self, *a, **k):
@@ -399,3 +406,26 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_lineage_off_forgets_lineage_digests(tmp_path, monkeypatch, _env):
+    """Digests from before a lineage pause must not skip targets once lineage is back on."""
+    monkeypatch.setattr(component_mod, "StorageReader", FakeStorage)
+    monkeypatch.setattr(component_mod, "OMClient", lambda *a, **k: PersistentOM())
+    off = {
+        **BASE_PARAMS,
+        "write_table_lineage": False,
+        "write_column_lineage": False,
+        "write_pipeline_lineage": False,
+        "write_dashboard_lineage": False,
+        "write_bucket_lineage": False,
+    }
+    target = f"https://om.example.com/keboola#catalog-v{component_mod._CATALOG_FORMAT_VERSION}"
+    state = {
+        "om_target_seen": target,
+        "projects": {"777": {"bucket_digests": {}, "lineage_digests": {"table:x": "d"}}},
+    }
+    monkeypatch.setenv("KBC_DATADIR", _make_datadir(tmp_path, off, state=state))
+    component_mod.Component().run()
+    out = json.loads((tmp_path / "data" / "out" / "state.json").read_text())
+    assert out["projects"]["777"]["lineage_digests"] == {}

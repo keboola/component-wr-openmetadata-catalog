@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 _BRANCH_METADATA_KEY = "KBC.createdBy.branch.id"
 _DESCRIPTION_KEY = "KBC.description"
 _CREATED_BY_PREFIX = "KBC.createdBy."
-_RETRYABLE_STATUS = frozenset({500, 502, 503, 504})
+_RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 # Storage data-preview rejects a larger ``limit`` with 400.
 _PREVIEW_MAX_ROWS = 1000
 # The snapshot table's primary key: unique and ordered, so it doubles as the page cursor.
@@ -80,6 +80,7 @@ class SourceTable:
     data_size_bytes: int | None = None
     last_import_date: str | None = None
     is_alias: bool = False
+    is_typed: bool = False
     source_table: dict | None = None
     branch_id: str | None = None
     # Storage ``KBC.createdBy.*`` system metadata (component id / configuration
@@ -126,6 +127,15 @@ def _metadata_prefixed_values(entries: list | None, prefix: str) -> dict[str, st
         if isinstance(key, str) and key.startswith(prefix) and value is not None:
             result[key] = value
     return result
+
+
+def needs_detail(table: SourceTable) -> bool:
+    """Whether a table read from a bucket list lacks data only its own GET returns.
+
+    A typed table's native column types live in ``definition`` and an alias's
+    source in ``sourceTable``; the bucket table list returns neither.
+    """
+    return table.is_typed or table.is_alias
 
 
 class StorageReader:
@@ -317,9 +327,18 @@ class StorageReader:
         return buckets
 
     def iter_tables(self, bucket_id: str) -> Iterator[SourceTable]:
-        summaries = self._get(f"/v2/storage/buckets/{bucket_id}/tables", params={"include": "metadata"})
-        for summary in summaries if isinstance(summaries, list) else []:
-            yield self.get_table(summary["id"])
+        """Every table of a bucket, with columns and metadata, from ONE Storage call.
+
+        The list carries no typed ``definition`` (native column types) and no alias
+        ``sourceTable``; :func:`needs_detail` marks the tables that need
+        :meth:`get_table` for those. Callers fetch that detail only for a bucket they
+        write, so an unchanged bucket costs one call instead of one per table.
+        """
+        raw = self._get(
+            f"/v2/storage/buckets/{bucket_id}/tables", params={"include": "columns,metadata,columnMetadata"}
+        )
+        for item in raw if isinstance(raw, list) else []:
+            yield self._parse_table(item)
 
     def get_table(self, table_id: str) -> SourceTable:
         raw = self._get(
@@ -364,6 +383,7 @@ class StorageReader:
             data_size_bytes=raw.get("dataSizeBytes"),
             last_import_date=raw.get("lastImportDate"),
             is_alias=bool(raw.get("isAlias")),
+            is_typed=bool(raw.get("isTyped")),
             source_table=raw.get("sourceTable"),
             branch_id=branch,
             created_by_metadata=_metadata_prefixed_values(raw.get("metadata"), _CREATED_BY_PREFIX),

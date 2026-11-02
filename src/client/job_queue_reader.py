@@ -18,7 +18,7 @@ from keboola.component.exceptions import UserException
 
 logger = logging.getLogger(__name__)
 
-_RETRYABLE_STATUS = frozenset({500, 502, 503, 504})
+_RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 _START = "START"
 _TERMINAL = frozenset({"COMPLETE", "FAIL", "ABORT"})
 _SUCCESS_STATUS = "Successful"
