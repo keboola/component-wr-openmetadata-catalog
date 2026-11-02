@@ -32,7 +32,7 @@ from keboola.vcr import BaseSanitizer, DefaultSanitizer
 import report as report_mod
 from client import ssh_proxy
 from client.data_app_reader import fetch_app_states
-from client.job_queue_reader import JobQueueReader
+from client.job_queue_reader import JobQueueReader, status_record
 from client.om_client import (
     OMAuthError,
     OMClient,
@@ -369,7 +369,7 @@ class Component(ComponentBase):
                 raise UserException(self._unexpected_answer(config, exc)) from exc
             server_version = om.server_version
             version_changed = state.om_version_seen not in (None, server_version)
-            snapshot = self._load_snapshot(env, state)
+            snapshot = self._load_snapshot(env, state, config.resolve_service_name())
             self._process_project(config, om, project, env, state, snapshot, report, version_changed, synced_at)
             state.om_version_seen = server_version
         finally:
@@ -409,9 +409,10 @@ class Component(ComponentBase):
         return storage_url.rstrip("/")
 
     def _build_om_client(self, config: Configuration, proxy: ssh_proxy.SshProxy | None, **client_kwargs) -> OMClient:
-        host = proxy.local_om_host if proxy and proxy.local_om_host else config.om_host
-        verify_ssl = proxy is None  # a loopback tunnel terminates TLS at the bastion
-        return OMClient(host, config.bot_token, verify_ssl=verify_ssl, **client_kwargs)
+        if proxy is not None and proxy.local_om_host:
+            # TLS runs end to end through the tunnel and is checked against the OM host name.
+            return OMClient(proxy.local_om_host, config.bot_token, session=proxy.session(), **client_kwargs)
+        return OMClient(config.om_host, config.bot_token, **client_kwargs)
 
     @staticmethod
     def _connection_hint(config: Configuration) -> str:
@@ -459,13 +460,19 @@ class Component(ComponentBase):
     # -------------------------------------------------------------- snapshot
 
     @staticmethod
-    def _load_snapshot(env: dict, state: StateManager) -> SnapshotStore:
+    def _load_snapshot(env: dict, state: StateManager, service_name: str) -> SnapshotStore:
+        """Load the merge base, keeping only this service's entities.
+
+        Every configuration in the project writes to the same snapshot table, so it
+        also holds other configurations' entities; holding those would only cost memory.
+        """
         snapshot = SnapshotStore()
         if not state.snapshot_table or not env["token"] or not env["url"]:
             return snapshot
         reader = StorageReader(env["url"], env["token"])
-        rows = reader.read_snapshot_rows(state.snapshot_table)
-        snapshot.load_rows(rows)
+        # FQNs of this service start with its name: "<service>", "<service>.<db>...",
+        # "<service>-<project>.<pipeline>" (pipeline and dashboard services).
+        snapshot.load_rows(reader.read_snapshot_rows(state.snapshot_table, key_prefix=service_name))
         return snapshot
 
     # ------------------------------------------------------ per-project run
@@ -852,7 +859,7 @@ class Component(ComponentBase):
                 merger,
             )
             if config.write_pipeline_status:
-                self._push_pipeline_status(run, built.fqn, cfg, env, om, item_report)
+                self._push_pipeline_status(run, built.fqn, component_id, cfg, om, item_report)
 
         self._parallel(config, selected, sync_pipeline, report)
 
@@ -916,16 +923,19 @@ class Component(ComponentBase):
         storage = (cfg.get("configuration") or {}).get("storage") or {}
         return bool((storage.get("output") or {}).get("tables") or (storage.get("input") or {}).get("tables"))
 
-    def _push_pipeline_status(self, run, pipeline_fqn, cfg, env, om, report) -> None:
-        job_id = ((cfg.get("configuration") or {}).get("_lastJobId")) or cfg.get("lastJobId")
-        if not job_id or not env["url"]:
+    def _push_pipeline_status(self, run, pipeline_fqn, component_id, cfg, om, report) -> None:
+        if not run.ctx.storage_url:
             return
-        queue_url = env["url"].replace("connection.", "queue.")
+        queue = JobQueueReader(run.ctx.storage_url.replace("connection.", "queue."), run.ctx.storage_token)
         try:
-            events = JobQueueReader(queue_url, run.ctx.storage_token).get_lineage_events(str(job_id))
-            record = JobQueueReader.summarize_run(events)
-            if record is not None:
-                om.put_pipeline_status(pipeline_fqn, record.to_status_body())
+            # The configuration listing carries no job id: ask the queue for the latest job.
+            job = queue.latest_job(component_id, str(cfg.get("id")))
+            if job is None:
+                return  # never ran
+            # Only a flow's child jobs map to tasks of its pipeline; others keep the overall status.
+            task_names = PipelineBuilder.flow_task_names_by_job(cfg.get("configuration") or {})
+            children = queue.child_jobs(str(job["runId"])) if task_names and job.get("runId") else []
+            om.put_pipeline_status(pipeline_fqn, status_record(job, children, task_names).to_status_body())
         except OMAuthError:
             # Auth stays fatal, consistent with the per-entity write paths (_upsert /
             # _put_lineage) — an invalid #bot_token must fail the run, not be swallowed.

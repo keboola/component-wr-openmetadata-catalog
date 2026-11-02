@@ -334,6 +334,25 @@ class PipelineBuilder:
         )
 
     @staticmethod
+    def flow_task_names_by_job(configuration: dict) -> dict[str, str]:
+        """OpenLineage job name of each flow task's child job -> that task's pipeline task name.
+
+        The Job Queue names a child job ``<componentId>-<configId>``; OM accepts a task
+        status only under a task name of the pipeline, as :meth:`_flow_to_tasks` builds it.
+        """
+        phases = {p.get("id") for p in configuration.get("phases") or []}
+        names: dict[str, str] = {}
+        for task in configuration.get("tasks") or []:
+            child = task.get("task") or {}
+            if task.get("enabled") is False or task.get("phase") not in phases:
+                continue
+            if child.get("componentId") and child.get("configId"):
+                names[f"{child['componentId']}-{child['configId']}"] = fqn.sanitize_name(
+                    task.get("name") or task.get("id")
+                )
+        return names
+
+    @staticmethod
     def _flow_to_tasks(configuration: dict) -> list[dict]:
         phases = configuration.get("phases") or []
         raw_tasks = configuration.get("tasks") or []

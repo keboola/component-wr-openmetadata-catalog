@@ -1,65 +1,74 @@
-from client.job_queue_reader import JobQueueReader
+from unittest import mock
+
+from client.job_queue_reader import JobQueueReader, execution_status, status_record
 
 
-def test_summarize_run_success_with_children():
-    events = [
-        {"eventType": "START", "eventTime": "2026-08-24T10:00:00Z", "job": {"name": "flow"}},
-        {"eventType": "START", "eventTime": "2026-08-24T10:00:05Z", "job": {"name": "child-1"}},
-        {"eventType": "COMPLETE", "eventTime": "2026-08-24T10:01:00Z", "job": {"name": "child-1"}},
-        {"eventType": "COMPLETE", "eventTime": "2026-08-24T10:02:00Z", "job": {"name": "flow"}},
+def _response(body, status_code=200):
+    response = mock.Mock(status_code=status_code)
+    response.json.return_value = body
+    return response
+
+
+def test_failed_job_is_failed_even_though_its_lineage_events_say_complete():
+    """Keboola emits OpenLineage COMPLETE for a failed job too: the job's own status decides."""
+    job = {"status": "error", "startTime": "2026-08-24T10:00:00+00:00", "endTime": "2026-08-24T10:02:00+00:00"}
+    body = status_record(job, [], {}).to_status_body()
+    assert body == {"timestamp": 1787565720000, "executionStatus": "Failed", "taskStatus": []}
+
+
+def test_job_statuses_map_to_om_execution_statuses():
+    assert [execution_status(s) for s in ("success", "warning", "error", "terminated", "cancelled")] == [
+        "Successful",
+        "Successful",
+        "Failed",
+        "Failed",
+        "Failed",
     ]
-    rec = JobQueueReader.summarize_run(events)
-    assert rec is not None
-    assert rec.execution_status == "Successful"
-    body = rec.to_status_body()
-    assert body["executionStatus"] == "Successful"
-    # end timestamp is the latest terminal event (2026-08-24T10:02:00Z)
-    assert body["timestamp"] == 1787565720000
-    names = {t["name"] for t in body["taskStatus"]}
-    assert {"child-1", "flow"} <= names
+    assert {execution_status(s) for s in ("created", "waiting", "processing", "terminating", None)} == {"Pending"}
 
 
-def test_summarize_run_failure_when_any_child_fails():
-    events = [
-        {"eventType": "START", "eventTime": "2026-08-24T10:00:00Z", "job": {"name": "flow"}},
-        {"eventType": "FAIL", "eventTime": "2026-08-24T10:00:30Z", "job": {"name": "child-1"}},
-        {"eventType": "COMPLETE", "eventTime": "2026-08-24T10:01:00Z", "job": {"name": "flow"}},
+def test_flow_child_jobs_become_task_statuses_under_the_pipeline_task_names():
+    job = {"status": "success", "endTime": "2026-08-24T10:02:00+00:00"}
+    children = [
+        {"component": "keboola.ex-db-mysql", "config": "1", "status": "success"},
+        {"component": "keboola.snowflake-transformation", "config": "2", "status": "error"},
+        {"component": "keboola.other", "config": "3", "status": "success"},  # not a task of this flow
     ]
-    rec = JobQueueReader.summarize_run(events)
-    assert rec is not None
-    assert rec.execution_status == "Failed"
+    names = {"keboola.ex-db-mysql-1": "Extract", "keboola.snowflake-transformation-2": "Transform"}
+    record = status_record(job, children, names)
+    assert record.task_status == [
+        {"name": "Extract", "executionStatus": "Successful"},
+        {"name": "Transform", "executionStatus": "Failed"},
+    ]
 
 
-def test_summarize_run_empty_returns_none():
-    assert JobQueueReader.summarize_run([]) is None
-
-
-def test_get_lineage_events_unwraps_dict():
-    from unittest import mock
-
+def test_latest_job_asks_for_the_newest_job_of_one_config():
     session = mock.Mock()
-
-    class R:
-        status_code = 200
-
-        @staticmethod
-        def json():
-            return {"events": [{"eventType": "START", "eventTime": "2026-08-24T10:00:00Z"}]}
-
-    session.get.return_value = R()
+    session.get.side_effect = [_response([{"id": "60770133", "status": "success"}]), _response([])]
     reader = JobQueueReader("https://queue.keboola.com", "tok", session=session)
-    events = reader.get_lineage_events("job-1")
-    assert len(events) == 1
+    assert reader.latest_job("keboola.ex-db-mysql", "123") == {"id": "60770133", "status": "success"}
+    assert reader.latest_job("keboola.ex-db-mysql", "456") is None
+    params = session.get.call_args_list[0].kwargs["params"]
+    assert params == {
+        "componentId": "keboola.ex-db-mysql",
+        "configId": "123",
+        "limit": 1,
+        "sortBy": "id",
+        "sortOrder": "desc",
+    }
+
+
+def test_child_jobs_are_found_by_the_parent_run_id():
+    session = mock.Mock()
+    session.get.return_value = _response([{"id": "2"}])
+    reader = JobQueueReader("https://queue.keboola.com", "tok", session=session)
+    assert reader.child_jobs("1.2") == [{"id": "2"}]
+    assert session.get.call_args.kwargs["params"]["parentRunId"] == "1.2"
 
 
 def test_rate_limited_queue_call_is_retried():
-    from unittest import mock
-
-    busy = mock.Mock(status_code=429)
-    ok = mock.Mock(status_code=200)
-    ok.json.return_value = []
     session = mock.Mock()
-    session.get.side_effect = [busy, ok]
+    session.get.side_effect = [_response({}, status_code=429), _response([])]
     reader = JobQueueReader("https://queue.keboola.com", "tok", session=session, backoff_base=0)
-    assert reader.get_lineage_events("job-1") == []
+    assert reader.latest_job("keboola.ex-db-mysql", "1") is None
     assert session.get.call_count == 2

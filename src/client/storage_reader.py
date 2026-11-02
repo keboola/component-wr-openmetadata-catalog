@@ -20,6 +20,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
+import ijson
 import requests
 from keboola.component.exceptions import UserException
 
@@ -35,6 +36,11 @@ _PREVIEW_MAX_ROWS = 1000
 _SNAPSHOT_KEY = "entity_fqn"
 # A wide table's written_fields_json exceeds csv's 128 KB default field limit.
 csv.field_size_limit(2**31 - 1)
+
+
+def _prefix_upper_bound(prefix: str) -> str:
+    """The smallest string greater than every string that starts with ``prefix``."""
+    return prefix[:-1] + chr(ord(prefix[-1]) + 1)
 
 
 def resolve_storage_credentials(
@@ -186,51 +192,95 @@ class StorageReader:
             return response.json()
         raise UserException(f"Keboola Storage request exhausted retries: GET {path}")
 
-    def read_snapshot_rows(self, table_id: str) -> Iterator[dict]:
-        """Stream the whole prior snapshot table (the three-way-merge base), page by page.
+    def _get_stream(self, path: str, params: dict | None = None) -> requests.Response:
+        """Like :meth:`_get`, but returns the open response for the caller to stream."""
+        url = f"{self.base_url}{path}"
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = self.session.get(url, params=params, timeout=self.timeout, stream=True)
+            except requests.RequestException as exc:
+                if attempt < self.max_retries:
+                    time.sleep(self.backoff_base * (2**attempt))
+                    continue
+                raise UserException(f"Keboola Storage request failed: GET {path}: {exc}") from exc
+            if response.status_code in (401, 403):
+                response.close()
+                raise UserException(
+                    f"Keboola Storage rejected the token ({response.status_code}) on GET {path}. "
+                    "Check the Storage token is valid and has read access."
+                )
+            if response.status_code in _RETRYABLE_STATUS and attempt < self.max_retries:
+                response.close()
+                time.sleep(self.backoff_base * (2**attempt))
+                continue
+            if response.status_code >= 400:
+                response.close()
+                raise UserException(f"Keboola Storage GET {path} failed: {response.status_code}")
+            return response
+        raise UserException(f"Keboola Storage request exhausted retries: GET {path}")
+
+    def read_snapshot_rows(self, table_id: str, *, key_prefix: str = "") -> Iterator[dict]:
+        """Stream the prior snapshot table (the three-way-merge base), row by row.
 
         ``data-preview`` returns at most 1000 rows per call and rejects a larger
         ``limit`` with 400, so the table is paged by its primary key: each call asks
-        for the rows after the last key seen (keyset pagination). Rows are yielded as
-        each page arrives, so a large snapshot (57 MB for ~13k entities) is never held
-        whole in memory.
+        for the rows after the last key seen (keyset pagination). Each page is parsed
+        as a stream and rows are yielded as they arrive: one page of wide tables can
+        be over 10 MB of CSV, so neither a page nor the table is ever held whole.
+        ``key_prefix`` asks Storage only for keys that start with it: one service's
+        entities (every configuration in a project shares the table), plus any service
+        whose name merely extends it, which the exact-key lookups ignore. Paging ends on
+        an empty page, so a page cut short by the server cannot end the read early.
 
-        Yields nothing when the table does not exist yet (first run). A failed or short
-        read is logged loudly and ends the stream: entities missing from the base look
+        Yields nothing when the table does not exist yet (first run). A failed read is
+        logged loudly and ends the stream: entities missing from the base look
         human-edited and are skipped as diverged (fail-safe, never overwritten).
         """
         url = f"{self.base_url}/v2/storage/tables/{table_id}/data-preview"
         read = 0
         last_key: str | None = None
         while True:
-            params = {"limit": _PREVIEW_MAX_ROWS, "orderBy[0][column]": _SNAPSHOT_KEY, "orderBy[0][order]": "ASC"}
+            filters: list[tuple[str, str]] = []
+            if key_prefix:
+                filters += [("ge", key_prefix), ("lt", _prefix_upper_bound(key_prefix))]
             if last_key is not None:
+                filters.append(("gt", last_key))
+            params = {"limit": _PREVIEW_MAX_ROWS, "orderBy[0][column]": _SNAPSHOT_KEY, "orderBy[0][order]": "ASC"}
+            for i, (operator, value) in enumerate(filters):
                 params |= {
-                    "whereFilters[0][column]": _SNAPSHOT_KEY,
-                    "whereFilters[0][operator]": "gt",
-                    "whereFilters[0][values][]": last_key,
+                    f"whereFilters[{i}][column]": _SNAPSHOT_KEY,
+                    f"whereFilters[{i}][operator]": operator,
+                    f"whereFilters[{i}][values][]": value,
                 }
+            page_rows = 0
             try:
-                response = self.session.get(url, params=params, timeout=self.timeout)
-                if response.status_code == 404:  # first run: no snapshot yet
-                    return
-                if response.status_code >= 400:
-                    logger.warning(
-                        "Could not read the snapshot merge base '%s' (HTTP %s); existing entities will "
-                        "be skipped as diverged this run.",
-                        table_id,
-                        response.status_code,
-                    )
-                    return
-                page = list(csv.DictReader(io.StringIO(response.text)))
-            except (requests.RequestException, csv.Error) as exc:
+                with self.session.get(url, params=params, timeout=self.timeout, stream=True) as response:
+                    if response.status_code == 404:  # first run: no snapshot yet
+                        return
+                    if response.status_code >= 400:
+                        logger.warning(
+                            "Could not read the snapshot merge base '%s' (HTTP %s); existing entities will "
+                            "be skipped as diverged this run.",
+                            table_id,
+                            response.status_code,
+                        )
+                        return
+                    response.raw.decode_content = True
+                    # urllib3 closes the stream itself at the end of the body; the text
+                    # wrapper's next read would then fail instead of seeing end of file.
+                    response.raw.auto_close = False
+                    for row in csv.DictReader(io.TextIOWrapper(response.raw, encoding="utf-8", newline="")):
+                        page_rows += 1
+                        last_key = row.get(_SNAPSHOT_KEY) or last_key
+                        yield row
+            except (requests.RequestException, csv.Error, UnicodeDecodeError) as exc:
                 logger.warning("Could not read the snapshot merge base '%s' (%s).", table_id, exc)
                 return
-            read += len(page)
-            yield from page
-            if len(page) < _PREVIEW_MAX_ROWS or not page[-1].get(_SNAPSHOT_KEY):
+            read += page_rows
+            if page_rows == 0 or last_key is None:
                 break
-            last_key = page[-1][_SNAPSHOT_KEY]
+        if key_prefix:
+            return  # the table also holds other services' rows: its row count proves nothing
         total = self._table_rows_count(table_id)
         if total is not None and read < total:
             logger.warning(
@@ -401,19 +451,27 @@ class StorageReader:
 
     # ------------------------------------------------ configs / flows (E13-17)
 
-    def list_component_configs(self) -> list[dict]:
-        """Return every component with its configurations (params, storage, rows).
+    def list_component_configs(self) -> Iterator[dict]:
+        """Yield every component with its configurations (params, storage, rows).
 
         Used for the pipeline pass (E13/E14) and declared/column lineage
         (E16/E17). Flows/orchestrations arrive here too, distinguished by
         ``componentId`` downstream.
+
+        The response is the whole project's configuration (tens of MB on a large
+        project, several times that once parsed), so it is parsed as a stream:
+        only one component is held in memory at a time.
         """
         branch = self.branch_id or "default"
-        raw = self._get(
-            f"/v2/storage/branch/{branch}/components",
-            params={"include": "configuration,rows"},
-        )
-        return raw if isinstance(raw, list) else []
+        path = f"/v2/storage/branch/{branch}/components"
+        response = self._get_stream(path, params={"include": "configuration,rows"})
+        try:
+            response.raw.decode_content = True
+            yield from ijson.items(response.raw, "item", use_float=True)
+        except (requests.RequestException, ijson.JSONError) as exc:
+            raise UserException(f"Keboola Storage response was cut off: GET {path}: {exc}") from exc
+        finally:
+            response.close()
 
     def get_component_config(self, component_id: str, config_id: str) -> dict:
         branch = self.branch_id or "default"

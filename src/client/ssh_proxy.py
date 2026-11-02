@@ -13,7 +13,9 @@ from types import TracebackType
 from typing import Self
 from urllib.parse import urlparse, urlunparse
 
+import requests
 from keboola.component.exceptions import UserException
+from requests.adapters import HTTPAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +30,23 @@ def _remote_host_port(om_host: str) -> tuple[str, int]:
     return host, port
 
 
+class _TunnelAdapter(HTTPAdapter):
+    """Connects to the local end of the tunnel, but speaks TLS to the real OM host.
+
+    The request URL points at ``127.0.0.1``; TLS server name (SNI) and the
+    certificate check use the OM host name instead, as a direct connection would.
+    """
+
+    def __init__(self, server_hostname: str, **kwargs) -> None:
+        self._server_hostname = server_hostname
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, *args, **kwargs) -> None:
+        kwargs["server_hostname"] = self._server_hostname
+        kwargs["assert_hostname"] = self._server_hostname
+        super().init_poolmanager(*args, **kwargs)
+
+
 class SshProxy:
     """Context manager wrapping an ``sshtunnel`` forward to the OM host."""
 
@@ -36,6 +55,7 @@ class SshProxy:
         self._om_host = om_host
         self._forwarder = None
         self.local_om_host: str | None = None
+        self._remote_netloc = ""
 
     def __enter__(self) -> Self:
         self.open()
@@ -71,8 +91,22 @@ class SshProxy:
         local_port = self._forwarder.local_bind_port
         parsed = urlparse(self._om_host if "://" in self._om_host else f"https://{self._om_host}")
         self.local_om_host = urlunparse(parsed._replace(netloc=f"127.0.0.1:{local_port}"))
+        self._remote_netloc = parsed.netloc
         logger.info("SSH tunnel open: OM host %s -> 127.0.0.1:%s", remote_host, local_port)
         return self.local_om_host
+
+    def session(self) -> requests.Session:
+        """A session for ``local_om_host`` that presents the real OM host name.
+
+        SNI, certificate check and ``Host`` header name the OM host, so a server
+        behind a TLS proxy or virtual host answers as it would on a direct call.
+        """
+        if self.local_om_host is None:
+            raise RuntimeError("the tunnel is not open")
+        session = requests.Session()
+        session.mount(self.local_om_host, _TunnelAdapter(urlparse(f"//{self._remote_netloc}").hostname or ""))
+        session.headers["Host"] = self._remote_netloc
+        return session
 
     def close(self) -> None:
         if self._forwarder is not None:

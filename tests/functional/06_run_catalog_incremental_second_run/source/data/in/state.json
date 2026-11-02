@@ -66,13 +66,15 @@
         "out.c-postgres-cdc-test-perm": "e8c2e759da45e0ab86d532b7cd1fcc765834d1cf30b633bdd6d5d995724a7659",
         "out.c-TESTS_CI_SCD": "ee796a393f1ecbe2333d845dbe1ee267df727597dc2328b1600e21d3edc672ce",
         "out.c-typeform-LxWl3ZmU": "a3951834a113d740da3a95eb03295a034c225dd1906b5345aaf24fea7af7b479"
-      }
+      },
+      "lineage_digests": {},
+      "lineage_unresolved": {}
     }
   },
   "snapshot_table": "in.c-wr-openmetadata-catalog.last_written_snapshot",
   "last_full_refresh": null,
   "run_count": 1,
   "om_version_seen": "1.13.4",
-  "om_target_seen": "https://34.56.130.9.nip.io/keboola-vcr-catalog7#catalog-v3",
+  "om_target_seen": "https://34.56.130.9.nip.io/keboola-vcr-catalog10#catalog-v3",
   "lineage_layout": null
 }

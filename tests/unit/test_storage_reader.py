@@ -181,9 +181,18 @@ def test_missing_token_401_raises_userexception():
 
 
 class CsvResponse:
+    """A streamed CSV response: ``raw`` is read as the body, as with ``stream=True``."""
+
     def __init__(self, text, status_code=200):
         self.status_code = status_code
         self.text = text
+        self.raw = io.BytesIO(text.encode())
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
 
 def _snapshot_reader(csv_text, *, rows_count=None):
@@ -194,7 +203,7 @@ def _snapshot_reader(csv_text, *, rows_count=None):
     """
     session = mock.Mock()
 
-    def _get(url, params=None, timeout=None):
+    def _get(url, params=None, timeout=None, stream=False):
         if "data-preview" in url:
             return CsvResponse(csv_text)
         return FakeResponse(200, {"rowsCount": rows_count} if rows_count is not None else {})
@@ -235,7 +244,7 @@ class _PreviewApi:
         self.calls = []
         self.headers = {}
 
-    def get(self, url, params=None, timeout=None):
+    def get(self, url, params=None, timeout=None, stream=False):
         params = params or {}
         self.calls.append(params)
         if "data-preview" not in url:
@@ -243,8 +252,13 @@ class _PreviewApi:
         if int(params.get("limit", 100)) > 1000:
             return CsvResponse('{"error":"limit: This value should be between 0 and 1000."}', status_code=400)
         rows = sorted(self.rows, key=lambda r: r[params["orderBy[0][column]"]])
-        if "whereFilters[0][values][]" in params:
-            rows = [r for r in rows if r[params["whereFilters[0][column]"]] > params["whereFilters[0][values][]"]]
+        compare = {"gt": str.__gt__, "ge": str.__ge__, "lt": str.__lt__}
+        i = 0
+        while f"whereFilters[{i}][column]" in params:
+            column, value = params[f"whereFilters[{i}][column]"], params[f"whereFilters[{i}][values][]"]
+            op = compare[params[f"whereFilters[{i}][operator]"]]
+            rows = [r for r in rows if op(r[column], value)]
+            i += 1
         page = rows[: int(params["limit"])]
         out = io.StringIO()
         writer = csv.DictWriter(out, fieldnames=["entity_fqn", "entity_type", "written_fields_json"])
@@ -286,3 +300,31 @@ def test_read_snapshot_rows_streams_page_by_page():
     assert first["entity_fqn"] == "svc.p.b.t00000"
     assert sum(1 for c in api.calls if "limit" in c) == 1  # only the first page fetched so far
     assert 1 + sum(1 for _ in stream) == 2500
+
+
+def test_read_snapshot_rows_asks_only_for_one_service():
+    """Every configuration shares the snapshot table: only this service's keys are read."""
+    rows = [
+        {"entity_fqn": fqn, "entity_type": "table", "written_fields_json": "{}"}
+        for fqn in ("keboola-a.p.b.t1", "keboola-a-P.cfg1", "keboola-ab.p.b.t1", "keboola-b.p.b.t1", "keboola-a")
+    ]
+    api = _PreviewApi(rows)
+    reader = StorageReader("https://connection.keboola.com", "tok", session=api)  # ty: ignore[invalid-argument-type]  (duck-typed test double)
+    got = [r["entity_fqn"] for r in reader.read_snapshot_rows("in.c-x.last_written_snapshot", key_prefix="keboola-a")]
+    # "keboola-ab..." also starts with the prefix; extra rows are harmless, missing ones are not
+    assert got == ["keboola-a", "keboola-a-P.cfg1", "keboola-a.p.b.t1", "keboola-ab.p.b.t1"]
+    assert api.calls[-1]["whereFilters[1][values][]"] == "keboola-b"
+
+
+def test_read_snapshot_rows_does_not_stop_on_a_short_page():
+    """A page cut short by the server must not end the read: paging stops only on an empty page."""
+
+    class ShortPages(_PreviewApi):
+        def get(self, url, params=None, timeout=None, stream=False):
+            if "data-preview" in url:
+                params = dict(params or {}, limit="3")  # the server returns fewer rows than asked
+            return super().get(url, params=params, timeout=timeout, stream=stream)
+
+    rows = [{"entity_fqn": f"svc.t{i}", "entity_type": "table", "written_fields_json": "{}"} for i in range(10)]
+    reader = StorageReader("https://connection.keboola.com", "tok", session=ShortPages(rows))  # ty: ignore[invalid-argument-type]  (duck-typed test double)
+    assert len(list(reader.read_snapshot_rows("in.c-x.last_written_snapshot", key_prefix="svc"))) == 10

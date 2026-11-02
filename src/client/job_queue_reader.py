@@ -1,9 +1,10 @@
 """Job Queue run-history reader (E15, spec 2.1 / research 9.2).
 
-``GET /jobs/{jobId}/open-api-lineage`` returns OpenLineage START/COMPLETE
-events (including child jobs of an orchestration). These map to an OM Pipeline
-status body (``PUT /pipelines/{fqn}/status``): success/fail plus start/end
-timestamps.
+A pipeline's status is its configuration's latest job (``GET /search/jobs``): the
+job's own ``status`` and start/end time map to an OM Pipeline status body
+(``PUT /pipelines/{fqn}/status``). A flow's child jobs (``parentRunId``) give the
+status of each of its tasks. The job's OpenLineage events are not used: Keboola
+emits ``COMPLETE`` for a failed job too.
 """
 
 from __future__ import annotations
@@ -19,11 +20,19 @@ from keboola.component.exceptions import UserException
 logger = logging.getLogger(__name__)
 
 _RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
-_START = "START"
-_TERMINAL = frozenset({"COMPLETE", "FAIL", "ABORT"})
 _SUCCESS_STATUS = "Successful"
 _FAILED_STATUS = "Failed"
 _PENDING_STATUS = "Pending"
+# Keboola job status -> OM execution status. Anything else (created, waiting,
+# processing, terminating) has not finished yet.
+_EXECUTION_STATUS = {
+    "success": _SUCCESS_STATUS,
+    "warning": _SUCCESS_STATUS,
+    "error": _FAILED_STATUS,
+    "terminated": _FAILED_STATUS,
+    "cancelled": _FAILED_STATUS,
+}
+_MAX_CHILD_JOBS = 500
 
 
 @dataclass
@@ -33,10 +42,12 @@ class PipelineStatusRecord:
     task_status: list[dict] = field(default_factory=list)
 
     def to_status_body(self) -> dict:
-        body: dict = {"timestamp": self.timestamp_ms, "executionStatus": self.execution_status}
-        if self.task_status:
-            body["taskStatus"] = self.task_status
-        return body
+        # OM 1.13.4 fails with HTTP 500 on a status without ``taskStatus``: always send the list.
+        return {
+            "timestamp": self.timestamp_ms,
+            "executionStatus": self.execution_status,
+            "taskStatus": self.task_status,
+        }
 
 
 def _epoch_ms(iso: str | None) -> int | None:
@@ -48,16 +59,32 @@ def _epoch_ms(iso: str | None) -> int | None:
         return None
 
 
-def _status_from_event_type(event_type: str) -> str:
-    if event_type == "COMPLETE":
-        return _SUCCESS_STATUS
-    if event_type in ("FAIL", "ABORT"):
-        return _FAILED_STATUS
-    return _PENDING_STATUS
+def execution_status(job_status: str | None) -> str:
+    return _EXECUTION_STATUS.get((job_status or "").lower(), _PENDING_STATUS)
+
+
+def status_record(job: dict, children: list[dict], task_names: dict[str, str]) -> PipelineStatusRecord:
+    """The OM status of one job; ``task_names`` maps ``<component>-<config>`` of a child job to a task name.
+
+    A child job that maps to no task of the pipeline is left out: OM rejects a task
+    status under a name the pipeline does not have (400).
+    """
+    timestamp = (
+        _epoch_ms(job.get("endTime"))
+        or _epoch_ms(job.get("startTime"))
+        or _epoch_ms(job.get("createdTime"))
+        or int(time.time() * 1000)
+    )
+    tasks = [
+        {"name": task_names[key], "executionStatus": execution_status(child.get("status"))}
+        for child in children
+        if (key := f"{child.get('component')}-{child.get('config')}") in task_names
+    ]
+    return PipelineStatusRecord(execution_status(job.get("status")), timestamp, tasks)
 
 
 class JobQueueReader:
-    """Reads a job's OpenLineage run history from the Job Queue API."""
+    """Reads configurations' latest jobs from the Job Queue API."""
 
     def __init__(
         self,
@@ -76,11 +103,11 @@ class JobQueueReader:
         self.session = session or requests.Session()
         self.session.headers.update({"X-StorageApi-Token": storage_token, "Accept": "application/json"})
 
-    def _get(self, path: str) -> object:
+    def _get(self, path: str, params: dict | None = None) -> object:
         url = f"{self.base_url}{path}"
         for attempt in range(self.max_retries + 1):
             try:
-                response = self.session.get(url, timeout=self.timeout)
+                response = self.session.get(url, params=params, timeout=self.timeout)
             except requests.RequestException as exc:
                 if attempt < self.max_retries:
                     time.sleep(self.backoff_base * (2**attempt))
@@ -94,43 +121,15 @@ class JobQueueReader:
             return response.json()
         raise UserException(f"Job Queue request exhausted retries: GET {path}")
 
-    def get_lineage_events(self, job_id: str) -> list[dict]:
-        raw = self._get(f"/jobs/{job_id}/open-api-lineage")
-        if isinstance(raw, list):
-            return raw
-        if isinstance(raw, dict):
-            return raw.get("events") or raw.get("data") or []
-        return []
+    def latest_job(self, component_id: str, config_id: str) -> dict | None:
+        """The configuration's most recent job, or ``None`` if it never ran."""
+        jobs = self._get(
+            "/search/jobs",
+            {"componentId": component_id, "configId": config_id, "limit": 1, "sortBy": "id", "sortOrder": "desc"},
+        )
+        return jobs[0] if isinstance(jobs, list) and jobs else None
 
-    @staticmethod
-    def summarize_run(events: list[dict]) -> PipelineStatusRecord | None:
-        """Fold OpenLineage events (parent + children) into one status record."""
-        if not events:
-            return None
-        start_ms: int | None = None
-        end_ms: int | None = None
-        overall = _SUCCESS_STATUS
-        saw_terminal = False
-        task_status: list[dict] = []
-
-        for event in events:
-            event_type = (event.get("eventType") or "").upper()
-            ts = _epoch_ms(event.get("eventTime"))
-            job_name = (event.get("job") or {}).get("name")
-
-            if event_type == _START and ts is not None:
-                start_ms = ts if start_ms is None else min(start_ms, ts)
-            if event_type in _TERMINAL:
-                saw_terminal = True
-                if ts is not None:
-                    end_ms = ts if end_ms is None else max(end_ms, ts)
-                status = _status_from_event_type(event_type)
-                if status == _FAILED_STATUS:
-                    overall = _FAILED_STATUS
-                if job_name:
-                    task_status.append({"name": job_name, "executionStatus": status})
-
-        if not saw_terminal:
-            overall = _PENDING_STATUS
-        timestamp = end_ms or start_ms or int(time.time() * 1000)
-        return PipelineStatusRecord(execution_status=overall, timestamp_ms=timestamp, task_status=task_status)
+    def child_jobs(self, run_id: str) -> list[dict]:
+        """The jobs a flow job started (its tasks)."""
+        jobs = self._get("/search/jobs", {"parentRunId": run_id, "limit": _MAX_CHILD_JOBS})
+        return jobs if isinstance(jobs, list) else []

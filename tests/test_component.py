@@ -98,7 +98,7 @@ class FakeStorage:
     def list_component_configs(self):
         return []
 
-    def read_snapshot_rows(self, table_id, limit=1000000):
+    def read_snapshot_rows(self, table_id, **kwargs):
         return []
 
 
@@ -283,7 +283,7 @@ def test_second_run_loads_base_and_updates_changed_owned_field(tmp_path, monkeyp
                 ]
             )
 
-        def read_snapshot_rows(self, table_id, limit=1000000):
+        def read_snapshot_rows(self, table_id, **kwargs):
             return list(snapshot_holder["rows"])
 
     monkeypatch.setattr(component_mod, "OMClient", StatefulOM)

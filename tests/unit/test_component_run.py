@@ -137,7 +137,7 @@ class OneBucketStorage:
     def list_component_configs(self):
         return []
 
-    def read_snapshot_rows(self, table_id, limit=1000000):
+    def read_snapshot_rows(self, table_id, **kwargs):
         return []
 
 
@@ -637,17 +637,16 @@ def test_upsert_second_call_fetches_extension_owners_on_update():
 
 
 class _StatusJobReader:
-    """Fake JobQueueReader that yields a summarizable run for the status push."""
+    """Fake JobQueueReader: every configuration's latest job succeeded."""
 
     def __init__(self, *a, **k):
         pass
 
-    def get_lineage_events(self, job_id):
-        return [{"id": job_id}]
+    def latest_job(self, component_id, config_id):
+        return {"id": "999", "runId": "999", "status": "success", "endTime": "2026-08-24T10:02:00+00:00"}
 
-    @staticmethod
-    def summarize_run(events):
-        return SimpleNamespace(to_status_body=lambda: {"pipelineStatus": "Successful"})
+    def child_jobs(self, run_id):
+        return []
 
 
 def test_pipeline_status_404_is_recorded_not_fatal(monkeypatch):
@@ -669,13 +668,12 @@ def test_pipeline_status_404_is_recorded_not_fatal(monkeypatch):
         dashboards=DashboardBuilder("svc", "P", "777", "https://ui"),
     )
     report = component_mod.RunReport(run_id="rid")
-    cfg = {"id": "cfg1", "configuration": {"_lastJobId": "999"}}
-    env = {"url": "https://connection.keboola.com"}
+    cfg = {"id": "cfg1", "configuration": {}}
 
     comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
 
     # Pre-fix this call re-raises OMNotFound (only UserException was caught) -> exit 2.
-    comp._push_pipeline_status(run, "svc.P.pipeline.cfg1", cfg, env, om, report)
+    comp._push_pipeline_status(run, "svc.P.pipeline.cfg1", "keboola.ex-db-mysql", cfg, om, report)
 
     failed = [r for r in report.rows() if r["action"] == report_mod.ACTION_FAILED]
     assert len(failed) == 1
@@ -1779,3 +1777,89 @@ def test_layout_switch_drops_legacy_node_edges_of_configs_without_a_pipeline_thi
 
     assert done is True
     assert om.delete_edge_calls == [("table", "id-a", "pipeline", "id-pipe")]
+
+
+def test_pipeline_status_comes_from_the_latest_job_of_the_config(monkeypatch):
+    """The configuration listing carries no job id: the latest job is looked up in the queue."""
+    lookups = []
+
+    class Reader(_StatusJobReader):
+        def latest_job(self, component_id, config_id):
+            lookups.append((component_id, config_id))
+            return super().latest_job(component_id, config_id) if config_id == "ran" else None
+
+    class StatusOM(FakeOM):
+        def __init__(self):
+            super().__init__()
+            self.statuses = []
+
+        def put_pipeline_status(self, *a):
+            self.statuses.append(a)
+
+    monkeypatch.setattr(component_mod, "JobQueueReader", Reader)
+    om = StatusOM()
+    run = _ProjectRun(
+        ctx=ProjectContext(project_id="777", project_name="P", storage_token="t", storage_url="https://connection.x"),
+        reader=OneBucketStorage(),  # ty: ignore[invalid-argument-type]  (duck-typed test double)
+        entities=EntityBuilder("svc", "P", "777", "https://ui"),
+        pipelines=PipelineBuilder("svc", "P", "777", "https://ui"),
+        dashboards=DashboardBuilder("svc", "P", "777", "https://ui"),
+    )
+    report = component_mod.RunReport(run_id="rid")
+    comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
+    comp._push_pipeline_status(run, "svc-P.ran", "keboola.ex-db-mysql", {"id": "ran"}, om, report)
+    comp._push_pipeline_status(run, "svc-P.never", "keboola.ex-db-mysql", {"id": "never"}, om, report)
+
+    assert lookups == [("keboola.ex-db-mysql", "ran"), ("keboola.ex-db-mysql", "never")]
+    assert om.statuses == [
+        ("svc-P.ran", {"timestamp": 1787565720000, "executionStatus": "Successful", "taskStatus": []})
+    ]
+    assert report.rows() == []
+
+
+def test_flow_status_reads_child_jobs_only_for_flows(monkeypatch):
+    runs = []
+
+    class Reader(_StatusJobReader):
+        def child_jobs(self, run_id):
+            runs.append(run_id)
+            return [{"component": "keboola.ex-db-mysql", "config": "1", "status": "error"}]
+
+    class StatusOM(FakeOM):
+        def __init__(self):
+            super().__init__()
+            self.statuses = []
+
+        def put_pipeline_status(self, *a):
+            self.statuses.append(a)
+
+    monkeypatch.setattr(component_mod, "JobQueueReader", Reader)
+    om = StatusOM()
+    run = _ProjectRun(
+        ctx=ProjectContext(project_id="777", project_name="P", storage_token="t", storage_url="https://connection.x"),
+        reader=OneBucketStorage(),  # ty: ignore[invalid-argument-type]  (duck-typed test double)
+        entities=EntityBuilder("svc", "P", "777", "https://ui"),
+        pipelines=PipelineBuilder("svc", "P", "777", "https://ui"),
+        dashboards=DashboardBuilder("svc", "P", "777", "https://ui"),
+    )
+    flow = {
+        "id": "f1",
+        "configuration": {
+            "phases": [{"id": 1}],
+            "tasks": [
+                {
+                    "id": 7,
+                    "name": "Load MySQL",
+                    "phase": 1,
+                    "task": {"componentId": "keboola.ex-db-mysql", "configId": "1"},
+                }
+            ],
+        },
+    }
+    comp = component_mod.Component.__new__(component_mod.Component)  # bypass ComponentBase.__init__
+    report = component_mod.RunReport(run_id="rid")
+    comp._push_pipeline_status(run, "svc-P.t", "keboola.snowflake-transformation", {"id": "t"}, om, report)
+    comp._push_pipeline_status(run, "svc-P.f1", "keboola.flow", flow, om, report)
+
+    assert runs == ["999"]  # only the flow asked for its child jobs
+    assert om.statuses[1][1]["taskStatus"] == [{"name": "Load_MySQL", "executionStatus": "Failed"}]
