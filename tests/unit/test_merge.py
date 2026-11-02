@@ -442,3 +442,24 @@ def test_person_edit_next_to_a_moved_sync_timestamp_still_diverges():
     base = {"extension": {"kbcOwner": "a@x.com", "kbcSyncedAt": "2026-11-02 13:53 UTC"}}
     decision = TWM.merge(desired=desired, current=current, base=base, owned_fields=("extension",))
     assert decision.action == ACTION_SKIPPED_DIVERGED
+
+
+def test_empty_over_empty_is_not_a_change():
+    """An empty description in OM and in Keboola must not be re-written on every run."""
+    d = _merge(TWM, {"description": ""}, {"description": ""}, {"description": ""})
+    assert d.action == ACTION_SKIPPED_UNCHANGED
+    assert d.patch == []
+
+
+def test_om_html_escaped_text_is_our_text():
+    """OM returns "a->b" as "a-&gt;b" and "it's" as "it&#39;s": that is not a person's edit."""
+    desired = {"description": "Fixture: table->dashboard lineage, the platform's orders & more"}
+    om = {"description": "Fixture: table-&gt;dashboard lineage, the platform&#39;s orders &amp; more"}
+    assert _merge(TWM, desired, om, desired).action == ACTION_SKIPPED_UNCHANGED
+    assert _merge(KAW, desired, om, desired).patch == []
+
+
+def test_real_edit_with_escaped_characters_still_diverges():
+    desired = {"description": "orders -> revenue"}
+    om = {"description": "Edited by a person: orders -&gt; net revenue"}
+    assert _merge(TWM, desired, om, desired).action == ACTION_SKIPPED_DIVERGED

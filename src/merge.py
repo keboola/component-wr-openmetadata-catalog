@@ -17,6 +17,7 @@ sources are ever dropped, so a ``Manual`` edge is never removed.
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import zlib
 from collections.abc import Iterable, Iterator
@@ -136,6 +137,9 @@ def _project_owned(desired_value: object, om_value: object) -> object:
         if len(desired_value) != len(om_value):
             return om_value  # a length change is a real change; leave it unequal to desired
         return [_project_owned(d, o) for d, o in zip(desired_value, om_value, strict=True)]
+    if isinstance(desired_value, str) and isinstance(om_value, str) and html.unescape(om_value) == desired_value:
+        # OM stores text HTML-escaped ("a->b" comes back as "a-&gt;b", "it's" as "it&#39;s").
+        return desired_value
     return om_value
 
 
@@ -175,7 +179,10 @@ class ThreeWayMerger:
             base_val = (base or {}).get(name)
             stable_desired, stable_om, stable_base = _stable(desired_val), _stable(om_val), _stable(base_val)
 
-            if _is_empty(om_val):
+            if _is_empty(om_val) and _is_empty(desired_val):
+                # Nothing to write (e.g. an empty description): writing it would churn every run.
+                snapshot[name] = desired_val
+            elif _is_empty(om_val):
                 patch.append(_patch_op(current, name, desired_val))
                 snapshot[name] = desired_val
                 changed = True

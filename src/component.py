@@ -1634,7 +1634,7 @@ class Component(ComponentBase):
     # separate, best-effort ``_with_extension_owners`` call below.
     _PRIMARY_FIELDS_BY_KIND: ClassVar[dict[str, str]] = {
         "tables": "columns,tableConstraints",
-        "pipelines": "extension,owners",
+        "pipelines": "extension,owners,tasks",  # tasks are owned: without them every pipeline looks changed
         "dashboards": "extension,owners",
     }
 

@@ -595,7 +595,7 @@ def test_ensure_custom_properties_and_fields_wiring_create():
     assert calls["tables"] == ["columns,tableConstraints"]
     assert calls["databaseSchemas"] == [None]
     assert calls["databases"] == [None]
-    assert calls["pipelines"] == ["extension,owners"]
+    assert calls["pipelines"] == ["extension,owners,tasks"]
 
     # every entity was a fresh create (never a patch) against this bare OM double.
     assert om.patch_calls == []
@@ -624,7 +624,7 @@ def test_upsert_second_call_fetches_extension_owners_on_update():
     assert calls["tables"] == ["columns,tableConstraints", "extension,owners"]
     assert calls["databaseSchemas"] == [None, "extension,owners"]
     assert calls["databases"] == [None, "extension,owners"]
-    assert calls["pipelines"] == ["extension,owners"]
+    assert calls["pipelines"] == ["extension,owners,tasks"]
 
     # current is not None for every kind above -> every write went through the
     # merge/PATCH path, never treated as a fresh create.
