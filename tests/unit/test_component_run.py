@@ -1863,3 +1863,52 @@ def test_flow_status_reads_child_jobs_only_for_flows(monkeypatch):
 
     assert runs == ["999"]  # only the flow asked for its child jobs
     assert om.statuses[1][1]["taskStatus"] == [{"name": "Load_MySQL", "executionStatus": "Failed"}]
+
+
+def test_flow_migrated_from_an_orchestration_supersedes_it():
+    """A migrated flow keeps the legacy orchestration's config id; only the flow is cataloged.
+
+    Both would map to the same pipeline FQN and overwrite each other on every run.
+    """
+
+    class _MigratedReader:
+        def list_component_configs(self):
+            return [
+                {
+                    "id": "keboola.orchestrator",
+                    "type": "other",
+                    "configurations": [{"id": "f1", "name": "Legacy", "configuration": {"tasks": [], "phases": []}}],
+                },
+                {
+                    "id": "keboola.flow",
+                    "type": "other",
+                    "configurations": [{"id": "f1", "name": "Migrated", "configuration": {"tasks": [], "phases": []}}],
+                },
+            ]
+
+    om = _PipelineRecordingOM()
+    run = _family_gating_run()
+    run.reader = _MigratedReader()
+    config = SimpleNamespace(
+        parallel_requests=1,
+        custom_properties=CustomPropertiesMode.CREATE,
+        write_transformations=False,
+        transformations=[],
+        write_components=False,
+        components=[],
+        write_flows=True,
+        flows=[],
+        write_pipeline_status=False,
+    )
+    comp = component_mod.Component.__new__(component_mod.Component)
+    comp._pipeline_pass(
+        config,  # ty: ignore[invalid-argument-type]
+        om,  # ty: ignore[invalid-argument-type]
+        run,
+        SnapshotStore(),
+        component_mod.RunReport(run_id="rid"),
+        ThreeWayMerger(MergeMode.THREE_WAY_MERGE),
+        {"url": "https://s", "stack_id": None},
+    )
+    assert [b["displayName"] for b in om.pipeline_bodies.values()] == ["Migrated"]
+    assert run.migrated_orchestration_ids == {"f1"}

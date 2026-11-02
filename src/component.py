@@ -63,7 +63,13 @@ from mapping.entity_builder import (
     EntityBuilder,
 )
 from mapping.pipeline_builder import CUSTOM_PROPERTIES as PIPELINE_CUSTOM_PROPERTIES
-from mapping.pipeline_builder import PipelineBuilder, component_kind, is_flow_component
+from mapping.pipeline_builder import (
+    FLOW_COMPONENT_ID,
+    LEGACY_ORCHESTRATOR_ID,
+    PipelineBuilder,
+    component_kind,
+    is_flow_component,
+)
 from merge import (
     OUR_DASHBOARD_LINEAGE_SOURCES,
     OUR_LINEAGE_SOURCES,
@@ -326,6 +332,8 @@ class _ProjectRun:
     # Data-app config id -> its Dashboard FQN, recorded by the dashboard pass so the
     # lineage pass can attach table -> dashboard edges to the entity it just wrote.
     dashboard_fqn_by_config: dict[str, str] = field(default_factory=dict)
+    # Legacy orchestration ids that a migrated flow of the same id supersedes.
+    migrated_orchestration_ids: set[str] = field(default_factory=set)
     id_cache: dict[str, str | None] = field(default_factory=dict)
     # FQNs this run had to create (they were absent from OM when the run started).
     created_fqns: set[str] = field(default_factory=set)
@@ -824,16 +832,25 @@ class Component(ComponentBase):
             return self._resolve_owner(om, run, email)
 
         selected: list[tuple[str, str, dict]] = []
+        flow_ids: set[str] = set()
         for component in run.reader.list_component_configs():
             component_id = str(component.get("id") or component.get("componentId") or "")
             kind = component_kind(component_id, component.get("type"))
             if kind == "data_app":
                 continue  # data apps are catalogued as Dashboards, not Pipelines
             for cfg in component.get("configurations") or []:
+                if component_id == FLOW_COMPONENT_ID:
+                    flow_ids.add(str(cfg.get("id")))
                 if kind != "orchestration" and not self._is_producing(cfg):
                     continue
                 if self._pipeline_config_in_scope(config, kind, str(cfg.get("id"))):
                     selected.append((component_id, kind, cfg))
+        # A legacy orchestration that was migrated to a flow shares the flow's id (and
+        # pipeline FQN): the flow is the live one, so the leftover is not cataloged.
+        run.migrated_orchestration_ids = {
+            str(cfg.get("id")) for cid, _kind, cfg in selected if cid == LEGACY_ORCHESTRATOR_ID
+        } & flow_ids
+        selected = [s for s in selected if not (s[0] == LEGACY_ORCHESTRATOR_ID and str(s[2].get("id")) in flow_ids)]
 
         def sync_pipeline(item: tuple[str, str, dict], item_report: RunReport) -> None:
             component_id, kind, cfg = item
@@ -1055,6 +1072,8 @@ class Component(ComponentBase):
                 if kind == "data_app":
                     edges += self._data_app_edges_for(config, run, cfg, storage)
                     continue  # a data app is a Dashboard: upstream table -> app, no table -> table
+                if component_id == LEGACY_ORCHESTRATOR_ID and str(cfg.get("id")) in run.migrated_orchestration_ids:
+                    continue  # superseded by the flow of the same id (see _pipeline_pass)
                 pipeline_fqn = run.pipeline_fqn_by_config.get(str(cfg.get("id")))
                 if kind == "orchestration":
                     # A flow has no storage mapping of its own; its only lineage is

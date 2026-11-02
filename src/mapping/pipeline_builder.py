@@ -41,6 +41,10 @@ CUSTOM_PROPERTIES = [
 ]
 
 _FLOW_COMPONENT_IDS = frozenset({"keboola.orchestrator", "keboola.flow"})
+# A flow migrated from a legacy orchestration keeps the orchestration's config id,
+# and the legacy configuration stays. Both would map to one pipeline FQN.
+FLOW_COMPONENT_ID = "keboola.flow"
+LEGACY_ORCHESTRATOR_ID = "keboola.orchestrator"
 _SQL_COMPONENT_IDS = frozenset(
     {
         "keboola.snowflake-transformation",
