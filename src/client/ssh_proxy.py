@@ -30,6 +30,20 @@ def _remote_host_port(om_host: str) -> tuple[str, int]:
     return host, port
 
 
+def _load_private_key(text: str):
+    """Parse the configured private key; sshtunnel ignores a key given as text."""
+    import paramiko
+
+    for key_class in (paramiko.Ed25519Key, paramiko.ECDSAKey, paramiko.RSAKey, paramiko.DSSKey):
+        try:
+            return key_class.from_private_key(io.StringIO(text))
+        except paramiko.SSHException, ValueError:
+            continue
+    raise UserException(
+        "The SSH private key could not be read. Use an unencrypted RSA, ECDSA or Ed25519 key (OpenSSH or PEM format)."
+    )
+
+
 class _TunnelAdapter(HTTPAdapter):
     """Connects to the local end of the tunnel, but speaks TLS to the real OM host.
 
@@ -77,11 +91,15 @@ class SshProxy:
             raise UserException("sshtunnel is not available but use_ssh_tunnel is enabled.") from exc
 
         remote_host, remote_port = _remote_host_port(self._om_host)
+        private_key = _load_private_key(self._ssh_config.private_key)
         try:
             self._forwarder = SSHTunnelForwarder(
                 (self._ssh_config.host, int(self._ssh_config.port)),
                 ssh_username=self._ssh_config.user,
-                ssh_pkey=io.StringIO(self._ssh_config.private_key),
+                ssh_pkey=private_key,
+                # Only the configured key: never an SSH agent or ~/.ssh of the machine it runs on.
+                allow_agent=False,
+                host_pkey_directories=[],
                 remote_bind_address=(remote_host, remote_port),
             )
             self._forwarder.start()

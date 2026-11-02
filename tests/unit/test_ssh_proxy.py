@@ -15,11 +15,21 @@ class _Cfg:
         self.om_host = "https://om.example.com"
 
 
+def _rsa_key_text() -> str:
+    import io
+
+    import paramiko
+
+    pem = io.StringIO()
+    paramiko.RSAKey.generate(2048).write_private_key(pem)
+    return pem.getvalue()
+
+
 class _Ssh:
     host = "bastion"
     user = "kbc"
     port = 22
-    private_key = "PKEY"
+    private_key = _rsa_key_text()
 
 
 def test_disabled_is_noop():
@@ -53,27 +63,49 @@ def test_successful_tunnel_rewrites_host():
         fake_forwarder.stop.assert_called_once()
 
 
-def test_sshtunnel_works_with_the_locked_paramiko():
-    """sshtunnel 0.4.0 reads paramiko.DSSKey while it builds the forwarder; paramiko 4 removed it.
+@pytest.mark.parametrize("key_type", ["ed25519", "ecdsa", "rsa"])
+def test_tunnel_uses_the_configured_key_only(tmp_path, monkeypatch, key_type):
+    """The configured key (text) reaches sshtunnel as a parsed key; nothing comes from the machine.
 
-    Building the forwarder (no connection yet) fails with AttributeError on an
-    incompatible paramiko, so this catches a dependency bump that breaks every tunnel.
+    sshtunnel ignores a key given as text and falls back to the SSH agent and ~/.ssh,
+    which the platform container does not have. It also reads paramiko.DSSKey while it
+    builds the forwarder, which paramiko 4 removed.
     """
-    import io
+    import subprocess
 
-    import paramiko
     from sshtunnel import SSHTunnelForwarder
 
-    key = paramiko.RSAKey.generate(2048)
-    pem = io.StringIO()
-    key.write_private_key(pem)
-    forwarder = SSHTunnelForwarder(
-        ("127.0.0.1", 2222),
-        ssh_username="kbc",
-        ssh_pkey=io.StringIO(pem.getvalue()),
-        remote_bind_address=("om.example.com", 443),
-    )
-    assert forwarder.ssh_pkeys
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    key_file = tmp_path / "id_test"
+    subprocess.run(["ssh-keygen", "-q", "-t", key_type, "-N", "", "-f", str(key_file)], check=True)
+    captured = {}
+
+    class Forwarder(SSHTunnelForwarder):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            captured["keys"] = self.ssh_pkeys
+
+        def start(self):
+            pass
+
+        @property
+        def local_bind_port(self):
+            return 40000
+
+    with mock.patch("sshtunnel.SSHTunnelForwarder", Forwarder):
+        proxy = SshProxy(
+            mock.Mock(host="127.0.0.1", port=2222, user="kbc", private_key=key_file.read_text()),
+            "https://om.example.com",
+        )
+        assert proxy.open() == "https://127.0.0.1:40000"
+    assert len(captured["keys"]) == 1
+
+
+def test_unreadable_key_is_a_user_error():
+    proxy = SshProxy(mock.Mock(host="h", port=22, user="u", private_key="not a key"), "https://om.example.com")
+    with pytest.raises(UserException, match="private key could not be read"):
+        proxy.open()
 
 
 def test_tunnel_session_speaks_tls_to_the_real_host():
