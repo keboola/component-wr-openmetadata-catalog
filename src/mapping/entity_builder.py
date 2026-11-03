@@ -343,9 +343,10 @@ class EntityBuilder:
     def _view_source_fqn(self, bucket: SourceBucket, table: SourceTable) -> str | None:
         """FQN of a linked/shared table's source, resolved onto its owning project.
 
-        The source is cataloged under its own bucket's Storage path: the linked
-        bucket's ``sourceBucket.path`` for a table of the source project, this
-        project's bucket paths for an alias of a table here.
+        The source is cataloged under its own bucket's Storage path. A linked
+        bucket's path is its source bucket's; an alias of a table in this project
+        takes this project's bucket paths and cataloged name (which may be the
+        Project Name Override). Projects are compared by id: names are not unique.
         """
         source = table.source_table or {}
         source_id = source.get("id")
@@ -357,11 +358,14 @@ class EntityBuilder:
         source_bucket_id = ".".join(parts[:2])
         source_table_name = ".".join(parts[2:])
         project_info = source.get("project") or {}
-        source_project = project_info.get("name") or self.project
-        linked_from = bucket.source_bucket or {}
-        if linked_from.get("id") == source_bucket_id and linked_from.get("path"):
-            source_bucket_path = str(linked_from["path"])
-        elif source_project == self.project:
+        if project_info.get("id") is not None:
+            same_project = str(project_info["id"]) == str(self.project_id)
+        else:
+            same_project = project_info.get("name") in (None, self.project)
+        source_project = self.project if same_project else (project_info.get("name") or self.project)
+        if (bucket.source_bucket or {}).get("id") == source_bucket_id and bucket.path:
+            source_bucket_path = bucket.path
+        elif same_project:
             source_bucket_path = self.bucket_paths.get(source_bucket_id, source_bucket_id)
         else:
             source_bucket_path = source_bucket_id

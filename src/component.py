@@ -578,11 +578,19 @@ class Component(ComponentBase):
         for bucket in buckets:
             run.bucket_paths[bucket.id] = bucket.path or bucket.name
         run.entities.bucket_paths = run.bucket_paths
-        # Linked buckets first: a bucket of this project wins a schema name it shares
-        # with a linked one (whose path is its source project's schema).
-        for bucket in sorted(buckets, key=lambda b: b.source_bucket is None):
+        # A bucket of this project wins a schema name it shares with a linked one (whose
+        # path is its source project's schema). A name two buckets of the same kind
+        # share (external buckets on PUBLIC of two databases) names neither: SQL that
+        # gives only the schema cannot tell them apart.
+        claims: dict[str, dict[bool, set[str]]] = {}
+        for bucket in buckets:
             if bucket.backend_path:
-                run.schema_buckets[bucket.backend_path[-1]] = bucket.id
+                own = bucket.source_bucket is None
+                claims.setdefault(bucket.backend_path[-1], {}).setdefault(own, set()).add(bucket.id)
+        for schema, by_kind in claims.items():
+            ids = by_kind.get(True) or by_kind[False]
+            if len(ids) == 1:
+                run.schema_buckets[schema] = next(iter(ids))
         return buckets
 
     @staticmethod
@@ -812,10 +820,29 @@ class Component(ComponentBase):
             bucket, table_name, table_fqn, columns = item
             if not config.write_table_lineage:
                 return
-            edge = self._external_source_edge(om, run, item_report, bucket, table_name, table_fqn, columns, service_fqn)
-            if edge is None:
-                return
-            if self._put_lineage(om, run, item_report, edge, retry_table_level=True) == EdgeOutcome.FAILED:
+            try:
+                edge = self._external_source_edge(
+                    om, run, item_report, bucket, table_name, table_fqn, columns, service_fqn
+                )
+                outcome = self._put_lineage(om, run, item_report, edge, retry_table_level=True) if edge else None
+            except Exception as exc:  # noqa: BLE001 - one table's lookup or write fails alone
+                # A 403 here is about the source warehouse's service, not the bot token:
+                # every Keboola entity was just written with it.
+                hint = (
+                    " (the bot may lack the right to view the source table or edit its lineage)"
+                    if isinstance(exc, OMAuthError)
+                    else ""
+                )
+                item_report.record(
+                    project_id=run.ctx.project_id,
+                    entity_type="Lineage",
+                    entity_fqn=table_fqn,
+                    action=report_mod.ACTION_FAILED,
+                    detail=f"external bucket source: {exc}{hint}",
+                )
+                outcome = EdgeOutcome.FAILED
+            if outcome == EdgeOutcome.FAILED:
+                # Re-sync the bucket next run, so the edge is looked up and written again.
                 state.forget_bucket_digest(run.ctx.project_id, bucket.id)
 
         self._parallel(config, buckets, sync_bucket, report)
@@ -839,26 +866,20 @@ class Component(ComponentBase):
 
         The source is found by its database, schema and table name in any other
         service of the OpenMetadata instance. None found, or several, is reported as
-        unresolved: the source warehouse may not be cataloged (yet).
+        unresolved: the source warehouse may not be cataloged (yet). A lookup error
+        is raised to the caller.
         """
-        try:
-            hits = om.search_tables(table_name, bucket.backend_path[-1])
-            matches = lineage_builder.external_source_matches(hits, bucket.backend_path, table_name, own_service)
-            source = om.get_by_fqn("tables", matches[0], fields="columns") if len(matches) == 1 else None
-        except OMAuthError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - a lookup failure is per-table, retried next run
-            report.record(
-                project_id=run.ctx.project_id,
-                entity_type="Lineage",
-                entity_fqn=table_fqn,
-                action=report_mod.ACTION_FAILED,
-                detail=f"external bucket source lookup: {exc}",
-            )
-            return None
+        hits = om.search_tables(table_name, bucket.backend_path[-1])
+        matches = lineage_builder.external_source_matches(hits, bucket.backend_path, table_name, own_service)
+        source = om.get_by_fqn("tables", matches[0], fields="columns") if len(matches) == 1 else None
         if source is None:
             where = ".".join([*bucket.backend_path, table_name])
-            detail = f"several OpenMetadata tables match: {', '.join(matches)}" if matches else "not in OpenMetadata"
+            if len(matches) > 1:
+                detail = f"several OpenMetadata tables match: {', '.join(matches)}"
+            elif matches:
+                detail = f"search found {matches[0]}, but it could not be read"
+            else:
+                detail = "not in OpenMetadata"
             report.record(
                 project_id=run.ctx.project_id,
                 entity_type="Lineage",
@@ -1091,21 +1112,23 @@ class Component(ComponentBase):
 
     @classmethod
     def _produced_outputs(cls, run: _ProjectRun, component_id: str, kind: str, cfg: dict) -> list[str]:
-        """The tables a config writes without an output mapping, per Storage metadata.
+        """The tables a config without any output mapping writes, per Storage metadata.
 
         A DB extractor writes through its own parameters (``outputTable``), so only the
-        tables' ``KBC.lastUpdatedBy`` metadata names it. Tables an output mapping of
-        the config or of its rows declares are left out, and a transformation's
-        outputs come from its mapping and SQL.
+        tables' ``KBC.lastUpdatedBy`` metadata names it. The metadata is a fallback: a
+        table keeps naming a config after the config stops writing it (an output
+        re-pointed elsewhere, a row disabled), so an output mapping on the config or
+        on any of its rows, disabled ones too, wins. A transformation's outputs come
+        from its mapping and SQL.
         """
         if kind in ("transformation", "orchestration", "data_app"):
             return []
-        declared = {
-            str(table.get("destination"))
-            for storage in cls._storages_of(cfg)
-            for table in cls._storage_tables(storage, "output")
-        }
-        return sorted(run.produced_tables.get((component_id, str(cfg.get("id"))), set()) - declared)
+        rows = [row for row in cfg.get("rows") or [] if isinstance(row, dict)]
+        mappings = [(cfg.get("configuration") or {}).get("storage")]
+        mappings += [(row.get("configuration") or {}).get("storage") for row in rows]
+        if any(cls._storage_tables(storage, "output") for storage in mappings):
+            return []
+        return sorted(run.produced_tables.get((component_id, str(cfg.get("id"))), ()))
 
     def _push_pipeline_status(self, run, pipeline_fqn, component_id, cfg, om, report) -> None:
         if not run.ctx.storage_url:
@@ -1287,6 +1310,12 @@ class Component(ComponentBase):
         edges = lineage_builder.merge_edges(edges)
         if config.write_bucket_lineage:
             edges += lineage_builder.bucket_edges(edges)
+        # One row of a config may keep the node edge another row drops (both read
+        # the same table): never delete an edge this run writes.
+        written = {(e.from_type, e.from_fqn, e.to_type, e.to_fqn) for e in edges}
+        legacy_node_edges = [
+            e for e in legacy_node_edges if (e.from_type, e.from_fqn, e.to_type, e.to_fqn) not in written
+        ]
         self._refresh_lineage(config, om, run, report, state, edges, force=force)
         return self._delete_legacy_node_edges(om, run, legacy_node_edges)
 

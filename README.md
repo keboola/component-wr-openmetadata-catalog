@@ -180,6 +180,13 @@ Version 0.2 changes what an existing configuration writes on its next run:
   extractors), tables read from a linked bucket, BigQuery `project.dataset.table`
   references in SQL and external buckets now get lineage edges. Before, they
   had none, or an edge to a table that did not exist.
+- **New pipelines**: a configuration that maps its tables only on rows is now a
+  Pipeline (with its job status when *Write Pipeline Status* is on).
+- **External buckets** write an edge onto a table of another OpenMetadata
+  service (the one cataloging the source warehouse), so the bot needs to view
+  that table and edit its lineage. Without that right the edge is reported
+  `failed` and every other write goes on. A source cataloged later is linked on the next
+  full refresh.
 - **Flows migrated from orchestrations**: when a legacy orchestration and its
   migrated flow share an id, only the flow is cataloged.
 - The first run re-writes every bucket and every lineage edge once (the catalog

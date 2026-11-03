@@ -135,15 +135,22 @@ def test_each_enabled_row_is_its_own_storage():
     assert component_mod.Component._is_producing({"rows": cfg["rows"][1:2] + cfg["rows"][:1]})
 
 
-def test_produced_outputs_leave_out_tables_a_row_maps():
+def test_table_metadata_names_outputs_only_when_no_mapping_declares_one():
+    """The metadata is a fallback: a table keeps naming a config after the config
+    stops writing it, so any output mapping (a disabled row's too) wins."""
     run = _run(None)
-    run.produced_tables[("keboola.ex-db-mysql", "ex1")] = {"in.c-db.mapped", "in.c-db.unmapped"}
-    cfg = {
-        "id": "ex1",
-        "rows": [{"configuration": {"storage": {"output": {"tables": [{"destination": "in.c-db.mapped"}]}}}}],
-    }
-    produced = component_mod.Component._produced_outputs(run, "keboola.ex-db-mysql", "extractor", cfg)
-    assert produced == ["in.c-db.unmapped"]
+    run.produced_tables[("keboola.ex-db-mysql", "ex1")] = {"in.c-db.orders"}
+
+    def produced(rows):
+        cfg = {"id": "ex1", "configuration": {"storage": []}, "rows": rows}
+        return component_mod.Component._produced_outputs(run, "keboola.ex-db-mysql", "extractor", cfg)
+
+    def row(destination, **extra):
+        return {"configuration": {"storage": {"output": {"tables": [{"destination": destination}]}}}, **extra}
+
+    assert produced([{"configuration": {"parameters": {"outputTable": "in.c-db.orders"}}}]) == ["in.c-db.orders"]
+    assert produced([row("in.c-db.renamed")]) == []
+    assert produced([row("in.c-db.orders", isDisabled=True)]) == []
 
 
 class _RowsReader:
@@ -317,8 +324,18 @@ class _ExternalOM:
     is_2_0_or_newer = False
     source = "snowflake_prod.PROD_DB.SALES.ORDERS"
 
-    def __init__(self, hits: list[dict]):
+    def __init__(
+        self,
+        hits: list[dict],
+        *,
+        search_error: Exception | None = None,
+        put_error: Exception | None = None,
+        source_readable: bool = True,
+    ):
         self.hits = hits
+        self.search_error = search_error
+        self.put_error = put_error
+        self.source_readable = source_readable
         self.searches: list[tuple[str, str]] = []
         self.lineage: list[dict] = []
         self.created: dict[str, str] = {}
@@ -337,21 +354,25 @@ class _ExternalOM:
         if kind != "tables":
             return None
         if fqn == self.source:
-            return {"id": "id-source", "columns": [{"name": "ID"}]}
+            return {"id": "id-source", "columns": [{"name": "ID"}]} if self.source_readable else None
         return {"id": self.created[fqn]} if fqn in self.created else None
 
     def search_tables(self, table_name, schema_name, size=25):
         self.searches.append((table_name, schema_name))
+        if self.search_error:
+            raise self.search_error
         return self.hits
 
     def put_lineage(self, request):
+        if self.put_error and request["edge"]["lineageDetails"]["source"] == "CrossDatabaseLineage":
+            raise self.put_error
         self.lineage.append(request)
 
     def find_user_id_by_email(self, email):
         return None
 
 
-def _sync_external(om):
+def _sync_external(om, state: StateManager | None = None):
     config = SimpleNamespace(
         parallel_requests=1,
         full_refresh=False,
@@ -365,7 +386,7 @@ def _sync_external(om):
         config,  # ty: ignore[invalid-argument-type]  (duck-typed test double)
         om,
         _run(_ExternalReader()),
-        StateManager({"run_count": 1}),
+        state or StateManager({"run_count": 1}),
         SnapshotStore(),
         report,
         ThreeWayMerger(MergeMode.THREE_WAY_MERGE),
@@ -394,3 +415,140 @@ def test_external_table_without_a_cataloged_source_is_reported_unresolved():
     [row] = [r for r in report.rows() if r["entity_type"] == "Lineage"]
     assert row["action"] == report_mod.ACTION_UNRESOLVED
     assert "PROD_DB.SALES.ORDERS: not in OpenMetadata" in row["detail"]
+
+
+def _lineage_row(report) -> dict:
+    [row] = [r for r in report.rows() if r["entity_type"] == "Lineage"]
+    return row
+
+
+def test_external_source_found_twice_or_unreadable_is_unresolved():
+    twice = _sync_external(_ExternalOM([_hit(_ExternalOM.source), _hit("snowflake_dr.PROD_DB.SALES.ORDERS")]))
+    assert "several OpenMetadata tables match" in _lineage_row(twice)["detail"]
+
+    unreadable = _sync_external(_ExternalOM([_hit(_ExternalOM.source)], source_readable=False))
+    row = _lineage_row(unreadable)
+    assert row["action"] == report_mod.ACTION_UNRESOLVED
+    assert f"search found {_ExternalOM.source}, but it could not be read" in row["detail"]
+
+
+def test_external_lookup_failure_is_reported_and_retried_next_run():
+    state = StateManager({"run_count": 1})
+    report = _sync_external(_ExternalOM([], search_error=component_mod.OMClientError("503")), state)
+    assert _lineage_row(report)["action"] == report_mod.ACTION_FAILED
+    assert state.bucket_digest(PID, "in.c-ext") is None  # the bucket re-syncs next run
+
+
+def test_permission_error_on_the_source_service_does_not_stop_the_run():
+    """Every Keboola entity was just written with the same token: a 403 here is about
+    the other service, so it fails this edge only."""
+    state = StateManager({"run_count": 1})
+    om = _ExternalOM([_hit(_ExternalOM.source)], put_error=component_mod.OMAuthError("403"))
+    report = _sync_external(om, state)
+    row = _lineage_row(report)
+    assert row["action"] == report_mod.ACTION_FAILED
+    assert "may lack the right" in row["detail"]
+    assert state.bucket_digest(PID, "in.c-ext") is None
+
+
+def test_a_schema_name_two_buckets_share_names_neither():
+    class _Reader:
+        def list_buckets(self):
+            def bucket(bucket_id, path, *, linked=False):
+                return SourceBucket(
+                    id=bucket_id,
+                    name=bucket_id.split(".")[1],
+                    path=bucket_id,
+                    backend_path=path,
+                    source_bucket={"id": "out.c-x"} if linked else None,
+                )
+
+            return [
+                bucket("in.c-ext1", ("DB1", "PUBLIC")),
+                bucket("in.c-ext2", ("DB2", "PUBLIC")),
+                bucket("in.c-main", ("KBC", "in.c-main")),
+                bucket("in.c-link", ("OTHER", "in.c-main"), linked=True),
+            ]
+
+    run = _run(_Reader())
+    component_mod.Component._index_buckets(run)
+    assert run.schema_buckets == {"in.c-main": "in.c-main"}  # own bucket wins over the linked one
+
+
+def test_layout_switch_keeps_a_node_edge_another_row_writes():
+    """Row 1 has a table edge, so its node edges are legacy; row 2 only reads the
+    same table, so it writes that table -> pipeline edge. It must not be deleted."""
+
+    class _Reader:
+        def list_buckets(self):
+            return []
+
+        def list_component_configs(self):
+            def row(storage):
+                return {"configuration": {"storage": storage}}
+
+            return [
+                {
+                    "id": "kds-team.app-rows",
+                    "type": "application",
+                    "configurations": [
+                        {
+                            "id": "app1",
+                            "rows": [
+                                row(
+                                    {
+                                        "input": {"tables": [{"source": "in.c-a.t1"}]},
+                                        "output": {"tables": [{"destination": "out.c-b.o1"}]},
+                                    }
+                                ),
+                                row({"input": {"tables": [{"source": "in.c-a.t1"}]}}),
+                            ],
+                        }
+                    ],
+                }
+            ]
+
+    class _OM(_LineageOM):
+        def __init__(self):
+            super().__init__()
+            self.deleted: list[tuple[str, str]] = []
+
+        def delete_lineage_edge(self, from_type, from_id, to_type, to_id):
+            self.deleted.append((from_id, to_id))
+
+    run = _run(_Reader())
+    app_fqn = fqn_mod.pipeline_fqn(SVC, PROJ, "app1")
+    run.pipeline_fqn_by_config["app1"] = app_fqn
+    om = _OM()
+    config = SimpleNamespace(
+        parallel_requests=1,
+        pipeline_lineage_as_node=False,
+        write_table_lineage=True,
+        write_pipeline_lineage=True,
+        write_column_lineage=False,
+        write_bucket_lineage=False,
+    )
+    _component()._lineage_pass(
+        config,  # ty: ignore[invalid-argument-type]  (duck-typed test double)
+        om,  # ty: ignore[invalid-argument-type]  (duck-typed test double)
+        run,
+        component_mod.RunReport(run_id="rid"),
+        StateManager(),
+        drop_legacy_node_edges=True,
+    )
+    assert (_t("in.c-a.t1"), app_fqn) not in om.deleted
+    assert (app_fqn, _t("out.c-b.o1")) in om.deleted  # row 1's legacy output edge still goes
+
+
+def test_alias_of_a_table_here_uses_the_project_name_override():
+    builder = EntityBuilder(SVC, "Override", PID, "https://ui.example")
+    builder.bucket_paths = {"in.c-src": "in.c-src"}
+    table = SourceTable(
+        id="in.c-a.alias",
+        name="alias",
+        is_alias=True,
+        columns=[SourceColumn(name="id")],
+        source_table={"id": "in.c-src.t", "project": {"id": int(PID), "name": "Real Name"}},
+    )
+    built = builder.table_body(SourceBucket(id="in.c-a", name="c-a", stage="in", path="in.c-a"), table)
+    assert built.view_source_fqn == fqn_mod.table_fqn(SVC, "Override", "in.c-src", "t")
