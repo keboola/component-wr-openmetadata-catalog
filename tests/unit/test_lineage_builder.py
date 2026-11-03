@@ -444,6 +444,26 @@ def test_merge_keeps_the_sql_of_either_edge_of_a_pair():
         assert merged.sql_query == "SELECT 1;"
 
 
+def test_merge_keeps_the_pipeline_of_a_later_column_edge():
+    """Two column edges of one pair: a config without a pipeline (selected out) may come first."""
+    first = LineageEdge(
+        from_fqn="a.t",
+        to_fqn="b.t",
+        source=SOURCE_QUERY,
+        columns_lineage=[{"fromColumns": ["a.t.x"], "toColumn": "b.t.x"}],
+    )
+    second = LineageEdge(
+        from_fqn="a.t",
+        to_fqn="b.t",
+        source=SOURCE_QUERY,
+        columns_lineage=[{"fromColumns": ["a.t.y"], "toColumn": "b.t.y"}],
+        pipeline_fqn="svc-proj.cfg",
+    )
+    [merged] = merge_edges([first, second])
+    assert merged.pipeline_fqn == "svc-proj.cfg"
+    assert len(merged.columns_lineage) == 2
+
+
 # --------------------------------------------------------------------------
 # Determinism: the column-lineage set feeds emitted output (PUT /lineage
 # payloads + warning logs); its iteration order must be a stable function of

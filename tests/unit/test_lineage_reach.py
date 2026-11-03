@@ -88,10 +88,10 @@ def test_view_of_a_linked_table_points_at_the_source_bucket_path():
 # ------------------------------------------------------- warehouse names in SQL
 
 
-def _bigquery_lineage(schema_buckets: dict[str, str] | None):
+def _bigquery_lineage(schema_buckets: dict[str, str] | None, *, ref_project: str = "my-project"):
     paths = {"in.c-main": "in_c_main", "out.c-main": "out_c_main"}
     return extract_column_lineage(
-        [("main", "CREATE TABLE result AS SELECT o.id FROM `my-project.in_c_main.orders` o")],
+        [("main", f"CREATE TABLE result AS SELECT o.id FROM `{ref_project}.in_c_main.orders` o")],
         in_map={},
         out_map={"result": "out.c-main.result"},
         dialect=dialect_for(component_id="keboola.google-bigquery-transformation-v2"),
@@ -100,12 +100,19 @@ def _bigquery_lineage(schema_buckets: dict[str, str] | None):
         known_table_fqns={_t("in.c-main.orders", paths), _t("out.c-main.result", paths)},
         bucket_paths=paths,
         schema_buckets=schema_buckets,
+        schema_databases={"in_c_main": "my-project", "out_c_main": "my-project"},
     )
 
 
 def test_bigquery_ref_by_dataset_name_resolves_to_its_bucket():
     result = _bigquery_lineage({"in_c_main": "in.c-main", "out_c_main": "out.c-main"})
     assert result.table_edges == {("in.c-main.orders", "out.c-main.result")}
+
+
+def test_bigquery_ref_to_another_project_stays_unresolved():
+    """Another GCP project's dataset of the same name is not this project's bucket."""
+    result = _bigquery_lineage({"in_c_main": "in.c-main"}, ref_project="other-project")
+    assert result.table_edges == set()
 
 
 def test_bigquery_ref_stays_unresolved_without_the_dataset_lookup():

@@ -166,7 +166,7 @@ def merge_edges(edges: list[LineageEdge]) -> list[LineageEdge]:
             kept.columns_lineage = kept.columns_lineage + [
                 c for c in edge.columns_lineage if (tuple(c["fromColumns"]), c["toColumn"]) not in known
             ]
-        elif not kept.pipeline_fqn and edge.pipeline_fqn:
+        if not kept.pipeline_fqn and edge.pipeline_fqn:
             kept.pipeline_fqn = edge.pipeline_fqn
     return list(merged.values())
 

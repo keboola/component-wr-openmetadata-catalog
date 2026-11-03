@@ -82,8 +82,15 @@ class _WorkspaceGraph:
         # are built (see ``_build_inferred_map`` / ``extract_column_lineage``).
         self.qualified_sources: set[str] = set()
         self.qualified_targets: set[str] = set()
+        # Qualified key -> the database (BigQuery project) parts its refs named, if any.
+        self.qualified_catalogs: dict[str, set[str]] = defaultdict(set)
         # (workspace target key, statement SQL) of every CREATE-AS / INSERT, in script order.
         self.writes: list[tuple[str, str]] = []
+
+    def add_qualified(self, tbl: exp.Table, key: str, *, target: bool) -> None:
+        (self.qualified_targets if target else self.qualified_sources).add(key)
+        if tbl.catalog:
+            self.qualified_catalogs[key].add(tbl.catalog)
 
 
 def _table_key(tbl: exp.Table) -> str:
@@ -112,7 +119,7 @@ def _select_and_target(
         if created is not None:
             tgt_key = _table_key(created)
             if created.db:
-                graph.qualified_targets.add(tgt_key)
+                graph.add_qualified(created, tgt_key, target=True)
             if cols:
                 graph.ws_schema[tgt_key] = cols
         if isinstance(tree.expression, exp.Select | exp.Union):
@@ -127,7 +134,7 @@ def _select_and_target(
         if table is not None:
             tgt_tbl = _table_key(table)
             if table.db:
-                graph.qualified_targets.add(tgt_tbl)
+                graph.add_qualified(table, tgt_tbl, target=True)
         if isinstance(tree.expression, exp.Select):
             return tree.expression, tgt_tbl, explicit
     return None, None, []
@@ -171,7 +178,7 @@ def _trace_projection(
         if isinstance(src, exp.Table):
             src_tbl = _table_key(src)
             if src.db:
-                graph.qualified_sources.add(src_tbl)
+                graph.add_qualified(src, src_tbl, target=False)
             src_col = leaf.name.split(".")[-1].strip('"')
             graph.table_edges.add((src_tbl, tgt_tbl or ""))
             if src_col == "*":
@@ -198,6 +205,8 @@ def _build_inferred_map(
     known_table_fqns: set[str] | None,
     bucket_paths: Mapping[str, str] | None = None,
     schema_buckets: Mapping[str, str] | None = None,
+    catalogs: Mapping[str, set[str]] | None = None,
+    schema_databases: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Phase B: promote a QUALIFIED workspace key to a storage id, but only
     when the run actually cataloged it.
@@ -206,7 +215,9 @@ def _build_inferred_map(
     bucket id (``"in.c-bucket"``), so the key already is the storage id; elsewhere
     the warehouse names the schema differently (BigQuery dataset ``in_c_bucket``,
     an external bucket's own schema), and ``schema_buckets`` (warehouse schema ->
-    bucket id) maps it back. Cross-checking the derived Table FQN against
+    bucket id) maps it back. A ref that also names a database (a BigQuery project)
+    other than the bucket's own (``schema_databases``) reads another project's
+    table of the same name, so it is not mapped. Cross-checking the derived Table FQN against
     ``known_table_fqns`` is what filters out CTEs, workspace scratch tables and
     cross-project/non-cataloged refs that happen to carry a dotted ``.db`` part
     but were never a real Storage table this run saw. ``known_table_fqns=None``
@@ -219,6 +230,10 @@ def _build_inferred_map(
     for key in sorted(qualified_keys):
         # Keboola table names hold no dot, so the last dot ends the schema.
         schema, _, table = key.rpartition(".")
+        database = (schema_databases or {}).get(schema)
+        named = (catalogs or {}).get(key) or set()
+        if database and any(name.lower() != database.lower() for name in named):
+            continue
         storage_id = f"{(schema_buckets or {}).get(schema, schema)}.{table}"
         candidate_fqn = fqn_mod.table_fqn_from_storage_id(service_name, project, storage_id, bucket_paths)
         if candidate_fqn is not None and candidate_fqn in known_table_fqns:
@@ -237,6 +252,7 @@ def extract_column_lineage(
     known_table_fqns: set[str] | None = None,
     bucket_paths: Mapping[str, str] | None = None,
     schema_buckets: Mapping[str, str] | None = None,
+    schema_databases: Mapping[str, str] | None = None,
 ) -> LineageResult:
     """Extract resolved column/table lineage for one transformation config.
 
@@ -265,6 +281,8 @@ def extract_column_lineage(
             cataloged under (see ``fqn.table_fqn_from_storage_id``).
         schema_buckets: warehouse schema name -> bucket id, for qualified
             refs whose schema is not the bucket id.
+        schema_databases: warehouse schema name -> the database (BigQuery
+            project) holding it; a ref naming another database is not mapped.
     """
     result = LineageResult()
     if not dialect.is_sql:
@@ -300,11 +318,18 @@ def extract_column_lineage(
     # declared one is spread second so its entries overwrite the inferred
     # ones (spec: "declared mappings stay authoritative; inference only fills
     # gaps").
-    inferred_in_map = _build_inferred_map(
-        graph.qualified_sources, service_name, project, known_table_fqns, bucket_paths, schema_buckets
-    )
-    inferred_out_map = _build_inferred_map(
-        graph.qualified_targets, service_name, project, known_table_fqns, bucket_paths, schema_buckets
+    inferred_in_map, inferred_out_map = (
+        _build_inferred_map(
+            keys,
+            service_name,
+            project,
+            known_table_fqns,
+            bucket_paths,
+            schema_buckets,
+            graph.qualified_catalogs,
+            schema_databases,
+        )
+        for keys in (graph.qualified_sources, graph.qualified_targets)
     )
     effective_in_map = {**inferred_in_map, **in_map}
     effective_out_map = {**inferred_out_map, **out_map}

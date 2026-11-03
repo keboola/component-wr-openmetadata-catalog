@@ -345,6 +345,8 @@ class _ProjectRun:
     # names a table by its warehouse schema (a BigQuery dataset, an external
     # bucket's own schema) resolves to the Storage table.
     schema_buckets: dict[str, str] = field(default_factory=dict)
+    # Warehouse schema name -> the database (BigQuery project) of the bucket it names.
+    schema_databases: dict[str, str] = field(default_factory=dict)
     # Cataloged table FQN -> its (sanitised) column names. The column-lineage pass
     # validates each columnsLineage entry against this so it never references a
     # column an endpoint table lacks (empty-stub tables map to an empty set).
@@ -583,14 +585,20 @@ class Component(ComponentBase):
         # share (external buckets on PUBLIC of two databases) names neither: SQL that
         # gives only the schema cannot tell them apart.
         claims: dict[str, dict[bool, set[str]]] = {}
+        databases: dict[str, str] = {}
         for bucket in buckets:
             if bucket.backend_path:
                 own = bucket.source_bucket is None
                 claims.setdefault(bucket.backend_path[-1], {}).setdefault(own, set()).add(bucket.id)
+                if len(bucket.backend_path) > 1:
+                    databases[bucket.id] = bucket.backend_path[-2]
         for schema, by_kind in claims.items():
             ids = by_kind.get(True) or by_kind[False]
             if len(ids) == 1:
-                run.schema_buckets[schema] = next(iter(ids))
+                bucket_id = next(iter(ids))
+                run.schema_buckets[schema] = bucket_id
+                if bucket_id in databases:
+                    run.schema_databases[schema] = databases[bucket_id]
         return buckets
 
     @staticmethod
@@ -1447,6 +1455,7 @@ class Component(ComponentBase):
             known_table_fqns=known_table_fqns,
             bucket_paths=run.bucket_paths,
             schema_buckets=run.schema_buckets,
+            schema_databases=run.schema_databases,
         )
 
     def _column_edges_for(self, run: _ProjectRun, cfg: dict, pipeline_fqn, result: LineageResult | None, report):

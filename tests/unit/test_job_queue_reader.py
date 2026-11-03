@@ -34,7 +34,7 @@ def test_flow_child_jobs_become_task_statuses_under_the_pipeline_task_names():
         {"component": "keboola.snowflake-transformation", "config": "2", "status": "error"},
         {"component": "keboola.other", "config": "3", "status": "success"},  # not a task of this flow
     ]
-    names = {"keboola.ex-db-mysql-1": "Extract", "keboola.snowflake-transformation-2": "Transform"}
+    names = {"keboola.ex-db-mysql-1": ["Extract"], "keboola.snowflake-transformation-2": ["Transform"]}
     record = status_record(job, children, names)
     assert record.task_status == [
         {"name": "Extract", "executionStatus": "Successful"},
@@ -55,6 +55,7 @@ def test_latest_job_asks_for_the_newest_job_of_one_config():
         "limit": 20,
         "sortBy": "id",
         "sortOrder": "desc",
+        "offset": 0,
     }
 
 
@@ -93,5 +94,31 @@ def test_a_retried_task_reports_its_newest_job():
         {"id": "10", "component": "keboola.ex-db-mysql", "config": "1", "status": "error"},
         {"id": "12", "component": "keboola.ex-db-mysql", "config": "1", "status": "success"},
     ]
-    record = status_record({"status": "success"}, children, {"keboola.ex-db-mysql-1": "Extract"})
+    record = status_record({"status": "success"}, children, {"keboola.ex-db-mysql-1": ["Extract"]})
     assert record.task_status == [{"name": "Extract", "executionStatus": "Successful"}]
+
+
+def test_production_job_behind_a_page_of_dev_branch_jobs_is_found():
+    session = mock.Mock()
+    dev_page = [{"id": str(100 - i), "status": "error", "branchId": "777"} for i in range(20)]
+    session.get.side_effect = [_response(dev_page), _response([{"id": "5", "status": "success", "branchId": "1"}])]
+    reader = JobQueueReader("https://queue.keboola.com", "tok", session=session)
+    assert reader.latest_job("keboola.ex-db-mysql", "1", branch_id="1") == {
+        "id": "5",
+        "status": "success",
+        "branchId": "1",
+    }
+    assert session.get.call_args.kwargs["params"]["offset"] == 20
+
+
+def test_two_tasks_running_one_config_each_get_their_job():
+    """A child job carries no task id: jobs of one config pair with its tasks in phase order."""
+    children = [
+        {"id": "10", "component": "keboola.ex-db-mysql", "config": "1", "status": "success"},
+        {"id": "12", "component": "keboola.ex-db-mysql", "config": "1", "status": "error"},
+    ]
+    record = status_record({"status": "error"}, children, {"keboola.ex-db-mysql-1": ["Early", "Late"]})
+    assert record.task_status == [
+        {"name": "Early", "executionStatus": "Successful"},
+        {"name": "Late", "executionStatus": "Failed"},
+    ]

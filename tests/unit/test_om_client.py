@@ -233,6 +233,16 @@ def test_search_tables_asks_the_schema_in_each_case():
     assert params["q"] == 'name:"OR\\"DERS" AND databaseSchema.name:("SALES" OR "Sales" OR "sales")'
 
 
+def test_search_tables_reads_every_page():
+    session = mock.Mock()
+    full = {"hits": {"hits": [{"_source": {"name": "T", "n": i}} for i in range(2)]}}
+    last = {"hits": {"hits": [{"_source": {"name": "T", "n": 2}}]}}
+    session.request.side_effect = [FakeResponse(200, full), FakeResponse(200, last)]
+    c = _client(session)
+    assert [h["n"] for h in c.search_tables("T", "S", size=2)] == [0, 1, 2]
+    assert [call.kwargs["params"]["from"] for call in session.request.call_args_list] == [0, 2]
+
+
 def test_find_user_id_by_email_none_when_no_exact_match():
     session = mock.Mock()
     # a token match returns a user whose email only contains the query terms -> no exact hit

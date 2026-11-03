@@ -371,3 +371,20 @@ def test_pipeline_extension_names_its_project():
     assert ext["kbcProjectId"] == "1234"
     assert ext["kbcProjectName"] == "Acme_Project"
     assert ext["kbcProjectUrl"]["url"] == "https://connection.us-east4.gcp.keboola.com/admin/projects/1234"
+
+
+def test_flow_tasks_running_one_config_keep_every_task_name_in_phase_order():
+    configuration = {
+        "phases": [{"id": 1}, {"id": 2}],
+        "tasks": [
+            {"name": "Late", "phase": 2, "task": {"componentId": "keboola.ex-db-mysql", "configId": "1"}},
+            {"name": "Early", "phase": 1, "task": {"componentId": "keboola.ex-db-mysql", "configId": "1"}},
+            {
+                "name": "Off",
+                "phase": 1,
+                "enabled": False,
+                "task": {"componentId": "keboola.ex-db-mysql", "configId": "1"},
+            },
+        ],
+    }
+    assert PipelineBuilder.flow_task_names_by_job(configuration) == {"keboola.ex-db-mysql-1": ["Early", "Late"]}

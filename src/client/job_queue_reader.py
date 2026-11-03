@@ -34,6 +34,7 @@ _EXECUTION_STATUS = {
 }
 _MAX_CHILD_JOBS = 500
 _LATEST_JOBS = 20
+_MAX_JOB_PAGES = 10
 
 
 @dataclass
@@ -64,11 +65,14 @@ def execution_status(job_status: str | None) -> str:
     return _EXECUTION_STATUS.get((job_status or "").lower(), _PENDING_STATUS)
 
 
-def status_record(job: dict, children: list[dict], task_names: dict[str, str]) -> PipelineStatusRecord:
-    """The OM status of one job; ``task_names`` maps ``<component>-<config>`` of a child job to a task name.
+def status_record(job: dict, children: list[dict], task_names: dict[str, list[str]]) -> PipelineStatusRecord:
+    """The OM status of one job; ``task_names`` maps ``<component>-<config>`` of a child job to task names.
 
     A child job that maps to no task of the pipeline is left out: OM rejects a task
-    status under a name the pipeline does not have (400).
+    status under a name the pipeline does not have (400). A child job carries no
+    flow task id, so when several tasks run one configuration (in phase order) the
+    newest of its jobs pair with them oldest first; a single task takes the newest
+    job, as a retried task leaves several.
     """
     timestamp = (
         _epoch_ms(job.get("endTime"))
@@ -76,14 +80,17 @@ def status_record(job: dict, children: list[dict], task_names: dict[str, str]) -
         or _epoch_ms(job.get("createdTime"))
         or int(time.time() * 1000)
     )
-    newest: dict[str, dict] = {}  # a retried task leaves several child jobs: the newest one counts
-    for child in sorted(children, key=lambda c: int(c.get("id") or 0), reverse=True):
-        newest.setdefault(f"{child.get('component')}-{child.get('config')}", child)
-    tasks = [
-        {"name": task_names[key], "executionStatus": execution_status(child.get("status"))}
-        for key, child in newest.items()
-        if key in task_names
-    ]
+    runs: dict[str, list[dict]] = {}  # oldest first
+    for child in sorted(children, key=lambda c: int(c.get("id") or 0)):
+        runs.setdefault(f"{child.get('component')}-{child.get('config')}", []).append(child)
+    tasks = []
+    for key, names in task_names.items():
+        key_runs = runs.get(key) or []
+        latest = key_runs[-len(names) :] if key_runs else []
+        tasks += [
+            {"name": name, "executionStatus": execution_status(child.get("status"))}
+            for name, child in zip(names, latest, strict=False)
+        ]
     return PipelineStatusRecord(execution_status(job.get("status")), timestamp, tasks)
 
 
@@ -128,14 +135,21 @@ class JobQueueReader:
     def latest_job(self, component_id: str, config_id: str, *, branch_id: str | None = None) -> dict | None:
         """The configuration's most recent job on ``branch_id`` (production), or ``None``.
 
-        A dev branch keeps the production config id, so its jobs are skipped; among
-        the newest few jobs the first production one wins.
+        A dev branch keeps the production config id, so its jobs are skipped; the
+        newest production job wins. Pages are read until one is found, up to
+        ``_MAX_JOB_PAGES`` pages, so a run of dev-branch jobs does not hide it.
         """
         params = {"componentId": component_id, "configId": config_id, "limit": _LATEST_JOBS}
-        jobs = self._get("/search/jobs", params | {"sortBy": "id", "sortOrder": "desc"})
-        for job in jobs if isinstance(jobs, list) else []:
-            if branch_id is None or job.get("branchId") is None or str(job.get("branchId")) == str(branch_id):
-                return job
+        for page in range(_MAX_JOB_PAGES):
+            jobs = self._get(
+                "/search/jobs", params | {"sortBy": "id", "sortOrder": "desc", "offset": page * _LATEST_JOBS}
+            )
+            jobs = jobs if isinstance(jobs, list) else []
+            for job in jobs:
+                if branch_id is None or job.get("branchId") is None or str(job.get("branchId")) == str(branch_id):
+                    return job
+            if len(jobs) < _LATEST_JOBS:
+                break
         return None
 
     def child_jobs(self, run_id: str) -> list[dict]:
