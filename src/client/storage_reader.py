@@ -371,7 +371,7 @@ class StorageReader:
 
     @staticmethod
     def _typed_column_definitions(raw: dict) -> dict[str, dict]:
-        """Map column name -> {'definition': {...}, 'basetype': ...} from typed ``definition.columns``."""
+        """Map column name -> {'definition': {...}, 'basetype': ...} from ``definition.columns`` (native types and descriptions)."""
         result: dict[str, dict] = {}
         for col in (raw.get("definition") or {}).get("columns") or []:
             name = col.get("name")
