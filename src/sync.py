@@ -28,8 +28,8 @@ DEFAULT_FULL_REFRESH_EVERY = 20
 # ``created_by_metadata`` specifically — are set once at Storage-object
 # creation and never change. Digesting them would force every bucket/table to
 # reprocess the instant such a field was introduced, for no real content
-# reason. ``producer`` feeds lineage only, which has its own digest.
-_DIGEST_EXCLUDED_FIELDS = frozenset({"created_by_metadata", "producer"})
+# reason. ``producer`` and ``backend_path`` feed lineage only, not catalog content.
+_DIGEST_EXCLUDED_FIELDS = frozenset({"created_by_metadata", "producer", "backend_path"})
 
 
 def digest_fields(obj: object, *, exclude: frozenset[str] = frozenset()) -> dict:

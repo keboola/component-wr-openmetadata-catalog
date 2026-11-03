@@ -12,6 +12,7 @@ same FQN, so N independent project rows converge on one coherent catalog.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 
 _UNSAFE = re.compile(r"[^0-9A-Za-z_-]+")
 _MULTI_UNDERSCORE = re.compile(r"_+")
@@ -83,18 +84,23 @@ def table_fqn(service_name: str, project: str, bucket_path: str, table_name: str
     )
 
 
-def table_fqn_from_storage_id(service_name: str, project: str, storage_id: str) -> str | None:
+def table_fqn_from_storage_id(
+    service_name: str, project: str, storage_id: str, bucket_paths: Mapping[str, str] | None = None
+) -> str | None:
     """OM Table FQN from a Keboola storage id (``stage.c-bucket.table``).
 
-    The first two dotted parts are the bucket path, the remainder the table
-    name. Returns ``None`` for an unparseable id.
+    The first two dotted parts are the bucket id, the remainder the table name.
+    A table is cataloged under its bucket's Storage ``path``, which is not always
+    the bucket id (a linked bucket's path is its source bucket's), so
+    ``bucket_paths`` (bucket id -> path) maps the id onto the cataloged schema.
+    Returns ``None`` for an unparseable id.
     """
     parts = str(storage_id).split(".")
     if len(parts) < 3:
         return None
-    bucket_path = ".".join(parts[:2])
+    bucket_id = ".".join(parts[:2])
     table_name = ".".join(parts[2:])
-    return table_fqn(service_name, project, bucket_path, table_name)
+    return table_fqn(service_name, project, (bucket_paths or {}).get(bucket_id, bucket_id), table_name)
 
 
 def column_fqn(table_fqn_value: str, column_name: str) -> str:

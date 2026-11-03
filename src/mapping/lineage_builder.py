@@ -10,7 +10,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from lineage.column_lineage import LineageResult
@@ -22,6 +22,7 @@ SOURCE_PIPELINE = "PipelineLineage"
 SOURCE_QUERY = "QueryLineage"
 SOURCE_VIEW = "ViewLineage"
 SOURCE_DASHBOARD = "DashboardLineage"
+SOURCE_CROSS_DATABASE = "CrossDatabaseLineage"
 # Every source must be a member of OM's closed ``lineageDetails.source`` enum — an
 # unknown value fails deserialization (400 "Invalid request format"). ChildAssets is
 # OM's own marker for higher-level lineage aggregated from child-asset edges, which
@@ -92,6 +93,7 @@ def declared_edges(
     pipeline_fqn: str | None = None,
     sql_table_edges: set[tuple[str, str]] | None = None,
     sql_by_output: dict[str, str] | None = None,
+    bucket_paths: Mapping[str, str] | None = None,
 ) -> list[LineageEdge]:
     """E16: table -> table edges for one config, its pipeline attached to each edge.
 
@@ -114,8 +116,8 @@ def declared_edges(
     edges: list[LineageEdge] = []
     seen: set[tuple[str, str]] = set()
     for source_id, dest_id in pairs:
-        source_fqn = fqn.table_fqn_from_storage_id(service_name, project, source_id)
-        dest_fqn = fqn.table_fqn_from_storage_id(service_name, project, dest_id)
+        source_fqn = fqn.table_fqn_from_storage_id(service_name, project, source_id, bucket_paths)
+        dest_fqn = fqn.table_fqn_from_storage_id(service_name, project, dest_id, bucket_paths)
         if not source_fqn or not dest_fqn or (source_fqn, dest_fqn) in seen:
             continue
         seen.add((source_fqn, dest_fqn))
@@ -175,6 +177,7 @@ def pipeline_edges(
     service_name: str,
     project: str,
     pipeline_fqn: str | None,
+    bucket_paths: Mapping[str, str] | None = None,
 ) -> list[LineageEdge]:
     """Phase A: wire the Pipeline itself as a lineage node from DECLARED storage.
 
@@ -192,7 +195,7 @@ def pipeline_edges(
     outputs = (storage.get("output") or {}).get("tables") or []
     edges: list[LineageEdge] = []
     for t in inputs:
-        in_fqn = fqn.table_fqn_from_storage_id(service_name, project, t.get("source", ""))
+        in_fqn = fqn.table_fqn_from_storage_id(service_name, project, t.get("source", ""), bucket_paths)
         if not in_fqn:
             continue
         edges.append(
@@ -205,7 +208,7 @@ def pipeline_edges(
             )
         )
     for t in outputs:
-        out_fqn = fqn.table_fqn_from_storage_id(service_name, project, t.get("destination", ""))
+        out_fqn = fqn.table_fqn_from_storage_id(service_name, project, t.get("destination", ""), bucket_paths)
         if not out_fqn:
             continue
         edges.append(
@@ -233,12 +236,63 @@ def view_edge(view_fqn: str, source_fqn: str, columns: list[str] | None = None) 
     return LineageEdge(from_fqn=source_fqn, to_fqn=view_fqn, source=SOURCE_VIEW, columns_lineage=columns_lineage)
 
 
+def external_source_matches(
+    hits: list[dict], backend_path: Sequence[str], table_name: str, own_service: str
+) -> list[str]:
+    """FQNs of the OM tables an external bucket's table reads, from search hits.
+
+    An external bucket's tables are the tables of a schema in the customer's own
+    warehouse (``backend_path``: ``[database, schema]`` on Snowflake, ``[project,
+    dataset]`` on BigQuery). OpenMetadata catalogs that warehouse in its own service,
+    so a hit matches when its table, schema and (when the path has one) database
+    names equal ours, ignoring case: warehouses differ in how they case names. Hits
+    in the writer's own service and soft-deleted ones never match.
+    """
+    if not backend_path:
+        return []
+    want_schema = backend_path[-1].lower()
+    want_database = backend_path[-2].lower() if len(backend_path) > 1 else None
+    matches: set[str] = set()
+    for hit in hits:
+        if hit.get("deleted") or (hit.get("service") or {}).get("name") == own_service:
+            continue
+        if str(hit.get("name") or "").lower() != table_name.lower():
+            continue
+        if str((hit.get("databaseSchema") or {}).get("name") or "").lower() != want_schema:
+            continue
+        if want_database is not None and str((hit.get("database") or {}).get("name") or "").lower() != want_database:
+            continue
+        if hit.get("fullyQualifiedName"):
+            matches.add(hit["fullyQualifiedName"])
+    return sorted(matches)
+
+
+def external_edge(table_fqn: str, source_fqn: str, columns: list[str], source_columns: list[str]) -> LineageEdge:
+    """Source warehouse table -> the external bucket's table that reads it.
+
+    Both are the same physical table seen from two services, so the edge is
+    ``CrossDatabaseLineage`` and each column maps to the source column of the same
+    name, ignoring case. A column whose name is not FQN-safe on either side is left
+    out: OpenMetadata would not resolve its column FQN.
+    """
+    source_by_name = {name.lower(): name for name in source_columns if fqn.sanitize_name(name) == name}
+    columns_lineage = [
+        {"fromColumns": [f"{source_fqn}.{source_by_name[col.lower()]}"], "toColumn": fqn.column_fqn(table_fqn, col)}
+        for col in columns
+        if col.lower() in source_by_name and fqn.sanitize_name(col) == col
+    ]
+    return LineageEdge(
+        from_fqn=source_fqn, to_fqn=table_fqn, source=SOURCE_CROSS_DATABASE, columns_lineage=columns_lineage
+    )
+
+
 def data_app_edges(
     storage: dict,
     *,
     service_name: str,
     project: str,
     dashboard_fqn: str,
+    bucket_paths: Mapping[str, str] | None = None,
 ) -> list[LineageEdge]:
     """Upstream table -> data-app (Dashboard) edges from the app's input mapping.
 
@@ -251,7 +305,7 @@ def data_app_edges(
     edges: list[LineageEdge] = []
     seen: set[str] = set()
     for table in inputs:
-        source_fqn = fqn.table_fqn_from_storage_id(service_name, project, table.get("source", ""))
+        source_fqn = fqn.table_fqn_from_storage_id(service_name, project, table.get("source", ""), bucket_paths)
         if not source_fqn or source_fqn in seen:
             continue
         seen.add(source_fqn)
@@ -387,6 +441,7 @@ def column_edges(
     project: str,
     pipeline_fqn: str | None = None,
     column_catalog: dict[str, set[str]] | None = None,
+    bucket_paths: Mapping[str, str] | None = None,
 ) -> list[LineageEdge]:
     """E17: group resolved column edges by (from_table, to_table) into QueryLineage edges.
 
@@ -406,8 +461,8 @@ def column_edges(
     # "Dropping column-level mapping" warning order are deterministic run-to-run,
     # matching the already-sorted omit path in _table_level_fallbacks.
     for edge in sorted(result.column_edges):
-        from_tbl_fqn = fqn.table_fqn_from_storage_id(service_name, project, edge.from_table)
-        to_tbl_fqn = fqn.table_fqn_from_storage_id(service_name, project, edge.to_table)
+        from_tbl_fqn = fqn.table_fqn_from_storage_id(service_name, project, edge.from_table, bucket_paths)
+        to_tbl_fqn = fqn.table_fqn_from_storage_id(service_name, project, edge.to_table, bucket_paths)
         if not from_tbl_fqn or not to_tbl_fqn:
             continue
         if _is_self_loop(from_tbl_fqn, to_tbl_fqn, SOURCE_QUERY):

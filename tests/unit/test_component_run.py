@@ -694,6 +694,9 @@ class _DataAppReader:
         self._config_id = config_id
         self._source = source_table
 
+    def list_buckets(self):
+        return []
+
     def list_component_configs(self):
         return [
             {
@@ -880,6 +883,9 @@ def test_lineage_pass_puts_pipeline_on_table_edge_not_as_node():
     svc, proj, pid = "keboola-stack", "Acme_Project", "4214"
 
     class _TwoConfigReader:
+        def list_buckets(self):
+            return []
+
         def list_component_configs(self):
             return [
                 {
@@ -968,6 +974,9 @@ def test_lineage_pass_pipeline_as_node_keeps_legacy_node_edges():
     svc, proj, pid = "keboola-stack", "Acme_Project", "4214"
 
     class _Reader:
+        def list_buckets(self):
+            return []
+
         def list_component_configs(self):
             return [
                 {
@@ -1045,6 +1054,9 @@ def test_lineage_pass_infers_input_pipeline_edge_from_direct_sql_when_declared_i
     svc, proj, pid = "keboola-stack", "Acme_Project", "4214"
 
     class _DirectSqlReader:
+        def list_buckets(self):
+            return []
+
         def list_component_configs(self):
             return [
                 {
@@ -1116,6 +1128,9 @@ def test_lineage_pass_skips_sql_inference_when_declared_input_present():
     svc, proj, pid = "keboola-stack", "Acme_Project", "4214"
 
     class _MixedReader:
+        def list_buckets(self):
+            return []
+
         def list_component_configs(self):
             return [
                 {
@@ -1219,6 +1234,9 @@ def test_refresh_lineage_deletes_stale_edges_keyed_on_target_type():
 
 class _FamilyReader:
     """One producing transformation, one producing extractor, one flow, one data app."""
+
+    def list_buckets(self):
+        return []
 
     def list_component_configs(self):
         return [
@@ -1458,6 +1476,9 @@ class _FlowChildReader:
     run, per `run.pipeline_fqn_by_config`) plus one task referencing a config
     that never got a pipeline (selector-excluded / non-producing)."""
 
+    def list_buckets(self):
+        return []
+
     def list_component_configs(self):
         return [
             {
@@ -1566,6 +1587,9 @@ def test_lineage_pass_aggregates_bucket_edges_when_gated_on():
     svc, proj, pid = "keboola-stack", "Acme_Project", "4214"
 
     class _TwoConfigReader:
+        def list_buckets(self):
+            return []
+
         def list_component_configs(self):
             return [
                 {
@@ -1623,6 +1647,9 @@ def test_lineage_pass_no_bucket_edge_when_gated_off():
     svc, proj, pid = "keboola-stack", "Acme_Project", "4214"
 
     class _OneConfigReader:
+        def list_buckets(self):
+            return []
+
         def list_component_configs(self):
             return [
                 {
@@ -1673,6 +1700,9 @@ def test_extractor_without_inputs_keeps_its_pipeline_as_a_node():
     svc, proj, pid = "keboola-stack", "Acme_Project", "4214"
 
     class _Reader:
+        def list_buckets(self):
+            return []
+
         def list_component_configs(self):
             return [
                 {
@@ -1715,6 +1745,9 @@ def test_extractor_without_inputs_keeps_its_pipeline_as_a_node():
 
 class _UnmappedExtractorReader:
     """A DB extractor that writes through ``outputTable``: no storage output mapping."""
+
+    def list_buckets(self):
+        return []
 
     def list_component_configs(self):
         return [
@@ -1811,6 +1844,9 @@ def _one_config_lineage_run(configuration: dict, *, pipeline_fqn: str | None):
     svc, proj, pid = "keboola-stack", "Acme_Project", "4214"
 
     class _Reader:
+        def list_buckets(self):
+            return []
+
         def list_component_configs(self):
             return [{"id": "keboola.python-transformation-v2", "configurations": [configuration]}]
 
@@ -1968,6 +2004,9 @@ def test_flow_migrated_from_an_orchestration_supersedes_it():
     """
 
     class _MigratedReader:
+        def list_buckets(self):
+            return []
+
         def list_component_configs(self):
             return [
                 {

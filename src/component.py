@@ -70,6 +70,7 @@ from mapping.pipeline_builder import (
     component_kind,
     is_flow_component,
 )
+from mapping.table_type import EXTERNAL
 from merge import (
     OUR_DASHBOARD_LINEAGE_SOURCES,
     OUR_LINEAGE_SOURCES,
@@ -301,6 +302,17 @@ _BASE_TYPE_FACTORY = {
 
 
 @dataclass
+class _StorageEdges:
+    """The lineage edges of one storage mapping of a config."""
+
+    table_edges: list[lineage_builder.LineageEdge] = field(default_factory=list)
+    column_edges: list[lineage_builder.LineageEdge] = field(default_factory=list)
+    # The config's pipeline as a node between its tables (written in the legacy
+    # layout, or when no table edge can carry the pipeline).
+    node_edges: list[lineage_builder.LineageEdge] = field(default_factory=list)
+
+
+@dataclass
 class ProjectContext:
     project_id: str
     project_name: str
@@ -324,6 +336,15 @@ class _ProjectRun:
     # (no table removed since its last sync) costs no listing.
     seen_schema_fqns: set[str] = field(default_factory=set)
     bucket_id_by_schema: dict[str, str] = field(default_factory=dict)
+    # Every production bucket of the project, listed once per run (None until then).
+    buckets: list[SourceBucket] | None = None
+    # Bucket id -> the Storage ``path`` its tables are cataloged under: lineage names
+    # tables by storage id, and a linked bucket's path is its source bucket's.
+    bucket_paths: dict[str, str] = field(default_factory=dict)
+    # Warehouse schema name (the last ``backendPath`` part) -> bucket id, so SQL that
+    # names a table by its warehouse schema (a BigQuery dataset, an external
+    # bucket's own schema) resolves to the Storage table.
+    schema_buckets: dict[str, str] = field(default_factory=dict)
     # Cataloged table FQN -> its (sanitised) column names. The column-lineage pass
     # validates each columnsLineage entry against this so it never references a
     # column an endpoint table lacks (empty-stub tables map to an empty set).
@@ -549,6 +570,22 @@ class Component(ComponentBase):
         self._tombstone_pass(config, om, run, report, state)
 
     @staticmethod
+    def _index_buckets(run: _ProjectRun) -> list[SourceBucket]:
+        """The project's buckets, listed and indexed on the first call of a run."""
+        if run.buckets is not None:
+            return run.buckets
+        buckets = run.buckets = run.reader.list_buckets()
+        for bucket in buckets:
+            run.bucket_paths[bucket.id] = bucket.path or bucket.name
+        run.entities.bucket_paths = run.bucket_paths
+        # Linked buckets first: a bucket of this project wins a schema name it shares
+        # with a linked one (whose path is its source project's schema).
+        for bucket in sorted(buckets, key=lambda b: b.source_bucket is None):
+            if bucket.backend_path:
+                run.schema_buckets[bucket.backend_path[-1]] = bucket.id
+        return buckets
+
+    @staticmethod
     def _parallel[T](
         config: Configuration, items: list[T], task: Callable[[T, RunReport], None], report: RunReport
     ) -> None:
@@ -679,10 +716,13 @@ class Component(ComponentBase):
         # Row count, size and last import change on every data load. Unless their
         # custom properties are written, they must not mark the bucket as changed.
         volatile = frozenset(f for f, prop in TABLE_STAT_PROPERTIES.items() if prop not in available_table)
-        buckets = [bucket for bucket in run.reader.list_buckets() if self._bucket_in_scope(config, bucket)]
+        buckets = [bucket for bucket in self._index_buckets(run) if self._bucket_in_scope(config, bucket)]
         # Written after every bucket: an alias may sit in another bucket than its
         # source table, which a parallel worker may still be creating.
         view_edges: list[tuple[str, lineage_builder.LineageEdge]] = []
+        # (bucket, table name, table FQN, column names) of every external table synced:
+        # its source table is looked up in OM once every bucket is written.
+        external_tables: list[tuple[SourceBucket, str, str, list[str]]] = []
 
         def sync_bucket(bucket: SourceBucket, bucket_report: RunReport) -> None:
             schema_fqn = fqn_mod.schema_fqn(run.entities.service_name, run.entities.project, bucket.path or bucket.name)
@@ -752,11 +792,11 @@ class Component(ComponentBase):
                     merger,
                 )
                 bucket_ok = bucket_ok and ok
+                columns = [col["name"] for col in built.body.get("columns") or []]
                 if built.view_source_fqn:
-                    view_columns = [col["name"] for col in built.body.get("columns") or []]
-                    view_edges.append(
-                        (bucket.id, lineage_builder.view_edge(built.fqn, built.view_source_fqn, view_columns))
-                    )
+                    view_edges.append((bucket.id, lineage_builder.view_edge(built.fqn, built.view_source_fqn, columns)))
+                elif built.table_type == EXTERNAL and bucket.backend_path:
+                    external_tables.append((bucket, table.name, built.fqn, columns))
             # advance-after-success: persist the digest only once the bucket's writes succeeded
             if bucket_ok:
                 state.set_bucket_digest(run.ctx.project_id, bucket.id, digest)
@@ -768,9 +808,67 @@ class Component(ComponentBase):
                 # unresolved source keeps the digest: it may never be cataloged.
                 state.forget_bucket_digest(run.ctx.project_id, bucket_id)
 
+        def write_external_edge(item: tuple[SourceBucket, str, str, list[str]], item_report: RunReport) -> None:
+            bucket, table_name, table_fqn, columns = item
+            if not config.write_table_lineage:
+                return
+            edge = self._external_source_edge(om, run, item_report, bucket, table_name, table_fqn, columns, service_fqn)
+            if edge is None:
+                return
+            if self._put_lineage(om, run, item_report, edge, retry_table_level=True) == EdgeOutcome.FAILED:
+                state.forget_bucket_digest(run.ctx.project_id, bucket.id)
+
         self._parallel(config, buckets, sync_bucket, report)
         view_edges.sort(key=lambda item: (item[1].to_fqn, item[1].from_fqn))  # buckets finish in any order
         self._parallel(config, view_edges, write_view_edge, report)
+        external_tables.sort(key=lambda item: item[2])
+        self._parallel(config, external_tables, write_external_edge, report)
+
+    def _external_source_edge(
+        self,
+        om: OMClient,
+        run: _ProjectRun,
+        report: RunReport,
+        bucket: SourceBucket,
+        table_name: str,
+        table_fqn: str,
+        columns: list[str],
+        own_service: str,
+    ) -> lineage_builder.LineageEdge | None:
+        """The edge from the warehouse table an external bucket's table reads, if OM has it.
+
+        The source is found by its database, schema and table name in any other
+        service of the OpenMetadata instance. None found, or several, is reported as
+        unresolved: the source warehouse may not be cataloged (yet).
+        """
+        try:
+            hits = om.search_tables(table_name, bucket.backend_path[-1])
+            matches = lineage_builder.external_source_matches(hits, bucket.backend_path, table_name, own_service)
+            source = om.get_by_fqn("tables", matches[0], fields="columns") if len(matches) == 1 else None
+        except OMAuthError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a lookup failure is per-table, retried next run
+            report.record(
+                project_id=run.ctx.project_id,
+                entity_type="Lineage",
+                entity_fqn=table_fqn,
+                action=report_mod.ACTION_FAILED,
+                detail=f"external bucket source lookup: {exc}",
+            )
+            return None
+        if source is None:
+            where = ".".join([*bucket.backend_path, table_name])
+            detail = f"several OpenMetadata tables match: {', '.join(matches)}" if matches else "not in OpenMetadata"
+            report.record(
+                project_id=run.ctx.project_id,
+                entity_type="Lineage",
+                entity_fqn=table_fqn,
+                action=report_mod.ACTION_UNRESOLVED,
+                detail=f"external bucket source {where}: {detail}",
+            )
+            return None
+        source_columns = [str(col.get("name")) for col in source.get("columns") or [] if col.get("name")]
+        return lineage_builder.external_edge(table_fqn, matches[0], columns, source_columns)
 
     @staticmethod
     def _record_column_catalog(run: _ProjectRun, table_fqn: str, table: SourceTable) -> None:
@@ -951,22 +1049,63 @@ class Component(ComponentBase):
         return not (selector and cfg_id not in selector)
 
     @staticmethod
-    def _is_producing(cfg: dict) -> bool:
-        storage = (cfg.get("configuration") or {}).get("storage") or {}
-        return bool((storage.get("output") or {}).get("tables") or (storage.get("input") or {}).get("tables"))
+    def _storage_tables(storage: object, side: str) -> list[dict]:
+        """The ``input`` or ``output`` tables of a storage mapping.
 
-    @staticmethod
-    def _produced_outputs(run: _ProjectRun, component_id: str, kind: str, cfg: dict) -> list[str]:
-        """The tables a config without an output mapping writes, per Storage metadata.
+        An empty mapping can arrive as ``[]`` instead of ``{}`` (Storage stores what
+        the UI sent), at any level.
+        """
+        mapping = storage.get(side) if isinstance(storage, dict) else None
+        tables = mapping.get("tables") if isinstance(mapping, dict) else None
+        return [table for table in tables or [] if isinstance(table, dict)]
+
+    @classmethod
+    def _storages_of(cls, cfg: dict) -> list[dict]:
+        """The storage mappings of a config: its own first, then each enabled row's.
+
+        Many writers and extractors map their tables per row. Each row is one job
+        step with its own mapping, so it stays a separate storage: a row's inputs
+        never pair with another row's outputs.
+        """
+        top = (cfg.get("configuration") or {}).get("storage")
+        storages = [
+            {side: {"tables": cls._storage_tables(top, side)} for side in ("input", "output")}
+            if isinstance(top, dict)
+            else {}
+        ]
+        for row in cfg.get("rows") or []:
+            if not isinstance(row, dict) or row.get("isDisabled"):
+                continue
+            storage = (row.get("configuration") or {}).get("storage")
+            row_storage = {side: {"tables": cls._storage_tables(storage, side)} for side in ("input", "output")}
+            if row_storage["input"]["tables"] or row_storage["output"]["tables"]:
+                storages.append(row_storage)
+        return storages
+
+    @classmethod
+    def _is_producing(cls, cfg: dict) -> bool:
+        return any(
+            cls._storage_tables(storage, "input") or cls._storage_tables(storage, "output")
+            for storage in cls._storages_of(cfg)
+        )
+
+    @classmethod
+    def _produced_outputs(cls, run: _ProjectRun, component_id: str, kind: str, cfg: dict) -> list[str]:
+        """The tables a config writes without an output mapping, per Storage metadata.
 
         A DB extractor writes through its own parameters (``outputTable``), so only the
-        tables' ``KBC.lastUpdatedBy`` metadata names it. A declared output mapping wins,
-        and a transformation's outputs come from its mapping and SQL.
+        tables' ``KBC.lastUpdatedBy`` metadata names it. Tables an output mapping of
+        the config or of its rows declares are left out, and a transformation's
+        outputs come from its mapping and SQL.
         """
-        storage = (cfg.get("configuration") or {}).get("storage") or {}
-        if kind in ("transformation", "orchestration", "data_app") or (storage.get("output") or {}).get("tables"):
+        if kind in ("transformation", "orchestration", "data_app"):
             return []
-        return sorted(run.produced_tables.get((component_id, str(cfg.get("id"))), ()))
+        declared = {
+            str(table.get("destination"))
+            for storage in cls._storages_of(cfg)
+            for table in cls._storage_tables(storage, "output")
+        }
+        return sorted(run.produced_tables.get((component_id, str(cfg.get("id"))), set()) - declared)
 
     def _push_pipeline_status(self, run, pipeline_fqn, component_id, cfg, om, report) -> None:
         if not run.ctx.storage_url:
@@ -1090,23 +1229,13 @@ class Component(ComponentBase):
         earlier run wrote in the legacy layout (when the layout changed). Returns
         ``False`` when some of those deletes failed, so the caller retries them.
         """
+        self._index_buckets(run)
         edges: list[lineage_builder.LineageEdge] = []
         legacy_node_edges: list[lineage_builder.LineageEdge] = []
         for component in run.reader.list_component_configs():
             component_id = str(component.get("id") or component.get("componentId") or "")
             kind = component_kind(component_id, component.get("type"))
             for cfg in component.get("configurations") or []:
-                # rows[]-declared storage (some extractors/transforms map storage
-                # per config row, not at the top level) is not read here — Phase A
-                # scope is the top-level configuration.storage only; a follow-up.
-                storage = (cfg.get("configuration") or {}).get("storage") or {}
-                produced = self._produced_outputs(run, component_id, kind, cfg)
-                if produced:
-                    output = {**(storage.get("output") or {}), "tables": [{"destination": t} for t in produced]}
-                    storage = {**storage, "output": output}
-                if kind == "data_app":
-                    edges += self._data_app_edges_for(config, run, cfg, storage)
-                    continue  # a data app is a Dashboard: upstream table -> app, no table -> table
                 if component_id == LEGACY_ORCHESTRATOR_ID and str(cfg.get("id")) in run.migrated_orchestration_ids:
                     continue  # superseded by the flow of the same id (see _pipeline_pass)
                 pipeline_fqn = run.pipeline_fqn_by_config.get(str(cfg.get("id")))
@@ -1116,68 +1245,91 @@ class Component(ComponentBase):
                     if config.write_pipeline_lineage and pipeline_fqn:
                         edges += self._flow_child_edges_for(run, cfg, pipeline_fqn)
                     continue
-                # Phase B: the column-lineage engine also recovers input/output
-                # tables a transform reads/writes via a DIRECT fully-qualified SQL
-                # ref instead of a declared mapping. Parsed once here whenever ANY
-                # lineage is wanted and reused for the table edges, the column edges
-                # and the legacy pipeline-node wiring, so the SQL is never parsed twice.
-                column_result = (
-                    self._column_lineage_for(run, component_id, cfg, storage)
-                    if (config.write_table_lineage or config.write_pipeline_lineage or config.write_column_lineage)
-                    else None
-                )
-                # The pipeline rides on each table -> table edge (lineageDetails.pipeline),
-                # so OM keeps the table -> table path its column lineage is drawn on.
-                edge_pipeline_fqn = pipeline_fqn if config.write_pipeline_lineage else None
-                table_edges = (
-                    lineage_builder.declared_edges(
-                        storage,
-                        service_name=run.entities.service_name,
-                        project=run.entities.project,
-                        pipeline_fqn=edge_pipeline_fqn,
-                        sql_table_edges=column_result.table_edges if column_result else None,
-                        sql_by_output=column_result.sql_by_output if column_result else None,
-                    )
-                    if config.write_table_lineage
-                    else []
-                )
-                edges += table_edges
-                if pipeline_fqn:
+                storages = self._storages_of(cfg)
+                produced = self._produced_outputs(run, component_id, kind, cfg)
+                if produced:
+                    top = storages[0]
+                    output = {"tables": self._storage_tables(top, "output") + [{"destination": t} for t in produced]}
+                    storages[0] = {**top, "output": output}
+                if kind == "data_app":
+                    edges += self._data_app_edges_for(config, run, cfg, storages[0])
+                    continue  # a data app is a Dashboard: upstream table -> app, no table -> table
+                # The pipeline FQN a legacy-layout run gave this config, for when it has
+                # no pipeline this run.
+                legacy_fqn = fqn_mod.pipeline_fqn(run.entities.service_name, run.entities.project, str(cfg.get("id")))
+                for storage in storages:
+                    storage_edges = self._storage_lineage(config, run, report, component_id, cfg, storage)
+                    edges += storage_edges.table_edges + storage_edges.column_edges
+                    if not pipeline_fqn:
+                        if drop_legacy_node_edges:
+                            # A config with no pipeline this run (selector, family switch) may
+                            # still hold node edges from the legacy layout: drop them too.
+                            legacy_node_edges += lineage_builder.pipeline_edges(
+                                storage,
+                                service_name=run.entities.service_name,
+                                project=run.entities.project,
+                                pipeline_fqn=legacy_fqn,
+                                bucket_paths=run.bucket_paths,
+                            )
+                        continue
                     # The pipeline as its own node between tables: the legacy layout, and
                     # the only way to show an extractor (outputs only) or a writer (inputs
-                    # only), which has no table -> table edge to carry its pipeline.
-                    node_edges = lineage_builder.pipeline_edges(
-                        storage,
-                        service_name=run.entities.service_name,
-                        project=run.entities.project,
-                        pipeline_fqn=pipeline_fqn,
-                    ) + self._inferred_input_pipeline_edges(run, storage, pipeline_fqn, column_result)
-                    # Edges that cannot be written (an endpoint outside the catalog) do
-                    # not count: the pipeline would otherwise show no lineage at all.
+                    # only), which has no table -> table edge to carry its pipeline. Edges
+                    # that cannot be written (an endpoint outside the catalog) do not count:
+                    # the pipeline would otherwise show no lineage at all.
                     if config.write_pipeline_lineage and (
-                        _pipelines_as_lineage_nodes(config) or not self._writable_edges(om, run, table_edges)
+                        _pipelines_as_lineage_nodes(config)
+                        or not self._writable_edges(om, run, storage_edges.table_edges)
                     ):
-                        edges += node_edges
+                        edges += storage_edges.node_edges
                     elif drop_legacy_node_edges:
-                        legacy_node_edges += node_edges
-                elif drop_legacy_node_edges:
-                    # A config with no pipeline this run (selector, family switch) may
-                    # still hold node edges from the legacy layout: drop them too.
-                    legacy_node_edges += lineage_builder.pipeline_edges(
-                        storage,
-                        service_name=run.entities.service_name,
-                        project=run.entities.project,
-                        pipeline_fqn=fqn_mod.pipeline_fqn(
-                            run.entities.service_name, run.entities.project, str(cfg.get("id"))
-                        ),
-                    )
-                if config.write_column_lineage:
-                    edges += self._column_edges_for(run, cfg, edge_pipeline_fqn, column_result, report)
+                        legacy_node_edges += storage_edges.node_edges
         edges = lineage_builder.merge_edges(edges)
         if config.write_bucket_lineage:
             edges += lineage_builder.bucket_edges(edges)
         self._refresh_lineage(config, om, run, report, state, edges, force=force)
         return self._delete_legacy_node_edges(om, run, legacy_node_edges)
+
+    def _storage_lineage(
+        self, config: Configuration, run: _ProjectRun, report: RunReport, component_id: str, cfg: dict, storage: dict
+    ) -> _StorageEdges:
+        """The lineage of one storage mapping of a config (its own or one row's)."""
+        pipeline_fqn = run.pipeline_fqn_by_config.get(str(cfg.get("id")))
+        # Phase B: the column-lineage engine also recovers input/output
+        # tables a transform reads/writes via a DIRECT fully-qualified SQL
+        # ref instead of a declared mapping. Parsed once here whenever ANY
+        # lineage is wanted and reused for the table edges, the column edges
+        # and the legacy pipeline-node wiring, so the SQL is never parsed twice.
+        column_result = (
+            self._column_lineage_for(run, component_id, cfg, storage)
+            if (config.write_table_lineage or config.write_pipeline_lineage or config.write_column_lineage)
+            else None
+        )
+        # The pipeline rides on each table -> table edge (lineageDetails.pipeline),
+        # so OM keeps the table -> table path its column lineage is drawn on.
+        edge_pipeline_fqn = pipeline_fqn if config.write_pipeline_lineage else None
+        edges = _StorageEdges()
+        if config.write_table_lineage:
+            edges.table_edges = lineage_builder.declared_edges(
+                storage,
+                service_name=run.entities.service_name,
+                project=run.entities.project,
+                pipeline_fqn=edge_pipeline_fqn,
+                sql_table_edges=column_result.table_edges if column_result else None,
+                sql_by_output=column_result.sql_by_output if column_result else None,
+                bucket_paths=run.bucket_paths,
+            )
+        if pipeline_fqn:
+            edges.node_edges = lineage_builder.pipeline_edges(
+                storage,
+                service_name=run.entities.service_name,
+                project=run.entities.project,
+                pipeline_fqn=pipeline_fqn,
+                bucket_paths=run.bucket_paths,
+            ) + self._inferred_input_pipeline_edges(run, storage, pipeline_fqn, column_result)
+        if config.write_column_lineage:
+            edges.column_edges = self._column_edges_for(run, cfg, edge_pipeline_fqn, column_result, report)
+        return edges
 
     def _writable_edges(self, om, run, edges: list[lineage_builder.LineageEdge]) -> list[lineage_builder.LineageEdge]:
         """The edges whose two endpoints exist in OM: cataloged this run, or found by name."""
@@ -1264,6 +1416,8 @@ class Component(ComponentBase):
             service_name=run.entities.service_name,
             project=run.entities.project,
             known_table_fqns=known_table_fqns,
+            bucket_paths=run.bucket_paths,
+            schema_buckets=run.schema_buckets,
         )
 
     def _column_edges_for(self, run: _ProjectRun, cfg: dict, pipeline_fqn, result: LineageResult | None, report):
@@ -1283,6 +1437,7 @@ class Component(ComponentBase):
             project=run.entities.project,
             pipeline_fqn=pipeline_fqn,
             column_catalog=run.column_catalog,
+            bucket_paths=run.bucket_paths,
         )
 
     def _data_app_edges_for(self, config, run, cfg, storage) -> list[lineage_builder.LineageEdge]:
@@ -1302,6 +1457,7 @@ class Component(ComponentBase):
             service_name=run.entities.service_name,
             project=run.entities.project,
             dashboard_fqn=dashboard_fqn,
+            bucket_paths=run.bucket_paths,
         )
 
     @staticmethod
@@ -1325,7 +1481,9 @@ class Component(ComponentBase):
         sids = sorted({sid for sid, _tid in result.table_edges})
         edges: list[lineage_builder.LineageEdge] = []
         for sid in sids:
-            in_fqn = fqn_mod.table_fqn_from_storage_id(run.entities.service_name, run.entities.project, sid)
+            in_fqn = fqn_mod.table_fqn_from_storage_id(
+                run.entities.service_name, run.entities.project, sid, run.bucket_paths
+            )
             if not in_fqn:
                 continue
             edges.append(

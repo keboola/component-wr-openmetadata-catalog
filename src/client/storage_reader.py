@@ -116,6 +116,10 @@ class SourceBucket:
     has_external_schema: bool = False
     source_bucket: dict | None = None
     backend: str | None = None
+    # Where the bucket's tables sit in the warehouse: [database, schema] on Snowflake,
+    # [project, dataset] on BigQuery. An external bucket's path is the customer's own
+    # schema; a linked bucket's is its source bucket's.
+    backend_path: tuple[str, ...] = ()
     branch_id: str | None = None
     # See ``SourceTable.created_by_metadata`` — same shape, same caveat.
     created_by_metadata: dict[str, str] = field(default_factory=dict)
@@ -387,6 +391,7 @@ class StorageReader:
                     has_external_schema=bool(item.get("hasExternalSchema")),
                     source_bucket=item.get("sourceBucket"),
                     backend=item.get("backend"),
+                    backend_path=tuple(str(part) for part in item.get("backendPath") or ()),
                     branch_id=branch,
                     created_by_metadata=_metadata_prefixed_values(item.get("metadata"), _CREATED_BY_PREFIX),
                 )

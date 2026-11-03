@@ -62,6 +62,7 @@ def test_list_buckets_parses_and_filters_dev_branch():
                 "name": "c-sales",
                 "stage": "out",
                 "path": "out.c-sales",
+                "backendPath": ["KBC_USE4_4214", "out.c-sales"],
                 "metadata": [{"key": "KBC.description", "value": "Sales bucket"}],
             },
             {
@@ -77,6 +78,7 @@ def test_list_buckets_parses_and_filters_dev_branch():
     assert len(buckets) == 1  # dev-branch bucket filtered out
     assert buckets[0].id == "out.c-sales"
     assert buckets[0].description == "Sales bucket"
+    assert buckets[0].backend_path == ("KBC_USE4_4214", "out.c-sales")
 
 
 def test_list_buckets_collects_created_by_metadata():

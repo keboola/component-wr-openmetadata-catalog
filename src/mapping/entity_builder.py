@@ -92,6 +92,8 @@ class EntityBuilder:
         self.project_id = project_id or "unknown"
         self.ui_base = ui_base.rstrip("/")
         self.stack_id = stack_id
+        # Bucket id -> Storage ``path`` of this project's buckets (see fqn.table_fqn_from_storage_id).
+        self.bucket_paths: dict[str, str] = {}
 
     # --------------------------------------------------------------- helpers
 
@@ -327,7 +329,7 @@ class EntityBuilder:
 
         view_source_fqn: str | None = None
         if table_type == VIEW:
-            view_source_fqn = self._view_source_fqn(table)
+            view_source_fqn = self._view_source_fqn(bucket, table)
             if view_source_fqn:
                 body["schemaDefinition"] = f"CREATE VIEW {table_fqn} AS SELECT * FROM {view_source_fqn}"
 
@@ -338,8 +340,13 @@ class EntityBuilder:
             view_source_fqn=view_source_fqn,
         )
 
-    def _view_source_fqn(self, table: SourceTable) -> str | None:
-        """FQN of a linked/shared table's source, resolved onto its owning project."""
+    def _view_source_fqn(self, bucket: SourceBucket, table: SourceTable) -> str | None:
+        """FQN of a linked/shared table's source, resolved onto its owning project.
+
+        The source is cataloged under its own bucket's Storage path: the linked
+        bucket's ``sourceBucket.path`` for a table of the source project, this
+        project's bucket paths for an alias of a table here.
+        """
         source = table.source_table or {}
         source_id = source.get("id")
         if not source_id:
@@ -347,8 +354,15 @@ class EntityBuilder:
         parts = str(source_id).split(".")
         if len(parts) < 3:
             return None
-        source_bucket_path = ".".join(parts[:2])
+        source_bucket_id = ".".join(parts[:2])
         source_table_name = ".".join(parts[2:])
         project_info = source.get("project") or {}
         source_project = project_info.get("name") or self.project
+        linked_from = bucket.source_bucket or {}
+        if linked_from.get("id") == source_bucket_id and linked_from.get("path"):
+            source_bucket_path = str(linked_from["path"])
+        elif source_project == self.project:
+            source_bucket_path = self.bucket_paths.get(source_bucket_id, source_bucket_id)
+        else:
+            source_bucket_path = source_bucket_id
         return fqn.table_fqn(self.service_name, source_project, source_bucket_path, source_table_name)

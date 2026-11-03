@@ -222,6 +222,17 @@ def test_find_user_id_by_email_matches_exact_email():
     assert params["q"] == 'email:"jakub.smagin@keboola.com"'
 
 
+def test_search_tables_asks_the_schema_in_each_case():
+    session = mock.Mock()
+    session.request.return_value = FakeResponse(200, {"hits": {"hits": [{"_source": {"name": "ORDERS"}}]}})
+    c = _client(session)
+    assert c.search_tables('OR"DERS', "Sales") == [{"name": "ORDERS"}]
+    params = session.request.call_args.kwargs["params"]
+    assert params["index"] == "table_search_index"
+    # name is analysed (any case); the schema name is a case-sensitive keyword (verified live)
+    assert params["q"] == 'name:"OR\\"DERS" AND databaseSchema.name:("SALES" OR "Sales" OR "sales")'
+
+
 def test_find_user_id_by_email_none_when_no_exact_match():
     session = mock.Mock()
     # a token match returns a user whose email only contains the query terms -> no exact hit

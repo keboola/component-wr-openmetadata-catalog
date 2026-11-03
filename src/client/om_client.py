@@ -292,6 +292,34 @@ class OMClient:
                 return source["id"]
         return None
 
+    def search_tables(self, table_name: str, schema_name: str, *, size: int = 25) -> list[dict]:
+        """Tables named ``table_name`` in a schema named ``schema_name``, in any service.
+
+        Returns each hit's ``_source`` (name, fullyQualifiedName, database,
+        databaseSchema, service, deleted). ``name`` matches in any case, but the
+        schema name is a case-sensitive keyword, so it is asked as given, upper- and
+        lower-cased (warehouses differ in how they case names). The caller must
+        check the names exactly; quotes and backslashes are escaped.
+        """
+
+        def phrase(value: str) -> str:
+            return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+        schemas = " OR ".join(phrase(s) for s in sorted({schema_name, schema_name.upper(), schema_name.lower()}))
+        response = self._request(
+            "GET",
+            "/search/query",
+            params={
+                "q": f"name:{phrase(table_name)} AND databaseSchema.name:({schemas})",
+                "index": "table_search_index",
+                "from": 0,
+                "size": size,
+                "deleted": "false",
+            },
+        )
+        hits = ((response.json() or {}).get("hits") or {}).get("hits") or []
+        return [hit.get("_source") or {} for hit in hits]
+
     def get_by_fqn(self, kind: str, fqn: str, *, fields: str | None = None) -> dict | None:
         params = {"fields": fields} if fields else None
         try:

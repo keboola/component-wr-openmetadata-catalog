@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 import sqlglot
@@ -195,25 +196,31 @@ def _build_inferred_map(
     service_name: str,
     project: str,
     known_table_fqns: set[str] | None,
+    bucket_paths: Mapping[str, str] | None = None,
+    schema_buckets: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Phase B: promote a QUALIFIED workspace key to a storage id, but only
     when the run actually cataloged it.
 
-    A qualified ref's key already *is* the Keboola storage id verbatim
-    (``db.name`` == ``stage.c-bucket.table`` for the Snowflake-validated
-    case — schema == bucket id), so ``storage_id = key``. Cross-checking its
-    derived Table FQN against ``known_table_fqns`` is what filters out CTEs,
-    workspace scratch tables and cross-project/non-cataloged refs that happen
-    to carry a dotted ``.db`` part but were never a real Storage table this
-    run saw. ``known_table_fqns=None`` disables Phase B entirely (returns
-    ``{}``), keeping every pre-Phase-B caller's behaviour unchanged.
+    A qualified ref's key is ``schema.table``. On Snowflake the schema is the
+    bucket id (``"in.c-bucket"``), so the key already is the storage id; elsewhere
+    the warehouse names the schema differently (BigQuery dataset ``in_c_bucket``,
+    an external bucket's own schema), and ``schema_buckets`` (warehouse schema ->
+    bucket id) maps it back. Cross-checking the derived Table FQN against
+    ``known_table_fqns`` is what filters out CTEs, workspace scratch tables and
+    cross-project/non-cataloged refs that happen to carry a dotted ``.db`` part
+    but were never a real Storage table this run saw. ``known_table_fqns=None``
+    disables Phase B entirely (returns ``{}``), keeping every pre-Phase-B caller's
+    behaviour unchanged.
     """
     if known_table_fqns is None:
         return {}
     inferred: dict[str, str] = {}
     for key in sorted(qualified_keys):
-        storage_id = key
-        candidate_fqn = fqn_mod.table_fqn_from_storage_id(service_name, project, storage_id)
+        # Keboola table names hold no dot, so the last dot ends the schema.
+        schema, _, table = key.rpartition(".")
+        storage_id = f"{(schema_buckets or {}).get(schema, schema)}.{table}"
+        candidate_fqn = fqn_mod.table_fqn_from_storage_id(service_name, project, storage_id, bucket_paths)
         if candidate_fqn is not None and candidate_fqn in known_table_fqns:
             inferred[key] = storage_id
     return inferred
@@ -228,6 +235,8 @@ def extract_column_lineage(
     service_name: str = "",
     project: str = "",
     known_table_fqns: set[str] | None = None,
+    bucket_paths: Mapping[str, str] | None = None,
+    schema_buckets: Mapping[str, str] | None = None,
 ) -> LineageResult:
     """Extract resolved column/table lineage for one transformation config.
 
@@ -244,15 +253,18 @@ def extract_column_lineage(
         project: Keboola project name — see ``service_name``.
         known_table_fqns: the run's cataloged Table FQNs. When given, a
             transformation that reads/writes a table via a DIRECT
-            fully-qualified SQL ref (Snowflake: ``"PROJDB"."in.c-bucket"."t"``,
-            schema == bucket id — the validated dialect; other warehouses may
-            name schemas differently and are not yet mapped, so a qualified
-            ref there simply never matches and is recorded as unresolved,
-            never raised) is recovered as an input/output the same as a
+            fully-qualified SQL ref (Snowflake: ``"PROJDB"."in.c-bucket"."t"``;
+            BigQuery: ``project.in_c_bucket.t``, mapped through
+            ``schema_buckets``) is recovered as an input/output the same as a
             declared one, provided the ref resolves onto a table this run
-            actually cataloged. ``None`` (the default) disables this
-            inference outright — pure declared-mapping resolution, matching
-            every pre-Phase-B call site.
+            actually cataloged; one that does not is recorded as unresolved,
+            never raised. ``None`` (the default) disables this inference
+            outright — pure declared-mapping resolution, matching every
+            pre-Phase-B call site.
+        bucket_paths: bucket id -> the Storage ``path`` its tables are
+            cataloged under (see ``fqn.table_fqn_from_storage_id``).
+        schema_buckets: warehouse schema name -> bucket id, for qualified
+            refs whose schema is not the bucket id.
     """
     result = LineageResult()
     if not dialect.is_sql:
@@ -288,8 +300,12 @@ def extract_column_lineage(
     # declared one is spread second so its entries overwrite the inferred
     # ones (spec: "declared mappings stay authoritative; inference only fills
     # gaps").
-    inferred_in_map = _build_inferred_map(graph.qualified_sources, service_name, project, known_table_fqns)
-    inferred_out_map = _build_inferred_map(graph.qualified_targets, service_name, project, known_table_fqns)
+    inferred_in_map = _build_inferred_map(
+        graph.qualified_sources, service_name, project, known_table_fqns, bucket_paths, schema_buckets
+    )
+    inferred_out_map = _build_inferred_map(
+        graph.qualified_targets, service_name, project, known_table_fqns, bucket_paths, schema_buckets
+    )
     effective_in_map = {**inferred_in_map, **in_map}
     effective_out_map = {**inferred_out_map, **out_map}
 

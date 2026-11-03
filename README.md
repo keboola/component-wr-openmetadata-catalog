@@ -76,18 +76,17 @@ Settings → Preferences → Lineage.
 
 | Lineage | Captured | Source of truth |
 |---|---|---|
-| Table → table inside a project | Yes | Input/output mapping; for SQL transformations the parsed SQL narrows each output to the inputs it really reads |
+| Table → table inside a project | Yes | Input/output mapping of the configuration and of each enabled row; for SQL transformations the parsed SQL narrows each output to the inputs it really reads |
 | Column → column | Yes, SQL transformations (Snowflake, BigQuery, …) | SQL parsed with SQLGlot; unresolved columns are listed in `catalog_run_report` |
-| Extractor → its tables | Yes, also for extractors with no output mapping (DB extractors write through `outputTable`) | Output mapping; else the table's `KBC.lastUpdatedBy` Storage metadata |
-| SQL that reads a table without an input mapping | Yes, for Snowflake-style `"stage.c-bucket"."table"` references to tables cataloged in the same run | Parsed SQL |
+| Extractor → its tables, table → writer | Yes, also when the mapping is on the configuration rows, and for extractors with no output mapping (DB extractors write through `outputTable`) | Output/input mapping; else the table's `KBC.lastUpdatedBy` Storage metadata |
+| SQL that reads a table without an input mapping | Yes, for tables cataloged in the same run: Snowflake `"stage.c-bucket"."table"`, BigQuery `project.dataset.table`, and an external bucket's own schema | Parsed SQL; bucket `backendPath` |
 | Shared / linked bucket → source project | Yes, as a View with 1:1 column lineage, when the source project is cataloged into the same service (a row for it, with no Project Name Override) | Bucket link metadata |
+| External bucket → its source table in BigQuery / Snowflake | Yes, with 1:1 column lineage, when OpenMetadata catalogs that warehouse in another service (found by database, schema and table name). Not found → `unresolved` in `catalog_run_report`; a source cataloged later is linked on the next full refresh | Bucket `backendPath` |
 | Bucket → bucket | Yes, aggregated from table lineage | — |
 | Flow → its tasks | Yes, pipeline → pipeline | Flow definition |
 | Table → data app | Yes | Data app input mapping |
+| Source system → extractor | The extractor → table part, yes (row above). The source database table itself (e.g. a MySQL table) is not drawn: catalog that database in OpenMetadata with its own connector | — |
 | Data app code / Git-hosted apps | No — the writer cannot read app code | — |
-| External bucket → BigQuery / Snowflake source table | Not yet | — |
-| Source system → extractor output (e.g. MySQL table → Keboola table) | Not yet | — |
-| BigQuery fully-qualified names in SQL (`project.dataset.table`) without an input mapping | Not yet | — |
 
 Settings reference
 ==================
@@ -177,6 +176,10 @@ Version 0.2 changes what an existing configuration writes on its next run:
 - **SSH tunnel** now works: before, every tunnel failed (an incompatible SSH
   library, the private key not being used, and TLS sent to `127.0.0.1` instead of
   the OpenMetadata host).
+- **More lineage**: mappings on configuration rows (most DB writers and many
+  extractors), tables read from a linked bucket, BigQuery `project.dataset.table`
+  references in SQL and external buckets now get lineage edges. Before, they
+  had none, or an edge to a table that did not exist.
 - **Flows migrated from orchestrations**: when a legacy orchestration and its
   migrated flow share an id, only the flow is cataloged.
 - The first run re-writes every bucket and every lineage edge once (the catalog
