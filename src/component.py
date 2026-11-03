@@ -110,8 +110,8 @@ class CredentialScrubber(BaseSanitizer):
     # of Keboola ``{"key": ..., "value": ...}`` metadata entries — its value is a
     # metadata key *name* (e.g. ``KBC.description``, ``KBC.datatype.type``), not a
     # secret. Redacting it corrupts every metadata key name in a recorded response, so
-    # replay can no longer find ``KBC.description`` / ``KBC.datatype.*`` and descriptions
-    # and legacy datatypes silently vanish. A real secret sitting under a bare ``key``
+    # replay can no longer find ``KBC.description`` / ``KBC.datatype.*`` and bucket
+    # descriptions and legacy datatypes silently vanish. A real secret sitting under a bare ``key``
     # field is still caught by the value-shape rules (PEM block, AWS key id).
     _NAME_ALLOWLIST: ClassVar[frozenset[str]] = frozenset({"primarykey", "key"})
 
