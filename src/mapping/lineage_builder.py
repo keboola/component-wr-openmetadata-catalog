@@ -91,12 +91,14 @@ def declared_edges(
     project: str,
     pipeline_fqn: str | None = None,
     sql_table_edges: set[tuple[str, str]] | None = None,
+    sql_by_output: dict[str, str] | None = None,
 ) -> list[LineageEdge]:
     """E16: table -> table edges for one config, its pipeline attached to each edge.
 
     The pipeline rides on the edge (``lineageDetails.pipeline``) instead of being a
     node between the tables, so OpenMetadata keeps the table -> table path that
-    column-level lineage is drawn on.
+    column-level lineage is drawn on. ``sql_by_output`` (output storage id -> the
+    statements that build it) becomes the edge's SQL query.
 
     Edges are the coarse all-declared-inputs x all-declared-outputs product, plus
     ``sql_table_edges``: the ``(input, output)`` storage-id pairs the SQL parser
@@ -125,6 +127,7 @@ def declared_edges(
                 to_fqn=dest_fqn,
                 source=SOURCE_PIPELINE,
                 pipeline_fqn=pipeline_fqn,
+                sql_query=(sql_by_output or {}).get(dest_id),
             )
         )
     return edges
@@ -136,7 +139,8 @@ def merge_edges(edges: list[LineageEdge]) -> list[LineageEdge]:
     OpenMetadata stores one edge per (from, to) pair; a second ``PUT /lineage`` for
     the pair replaces the first one's details. So a coarse declared edge must not
     overwrite the column-level edge for the same pair: the column-bearing edge wins,
-    and column mappings from several edges of one pair are unioned. First-seen
+    and column mappings from several edges of one pair are unioned. The SQL query
+    is kept from whichever edge of the pair carries one. First-seen
     order is kept, so the output is a stable function of the input.
     """
     merged: dict[tuple[str, str, str, str], LineageEdge] = {}
@@ -147,8 +151,15 @@ def merge_edges(edges: list[LineageEdge]) -> list[LineageEdge]:
             merged[key] = edge
             continue
         if edge.columns_lineage and not kept.columns_lineage:
-            merged[key] = dataclasses.replace(edge, pipeline_fqn=edge.pipeline_fqn or kept.pipeline_fqn)
-        elif edge.columns_lineage:
+            merged[key] = dataclasses.replace(
+                edge,
+                pipeline_fqn=edge.pipeline_fqn or kept.pipeline_fqn,
+                sql_query=edge.sql_query or kept.sql_query,
+            )
+            continue
+        if not kept.sql_query and edge.sql_query:
+            kept.sql_query = edge.sql_query
+        if edge.columns_lineage:
             known = {(tuple(c["fromColumns"]), c["toColumn"]) for c in kept.columns_lineage}
             kept.columns_lineage = kept.columns_lineage + [
                 c for c in edge.columns_lineage if (tuple(c["fromColumns"]), c["toColumn"]) not in known
@@ -330,6 +341,7 @@ def _table_level_fallbacks(
     catalog: dict[str, set[str]],
     temp: list[str],
     pipeline_fqn: str | None,
+    sql_by_fqn: dict[str, str],
 ) -> list[LineageEdge]:
     """Degrade pairs that lost ALL their column mappings.
 
@@ -355,6 +367,7 @@ def _table_level_fallbacks(
                     source=SOURCE_QUERY,
                     temp_lineage_tables=temp,
                     pipeline_fqn=pipeline_fqn,
+                    sql_query=sql_by_fqn.get(to_tbl_fqn),
                 )
             )
         else:
@@ -386,6 +399,7 @@ def column_edges(
     ``column_catalog=None`` disables the check (legacy behaviour: emit every mapping).
     """
     grouped: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    sql_by_fqn: dict[str, str] = {}
     seen_pairs: set[tuple[str, str]] = set()
     # ``column_edges`` is a set; iterate it in stable ColumnEdge sort order so the
     # emitted PUT /lineage payloads (edge order, columnsLineage order) and the
@@ -399,6 +413,8 @@ def column_edges(
         if _is_self_loop(from_tbl_fqn, to_tbl_fqn, SOURCE_QUERY):
             continue
         seen_pairs.add((from_tbl_fqn, to_tbl_fqn))
+        if edge.to_table in result.sql_by_output:
+            sql_by_fqn[to_tbl_fqn] = result.sql_by_output[edge.to_table]
         if column_catalog is not None and not _column_ref_valid(
             column_catalog, from_tbl_fqn, edge.from_column, to_tbl_fqn, edge.to_column
         ):
@@ -428,11 +444,12 @@ def column_edges(
             columns_lineage=cols,
             temp_lineage_tables=temp,
             pipeline_fqn=pipeline_fqn,
+            sql_query=sql_by_fqn.get(to_tbl_fqn),
         )
         for (from_tbl_fqn, to_tbl_fqn), cols in grouped.items()
     ]
     if column_catalog is not None:
-        edges += _table_level_fallbacks(seen_pairs, grouped, column_catalog, temp, pipeline_fqn)
+        edges += _table_level_fallbacks(seen_pairs, grouped, column_catalog, temp, pipeline_fqn, sql_by_fqn)
     return edges
 
 

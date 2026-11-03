@@ -1713,6 +1713,100 @@ def test_extractor_without_inputs_keeps_its_pipeline_as_a_node():
     assert put_pairs == {("id-ex1", "id-orders")}
 
 
+class _UnmappedExtractorReader:
+    """A DB extractor that writes through ``outputTable``: no storage output mapping."""
+
+    def list_component_configs(self):
+        return [
+            {
+                "id": "keboola.ex-db-mysql",
+                "type": "extractor",
+                "configurations": [
+                    {
+                        "id": "ex1",
+                        "name": "MySQL",
+                        "configuration": {"parameters": {"outputTable": "in.c-db.orders"}},
+                    }
+                ],
+            }
+        ]
+
+
+def _unmapped_extractor_run():
+    svc, proj, pid = "keboola-stack", "Acme_Project", "4214"
+    run = _ProjectRun(
+        ctx=ProjectContext(project_id=pid, project_name=proj, storage_token="t", storage_url="https://s"),
+        reader=_UnmappedExtractorReader(),  # ty: ignore[invalid-argument-type]  (duck-typed test double)
+        entities=EntityBuilder(svc, proj, pid, "https://ui.example"),
+        pipelines=PipelineBuilder(svc, proj, pid, "https://ui.example"),
+        dashboards=DashboardBuilder(svc, proj, pid, "https://ui.example"),
+    )
+    bucket = SourceBucket(id="in.c-db", name="c-db", stage="in", path="in.c-db")
+    table = SourceTable(id="in.c-db.orders", name="orders", producer=("keboola.ex-db-mysql", "ex1"))
+    component_mod.Component._record_producer(run, bucket, table)
+    return run, svc, proj
+
+
+def test_extractor_without_output_mapping_is_found_from_table_metadata():
+    """Its tables' ``KBC.lastUpdatedBy`` metadata names it: it gets a pipeline, and
+    the pipeline -> table edge its outputs."""
+    run, svc, proj = _unmapped_extractor_run()
+    om = _PipelineRecordingOM()
+    config = SimpleNamespace(
+        parallel_requests=1,
+        custom_properties=CustomPropertiesMode.CREATE,
+        write_transformations=True,
+        transformations=[],
+        write_components=True,
+        components=[],
+        write_flows=True,
+        flows=[],
+        write_pipeline_status=False,
+    )
+    comp = component_mod.Component.__new__(component_mod.Component)
+    comp._pipeline_pass(
+        config,  # ty: ignore[invalid-argument-type]  (duck-typed test double)
+        om,  # ty: ignore[invalid-argument-type]  (duck-typed test double)
+        run,
+        SnapshotStore(),
+        component_mod.RunReport(run_id="rid"),
+        ThreeWayMerger(MergeMode.THREE_WAY_MERGE),
+        env={"url": None},
+    )
+    assert {body["extension"]["kbcConfigId"] for body in om.pipeline_bodies.values()} == {"ex1"}
+
+    pipeline_fqn = run.pipeline_fqn_by_config["ex1"]
+    lineage_om = _LineageRecordingOM({_storage_fqn(svc, proj, "in.c-db.orders"): "id-orders", pipeline_fqn: "id-ex1"})
+    lineage_config = SimpleNamespace(
+        parallel_requests=1,
+        pipeline_lineage_as_node=False,
+        write_table_lineage=True,
+        write_pipeline_lineage=True,
+        write_column_lineage=False,
+        write_bucket_lineage=False,
+    )
+    comp._lineage_pass(lineage_config, lineage_om, run, component_mod.RunReport(run_id="rid"), StateManager())  # ty: ignore[invalid-argument-type]
+    put_pairs = {(r["edge"]["fromEntity"]["id"], r["edge"]["toEntity"]["id"]) for r in lineage_om.put_calls}
+    assert put_pairs == {("id-ex1", "id-orders")}
+
+
+def test_linked_bucket_tables_name_no_producer_here():
+    """A linked bucket's metadata names a config of the source project."""
+    run, _, _ = _unmapped_extractor_run()
+    linked = SourceBucket(id="in.c-shared", name="c-shared", source_bucket={"id": "in.c-db"})
+    table = SourceTable(id="in.c-shared.orders", name="orders", producer=("keboola.ex-db-mysql", "ex1"))
+    component_mod.Component._record_producer(run, linked, table)
+    alias = SourceTable(id="in.c-db.alias", name="alias", is_alias=True, producer=("keboola.ex-db-mysql", "ex1"))
+    component_mod.Component._record_producer(run, SourceBucket(id="in.c-db", name="c-db"), alias)
+    assert run.produced_tables == {("keboola.ex-db-mysql", "ex1"): {"in.c-db.orders"}}
+
+
+def test_list_components_offers_an_extractor_without_output_mapping(tmp_path, monkeypatch, _env):
+    monkeypatch.setenv("KBC_DATADIR", _make_datadir(tmp_path, BASE_PARAMS))
+    monkeypatch.setattr(component_mod, "StorageReader", lambda *a, **k: _UnmappedExtractorReader())
+    assert [e.value for e in component_mod.Component().list_components()] == ["ex1"]
+
+
 def _one_config_lineage_run(configuration: dict, *, pipeline_fqn: str | None):
     svc, proj, pid = "keboola-stack", "Acme_Project", "4214"
 

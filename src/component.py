@@ -329,6 +329,9 @@ class _ProjectRun:
     # column an endpoint table lacks (empty-stub tables map to an empty set).
     column_catalog: dict[str, set[str]] = field(default_factory=dict)
     pipeline_fqn_by_config: dict[str, str] = field(default_factory=dict)
+    # (component id, config id) -> storage ids of the cataloged tables Storage
+    # metadata says it last wrote; the outputs of a config with no output mapping.
+    produced_tables: dict[tuple[str, str], set[str]] = field(default_factory=dict)
     # Data-app config id -> its Dashboard FQN, recorded by the dashboard pass so the
     # lineage pass can attach table -> dashboard edges to the entity it just wrote.
     dashboard_fqn_by_config: dict[str, str] = field(default_factory=dict)
@@ -705,6 +708,7 @@ class Component(ComponentBase):
                     )
                     run.seen_table_fqns.add(table_fqn)
                     self._record_column_catalog(run, table_fqn, table)
+                    self._record_producer(run, bucket, table)
                 return
 
             # Re-written this run: its schema is a valid tombstone scope. An unchanged
@@ -734,6 +738,7 @@ class Component(ComponentBase):
                 )
                 run.seen_table_fqns.add(built.fqn)
                 self._record_column_catalog(run, built.fqn, table)
+                self._record_producer(run, bucket, table)
                 ok = self._upsert(
                     om,
                     run,
@@ -775,6 +780,13 @@ class Component(ComponentBase):
         a column the endpoint table does not actually hold (OM 400).
         """
         run.column_catalog[table_fqn] = {fqn_mod.sanitize_name(col.name) for col in table.columns}
+
+    @staticmethod
+    def _record_producer(run: _ProjectRun, bucket: SourceBucket, table: SourceTable) -> None:
+        # A linked bucket or an alias holds another project's (or table's) data: its
+        # producer metadata names a config that does not write it here.
+        if table.producer and bucket.source_bucket is None and not table.is_alias:
+            run.produced_tables.setdefault(table.producer, set()).add(table.id)
 
     @staticmethod
     def _bucket_in_scope(config: Configuration, bucket: SourceBucket) -> bool:
@@ -842,7 +854,9 @@ class Component(ComponentBase):
             for cfg in component.get("configurations") or []:
                 if component_id == FLOW_COMPONENT_ID:
                     flow_ids.add(str(cfg.get("id")))
-                if kind != "orchestration" and not self._is_producing(cfg):
+                if kind != "orchestration" and not (
+                    self._is_producing(cfg) or self._produced_outputs(run, component_id, kind, cfg)
+                ):
                     continue
                 if self._pipeline_config_in_scope(config, kind, str(cfg.get("id"))):
                     selected.append((component_id, kind, cfg))
@@ -940,6 +954,19 @@ class Component(ComponentBase):
     def _is_producing(cfg: dict) -> bool:
         storage = (cfg.get("configuration") or {}).get("storage") or {}
         return bool((storage.get("output") or {}).get("tables") or (storage.get("input") or {}).get("tables"))
+
+    @staticmethod
+    def _produced_outputs(run: _ProjectRun, component_id: str, kind: str, cfg: dict) -> list[str]:
+        """The tables a config without an output mapping writes, per Storage metadata.
+
+        A DB extractor writes through its own parameters (``outputTable``), so only the
+        tables' ``KBC.lastUpdatedBy`` metadata names it. A declared output mapping wins,
+        and a transformation's outputs come from its mapping and SQL.
+        """
+        storage = (cfg.get("configuration") or {}).get("storage") or {}
+        if kind in ("transformation", "orchestration", "data_app") or (storage.get("output") or {}).get("tables"):
+            return []
+        return sorted(run.produced_tables.get((component_id, str(cfg.get("id"))), ()))
 
     def _push_pipeline_status(self, run, pipeline_fqn, component_id, cfg, om, report) -> None:
         if not run.ctx.storage_url:
@@ -1073,6 +1100,10 @@ class Component(ComponentBase):
                 # per config row, not at the top level) is not read here — Phase A
                 # scope is the top-level configuration.storage only; a follow-up.
                 storage = (cfg.get("configuration") or {}).get("storage") or {}
+                produced = self._produced_outputs(run, component_id, kind, cfg)
+                if produced:
+                    output = {**(storage.get("output") or {}), "tables": [{"destination": t} for t in produced]}
+                    storage = {**storage, "output": output}
                 if kind == "data_app":
                     edges += self._data_app_edges_for(config, run, cfg, storage)
                     continue  # a data app is a Dashboard: upstream table -> app, no table -> table
@@ -1105,6 +1136,7 @@ class Component(ComponentBase):
                         project=run.entities.project,
                         pipeline_fqn=edge_pipeline_fqn,
                         sql_table_edges=column_result.table_edges if column_result else None,
+                        sql_by_output=column_result.sql_by_output if column_result else None,
                     )
                     if config.write_table_lineage
                     else []
@@ -1877,9 +1909,9 @@ class Component(ComponentBase):
             kind = component_kind(component_id, component.get("type"))
             if kind in ("transformation", "orchestration", "data_app"):
                 continue
+            # Not filtered by storage mappings: a DB extractor writes through its own
+            # parameters, and the run finds its tables from Storage metadata.
             for cfg in component.get("configurations") or []:
-                if not self._is_producing(cfg):
-                    continue
                 name = cfg.get("name") or str(cfg.get("id"))
                 elements.append(SelectElement(value=str(cfg.get("id")), label=f"{component_id} / {name}"))
         return elements

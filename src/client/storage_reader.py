@@ -98,6 +98,10 @@ class SourceTable:
     # ``mapping.entity_builder``. Excluded from the incremental digest (spec:
     # ``sync.digest_fields``) since it never changes after creation.
     created_by_metadata: dict[str, str] = field(default_factory=dict)
+    # (component id, configuration id) of the config that last wrote the table, from
+    # ``KBC.lastUpdatedBy.*`` (else ``KBC.createdBy.*``). Names the producer of a table
+    # that no output mapping declares, e.g. a DB extractor's ``outputTable``.
+    producer: tuple[str, str] | None = None
 
 
 @dataclass
@@ -121,6 +125,16 @@ def _metadata_value(entries: list | None, key: str) -> str | None:
     for entry in entries or []:
         if isinstance(entry, dict) and entry.get("key") == key:
             return entry.get("value")
+    return None
+
+
+def _producer(entries: list | None) -> tuple[str, str] | None:
+    """The (component id, configuration id) that last wrote a table, if Storage recorded one."""
+    for prefix in ("KBC.lastUpdatedBy.", _CREATED_BY_PREFIX):
+        component_id = _metadata_value(entries, f"{prefix}component.id")
+        config_id = _metadata_value(entries, f"{prefix}configuration.id")
+        if component_id and config_id:
+            return component_id, config_id
     return None
 
 
@@ -440,6 +454,7 @@ class StorageReader:
             source_table=raw.get("sourceTable"),
             branch_id=branch,
             created_by_metadata=_metadata_prefixed_values(raw.get("metadata"), _CREATED_BY_PREFIX),
+            producer=_producer(raw.get("metadata")),
         )
 
     @staticmethod

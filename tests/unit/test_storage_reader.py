@@ -396,3 +396,24 @@ def test_config_listing_retries_a_broken_download():
     ]
     reader = StorageReader("https://connection.keboola.com", "tok", session=session, backoff_base=0)
     assert [c["id"] for c in reader.list_component_configs()] == ["keboola.ex-db-mysql"]
+
+
+def test_table_producer_is_the_config_that_last_wrote_it():
+    """A DB extractor writes through ``outputTable``: only Storage metadata names it."""
+
+    def meta(prefix, component, config):
+        return [
+            {"key": f"{prefix}component.id", "value": component},
+            {"key": f"{prefix}configuration.id", "value": config},
+        ]
+
+    reader = StorageReader("https://connection.keboola.com", "tok", session=mock.Mock())
+    created = meta("KBC.createdBy.", "keboola.ex-db-mysql", "100")
+    updated = meta("KBC.lastUpdatedBy.", "keboola.ex-db-mysql", "200")
+
+    assert reader._parse_table({"id": "in.c-db.t", "metadata": created + updated}).producer == (
+        "keboola.ex-db-mysql",
+        "200",
+    )
+    assert reader._parse_table({"id": "in.c-db.t", "metadata": created}).producer == ("keboola.ex-db-mysql", "100")
+    assert reader._parse_table({"id": "in.c-db.t", "metadata": []}).producer is None

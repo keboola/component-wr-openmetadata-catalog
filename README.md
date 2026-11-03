@@ -67,10 +67,18 @@ pipeline made the change. An extractor (output tables only) or a writer (input
 tables only) has no table → table edge, so it is shown as a node: extractor →
 table, or table → writer.
 
+For a SQL transformation, the edge's **SQL Query** holds the statements that build
+its output table, including those that build the temporary tables it reads.
+
+Column-level lineage is drawn only when the **Column** layer is on (Layers, bottom
+left of the lineage view). An OpenMetadata admin can make it the default in
+Settings → Preferences → Lineage.
+
 | Lineage | Captured | Source of truth |
 |---|---|---|
 | Table → table inside a project | Yes | Input/output mapping; for SQL transformations the parsed SQL narrows each output to the inputs it really reads |
 | Column → column | Yes, SQL transformations (Snowflake, BigQuery, …) | SQL parsed with SQLGlot; unresolved columns are listed in `catalog_run_report` |
+| Extractor → its tables | Yes, also for extractors with no output mapping (DB extractors write through `outputTable`) | Output mapping; else the table's `KBC.lastUpdatedBy` Storage metadata |
 | SQL that reads a table without an input mapping | Yes, for Snowflake-style `"stage.c-bucket"."table"` references to tables cataloged in the same run | Parsed SQL |
 | Shared / linked bucket → source project | Yes, as a View with 1:1 column lineage, when the source project is cataloged into the same service (a row for it, with no Project Name Override) | Bucket link metadata |
 | Bucket → bucket | Yes, aggregated from table lineage | — |

@@ -47,6 +47,9 @@ class LineageResult:
     temp_lineage_tables: set[str] = field(default_factory=set)
     metrics: CoverageMetrics = field(default_factory=CoverageMetrics)
     unresolved_notes: list[str] = field(default_factory=list)
+    # Output storage table id -> the statements that build it, in script order: its
+    # own writes plus those of the workspace intermediates it is built from.
+    sql_by_output: dict[str, str] = field(default_factory=dict)
 
 
 def _has_column_ref(node: exp.Expression) -> bool:
@@ -78,6 +81,8 @@ class _WorkspaceGraph:
         # are built (see ``_build_inferred_map`` / ``extract_column_lineage``).
         self.qualified_sources: set[str] = set()
         self.qualified_targets: set[str] = set()
+        # (workspace target key, statement SQL) of every CREATE-AS / INSERT, in script order.
+        self.writes: list[tuple[str, str]] = []
 
 
 def _table_key(tbl: exp.Table) -> str:
@@ -268,6 +273,8 @@ def extract_column_lineage(
             select, tgt_tbl, explicit = _select_and_target(tree, graph)
             if select is None:
                 continue
+            if tgt_tbl:
+                graph.writes.append((tgt_tbl, tree.sql(dialect=dialect.sqlglot_dialect, pretty=True)))
             first = select.find(exp.Select) if isinstance(select, exp.Union) else select
             projections = first.expressions if first is not None else []
             tgt_cols = explicit or graph.ws_schema.get(tgt_tbl or "", [])
@@ -365,6 +372,35 @@ def _resolve_to_storage(
                 if out_kind == "output" and s_id != out_id:
                     _add_column_edge(result, s_id, s_col, out_id, out_col)
                     result.temp_lineage_tables.add(mid_tbl)
+
+    _collect_output_sql(graph, in_map, out_map, result)
+
+
+def _collect_output_sql(
+    graph: _WorkspaceGraph,
+    in_map: dict[str, str],
+    out_map: dict[str, str],
+    result: LineageResult,
+) -> None:
+    """Record, per output table, the statements that write it or an intermediate it reads."""
+    pred: dict[str, set[str]] = defaultdict(set)
+    for s, t in graph.table_edges:
+        if t:
+            pred[t].add(s)
+    scopes: dict[str, set[str]] = defaultdict(set)
+    for key in {target for target, _ in graph.writes}:
+        out_id, kind = _classify(key, in_map, out_map)
+        if kind != "output":
+            continue
+        scope, stack = {key}, [key]
+        while stack:
+            for upstream in pred.get(stack.pop(), ()):
+                if upstream not in scope and _classify(upstream, in_map, out_map)[1] == "intermediate":
+                    scope.add(upstream)
+                    stack.append(upstream)
+        scopes[out_id] |= scope
+    for out_id, scope in scopes.items():
+        result.sql_by_output[out_id] = ";\n\n".join(sql for target, sql in graph.writes if target in scope) + ";"
 
 
 def _reachable_outputs(

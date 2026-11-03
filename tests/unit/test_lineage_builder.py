@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 import os
 import subprocess
@@ -385,6 +386,62 @@ def test_e17_end_to_end_sql_to_add_lineage_request():
         "keboola-stack.Acme_Project.out_c-sales.result.id",
         "keboola-stack.Acme_Project.out_c-sales.result.total",
     }
+
+
+def test_edge_carries_the_sql_that_builds_its_target():
+    """The edge shows the statements that build its target: the target's own write
+    plus the write of the intermediate it reads, in script order. A statement that
+    builds another output is left out."""
+    statements = [
+        ("load_stg", 'CREATE TABLE "stg" AS SELECT "id", "amount" FROM "src"'),
+        ("build_other", 'CREATE TABLE "other" AS SELECT "id" FROM "src"'),
+        ("build_result", 'INSERT INTO "result" SELECT "id", "amount" AS "total" FROM "stg"'),
+    ]
+    result = extract_column_lineage(
+        statements,
+        in_map={"src": "in.c-main.orders"},
+        out_map={"result": "out.c-sales.result", "other": "out.c-sales.other"},
+        dialect=SNOW,
+    )
+    result_sql = result.sql_by_output["out.c-sales.result"]
+    assert result_sql.index('"stg"') < result_sql.index('INSERT INTO "result"')
+    assert '"other"' not in result_sql
+    assert result.sql_by_output["out.c-sales.other"].startswith('CREATE TABLE "other"')
+
+    catalog = {
+        "keboola-stack.Acme_Project.in_c-main.orders": {"id", "amount"},
+        "keboola-stack.Acme_Project.out_c-sales.result": {"id", "total"},
+        "keboola-stack.Acme_Project.out_c-sales.other": {"id"},
+    }
+    edges = column_edges(result, service_name=SVC, project=PROJ, column_catalog=catalog)
+    by_target = {e.to_fqn: e for e in edges}
+    edge = by_target["keboola-stack.Acme_Project.out_c-sales.result"]
+    assert edge.sql_query == result_sql
+    req = to_add_lineage_request(edge, _resolver({edge.from_fqn: "id-src", edge.to_fqn: "id-result"}))
+    assert req is not None
+    assert req["edge"]["lineageDetails"]["sqlQuery"] == result_sql
+
+
+def test_declared_edge_carries_the_sql_of_its_output():
+    storage = {
+        "input": {"tables": [{"source": "in.c-main.orders"}]},
+        "output": {"tables": [{"destination": "out.c-sales.result"}, {"destination": "out.c-sales.raw"}]},
+    }
+    edges = declared_edges(
+        storage, service_name=SVC, project=PROJ, sql_by_output={"out.c-sales.result": 'SELECT 1 AS "x";'}
+    )
+    sql = {e.to_fqn.rsplit(".", 1)[-1]: e.sql_query for e in edges}
+    assert sql == {"result": 'SELECT 1 AS "x";', "raw": None}
+
+
+def test_merge_keeps_the_sql_of_either_edge_of_a_pair():
+    columns = [{"fromColumns": ["a.t.c"], "toColumn": "b.t.c"}]
+    with_sql = LineageEdge(from_fqn="a.t", to_fqn="b.t", source=SOURCE_PIPELINE, sql_query="SELECT 1;")
+    with_columns = LineageEdge(from_fqn="a.t", to_fqn="b.t", source=SOURCE_QUERY, columns_lineage=columns)
+    for edges in ([with_sql, with_columns], [with_columns, with_sql]):
+        [merged] = merge_edges([dataclasses.replace(e) for e in edges])
+        assert merged.columns_lineage == columns
+        assert merged.sql_query == "SELECT 1;"
 
 
 # --------------------------------------------------------------------------
