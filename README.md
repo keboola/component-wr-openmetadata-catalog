@@ -108,7 +108,7 @@ Row (one Keboola project)
 | Setting | What it does |
 |---|---|
 | Storage Token | Empty = the configuration's own project; otherwise a read-only Storage token of another project on the same stack. |
-| Project Name Override | Name of the project's Database (and of its pipeline/dashboard services) in OpenMetadata. Default: the Keboola project name. |
+| Project Name Override | Name of the project's Database (and of its pipeline/dashboard services) in OpenMetadata. Default: the Keboola project name. Two projects whose names map to the same Database — the same name, or names that differ only in characters an FQN cannot hold, such as `[CF] Sales` and `(CF) Sales` — would overwrite each other, so the second one stops with an error that names the other project: set an override on one of them. |
 | Objects | Which families to catalog — buckets, transformations, components, flows, data apps — each with an optional "only these" selector (empty = all). |
 | Advanced → Lineage | One switch per lineage type: bucket, table, column, pipeline (pipeline on the edge + flow → task lineage), dashboard. **Pipeline as lineage node (legacy)** also draws each pipeline as its own node between the tables; off by default. |
 | Write Pipeline Status | Push each pipeline's latest job result (success, failure, still running) as its OpenMetadata pipeline status; a flow also gets the result of each task. |

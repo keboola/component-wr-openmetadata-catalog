@@ -98,6 +98,14 @@ from sync import (
 logger = logging.getLogger(__name__)
 
 
+class ProjectNameCollision(UserException):
+    """Two Keboola projects map onto one OpenMetadata Database; the run must stop."""
+
+
+# The Keboola project id in a Database's sourceUrl (``.../admin/projects/<id>/storage``).
+_PROJECT_ID_IN_URL = re.compile(r"/projects/(\d+)(?:/|$)")
+
+
 class CredentialScrubber(BaseSanitizer):
     """Recursive, name-agnostic scrubber for *foreign* credentials in bodies.
 
@@ -718,6 +726,7 @@ class Component(ComponentBase):
             snapshot,
             report,
             merger,
+            check_current=lambda current: self._check_database_owner(run, database_fqn, current),
         )
 
         if not config.write_buckets:
@@ -858,6 +867,26 @@ class Component(ComponentBase):
         self._parallel(config, view_edges, write_view_edge, report)
         external_tables.sort(key=lambda item: item[2])
         self._parallel(config, external_tables, write_external_edge, report)
+
+    @staticmethod
+    def _check_database_owner(run: _ProjectRun, database_fqn: str, existing: dict | None) -> None:
+        """Stop when the project's Database already belongs to another Keboola project.
+
+        The Database is named after the project, so two projects with the same name,
+        or names that differ only in characters an FQN cannot hold ("[CF] Sales" and
+        "(CF) Sales"), map onto one Database. Their runs would overwrite each other's
+        entities, and each would tombstone the other's tables in a bucket of the same
+        name. The owner is the project id in the Database's ``sourceUrl``, which every
+        release has written; a Database without one is taken over as before.
+        """
+        match = _PROJECT_ID_IN_URL.search(str((existing or {}).get("sourceUrl") or ""))
+        if match and match.group(1) != str(run.ctx.project_id):
+            raise ProjectNameCollision(
+                f'OpenMetadata database "{database_fqn}" already belongs to Keboola project {match.group(1)}, '
+                f'whose name maps to the same database as project {run.ctx.project_id} ("{run.ctx.project_name}"). '
+                "Set a Project Name Override on this row, or a different Service Name when the other project "
+                "is on another Keboola stack. Nothing was written for this project."
+            )
 
     def _external_source_edge(
         self,
@@ -1942,10 +1971,29 @@ class Component(ComponentBase):
             current = {**current, **{k: v for k, v in extra.items() if k in ("extension", "owners")}}
         return current
 
-    def _upsert(self, om, run, kind, entity_type, entity_fqn, desired, owned_fields, snapshot, report, merger) -> bool:
-        """Create-or-merge one entity; returns True on success (for advance-after-success)."""
+    def _upsert(
+        self,
+        om,
+        run,
+        kind,
+        entity_type,
+        entity_fqn,
+        desired,
+        owned_fields,
+        snapshot,
+        report,
+        merger,
+        check_current: Callable[[dict | None], None] | None = None,
+    ) -> bool:
+        """Create-or-merge one entity; returns True on success (for advance-after-success).
+
+        ``check_current`` sees the entity as OM holds it, before anything is written,
+        and may stop the run (``ProjectNameCollision``).
+        """
         try:
             current = om.get_by_fqn(kind, entity_fqn, fields=self._PRIMARY_FIELDS_BY_KIND.get(kind))
+            if check_current is not None:
+                check_current(current)
             primary_fields = self._PRIMARY_FIELDS_BY_KIND.get(kind) or ""
             if (
                 current is not None
@@ -1982,7 +2030,7 @@ class Component(ComponentBase):
                 detail=",".join(decision.diverged_fields),
             )
             return True
-        except OMAuthError:
+        except OMAuthError, ProjectNameCollision:
             raise
         except Exception as exc:  # noqa: BLE001 - per-entity failure handled per failure_mode
             return self._handle_entity_failure(run, report, entity_type, entity_fqn, exc)

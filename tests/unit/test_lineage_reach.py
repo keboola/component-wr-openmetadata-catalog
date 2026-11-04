@@ -616,3 +616,61 @@ def test_data_app_without_input_mapping_reads_the_tables_its_code_queries():
 def test_data_app_code_naming_another_project_or_an_uncataloged_table_gets_no_edge():
     pairs, _ = _data_app_run('"KBC_USE4_9999"."in.c-otlp"."traces" and "in.c-otlp"."missing"')
     assert pairs == set()
+
+
+# ------------------------------------------------------ one Database per project
+
+
+def _owner_check(source_url):
+    existing = None if source_url is None else {"id": "db-1", "sourceUrl": source_url}
+    component_mod.Component._check_database_owner(_run(None), f"{SVC}.{PROJ}", existing)
+
+
+def test_a_database_of_another_project_with_the_same_name_stops_the_run():
+    """'[CF] Sales' and '(CF) Sales' both map to CF_Sales: their runs would overwrite
+    each other and tombstone each other's tables in buckets of the same name."""
+    try:
+        _owner_check("https://connection.keboola.com/admin/projects/9382/storage")
+    except component_mod.ProjectNameCollision as exc:
+        assert "already belongs to Keboola project 9382" in str(exc)
+        assert "Project Name Override" in str(exc)
+    else:
+        raise AssertionError("expected ProjectNameCollision")
+
+
+def test_the_projects_own_database_or_one_without_a_project_url_passes():
+    for url in (
+        f"https://connection.us-east4.gcp.keboola.com/admin/projects/{PID}/storage",
+        f"https://connection.keboola.com/admin/projects/{PID}",  # host and suffix may differ
+        "",
+        None,
+    ):
+        _owner_check(url)
+
+
+class _ForeignDatabaseOM(_ExternalOM):
+    """The project's Database exists, written by another project of the same name."""
+
+    def __init__(self):
+        super().__init__([])
+        self.puts: list[str] = []
+
+    def get_by_fqn(self, kind, fqn, fields=None):
+        if kind == "databases":
+            return {"id": "db-1", "sourceUrl": "https://connection.keboola.com/admin/projects/9382/storage"}
+        return super().get_by_fqn(kind, fqn, fields)
+
+    def put_entity(self, kind, body):
+        self.puts.append(kind)
+        return super().put_entity(kind, body)
+
+
+def test_catalog_pass_writes_nothing_for_a_project_whose_database_is_taken():
+    om = _ForeignDatabaseOM()
+    try:
+        _sync_external(om)
+    except component_mod.ProjectNameCollision:
+        pass
+    else:
+        raise AssertionError("expected ProjectNameCollision")
+    assert om.puts == ["databaseServices"]  # the shared service only: no database, schema or table
