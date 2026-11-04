@@ -403,7 +403,7 @@ def test_snapshot_store_keeps_a_large_base_small_in_memory():
     held, _peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
     assert held < raw / 4, (held, raw)
-    assert store.base_fields("svc.p.b.t00007")["columns"][3]["name"] == "col_3"
+    assert store.base_fields("svc.p.b.t00007")["columns"][3]["name"] == "col_3"  # ty: ignore[not-subscriptable]
     assert store.base_fields("svc.p.b.missing") is None
 
 
@@ -414,3 +414,52 @@ def test_snapshot_store_entries_match_the_uncompressed_format():
     (entry,) = list(store.entries())
     assert entry.written_fields_json == json.dumps(fields, sort_keys=True, default=str)
     assert entry.content_hash == content_hash(fields)
+
+
+def test_sync_timestamp_alone_is_not_a_change():
+    """Only kbcSyncedAt moved: no rewrite, and no divergence after a run that died before its snapshot upload."""
+    desired = {"extension": {"kbcConfigId": "1", "kbcSyncedAt": "2026-11-02 15:00 UTC"}}
+    current = {"extension": {"kbcConfigId": "1", "kbcSyncedAt": "2026-11-02 14:06 UTC"}}  # a crashed run wrote OM
+    base = {"extension": {"kbcConfigId": "1", "kbcSyncedAt": "2026-11-02 13:53 UTC"}}  # last uploaded snapshot
+    decision = TWM.merge(desired=desired, current=current, base=base, owned_fields=("extension",))
+    assert decision.action == ACTION_SKIPPED_UNCHANGED
+    assert decision.patch == []
+    assert decision.diverged_fields == []
+
+
+def test_real_extension_change_carries_the_new_sync_timestamp():
+    desired = {"extension": {"kbcLastChange": "2026-11-02", "kbcSyncedAt": "2026-11-02 15:00 UTC"}}
+    current = {"extension": {"kbcLastChange": "2026-10-01", "kbcSyncedAt": "2026-11-02 14:06 UTC"}}
+    base = {"extension": {"kbcLastChange": "2026-10-01", "kbcSyncedAt": "2026-11-02 13:53 UTC"}}
+    decision = TWM.merge(desired=desired, current=current, base=base, owned_fields=("extension",))
+    assert decision.action == ACTION_UPDATED
+    assert decision.patch == [{"op": "replace", "path": "/extension", "value": desired["extension"]}]
+
+
+def test_person_edit_next_to_a_moved_sync_timestamp_still_diverges():
+    desired = {"extension": {"kbcOwner": "a@x.com", "kbcSyncedAt": "2026-11-02 15:00 UTC"}}
+    current = {"extension": {"kbcOwner": "edited@x.com", "kbcSyncedAt": "2026-11-02 14:06 UTC"}}
+    base = {"extension": {"kbcOwner": "a@x.com", "kbcSyncedAt": "2026-11-02 13:53 UTC"}}
+    decision = TWM.merge(desired=desired, current=current, base=base, owned_fields=("extension",))
+    assert decision.action == ACTION_SKIPPED_DIVERGED
+
+
+def test_empty_over_empty_is_not_a_change():
+    """An empty description in OM and in Keboola must not be re-written on every run."""
+    d = _merge(TWM, {"description": ""}, {"description": ""}, {"description": ""})
+    assert d.action == ACTION_SKIPPED_UNCHANGED
+    assert d.patch == []
+
+
+def test_om_html_escaped_text_is_our_text():
+    """OM returns "a->b" as "a-&gt;b" and "it's" as "it&#39;s": that is not a person's edit."""
+    desired = {"description": "Fixture: table->dashboard lineage, the platform's orders & more"}
+    om = {"description": "Fixture: table-&gt;dashboard lineage, the platform&#39;s orders &amp; more"}
+    assert _merge(TWM, desired, om, desired).action == ACTION_SKIPPED_UNCHANGED
+    assert _merge(KAW, desired, om, desired).patch == []
+
+
+def test_real_edit_with_escaped_characters_still_diverges():
+    desired = {"description": "orders -> revenue"}
+    om = {"description": "Edited by a person: orders -&gt; net revenue"}
+    assert _merge(TWM, desired, om, desired).action == ACTION_SKIPPED_DIVERGED

@@ -40,3 +40,9 @@ def test_default_is_regular():
 def test_external_priority_over_regular():
     # An external-schema bucket in stage out still classifies as External.
     assert _detect(stage="out", has_external_schema=True, sharing=None) == EXTERNAL
+
+
+def test_linked_bucket_in_out_stage_is_view():
+    # A linked bucket can sit in the out stage; its tables still alias the source project's.
+    assert _detect(stage="out", has_source_bucket=True) == VIEW
+    assert _detect(stage="out", is_alias=True) == VIEW

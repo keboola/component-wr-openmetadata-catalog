@@ -6,11 +6,15 @@ requires-python = "~=3.14.0"
 dependencies = [
     "keboola-component>=1.10.0",
     "keboola-http-client>=1.0.1",
+    "ijson>=3.3",
     "keboola-utils>=1.1.0",
     "pydantic>=2.11.7",
     "requests>=2.32.0",
     "sqlglot>=27.0.0",
     "sshtunnel>=0.4.0",
+    # sshtunnel 0.4.0 (its last release) reads paramiko.DSSKey on every tunnel start,
+    # and paramiko 4 removed DSSKey: with paramiko >= 4 no tunnel can open.
+    "paramiko>=3.4,<4",
 ]
 
 [dependency-groups]

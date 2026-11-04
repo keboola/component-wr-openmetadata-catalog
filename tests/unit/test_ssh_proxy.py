@@ -2,6 +2,8 @@ from unittest import mock
 
 import pytest
 from keboola.component.exceptions import UserException
+from requests.adapters import HTTPAdapter
+from urllib3 import HTTPSConnectionPool
 
 from client.ssh_proxy import SshProxy, _remote_host_port, maybe_open_tunnel
 
@@ -13,11 +15,21 @@ class _Cfg:
         self.om_host = "https://om.example.com"
 
 
+def _rsa_key_text() -> str:
+    import io
+
+    import paramiko
+
+    pem = io.StringIO()
+    paramiko.RSAKey.generate(2048).write_private_key(pem)
+    return pem.getvalue()
+
+
 class _Ssh:
     host = "bastion"
     user = "kbc"
     port = 22
-    private_key = "PKEY"
+    private_key = _rsa_key_text()
 
 
 def test_disabled_is_noop():
@@ -49,3 +61,100 @@ def test_successful_tunnel_rewrites_host():
         proxy.close()
         fake_forwarder.start.assert_called_once()
         fake_forwarder.stop.assert_called_once()
+
+
+@pytest.mark.parametrize("key_type", ["ed25519", "ecdsa", "rsa"])
+def test_tunnel_uses_the_configured_key_only(tmp_path, monkeypatch, key_type):
+    """The configured key (text) reaches sshtunnel as a parsed key; nothing comes from the machine.
+
+    sshtunnel ignores a key given as text and falls back to the SSH agent and ~/.ssh,
+    which the platform container does not have. It also reads paramiko.DSSKey while it
+    builds the forwarder, which paramiko 4 removed.
+    """
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
+    from sshtunnel import SSHTunnelForwarder
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    generate = {
+        "ed25519": ed25519.Ed25519PrivateKey.generate,
+        "ecdsa": lambda: ec.generate_private_key(ec.SECP256R1()),
+        "rsa": lambda: rsa.generate_private_key(public_exponent=65537, key_size=2048),
+    }[key_type]
+    key_text = (
+        generate()
+        .private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.OpenSSH, serialization.NoEncryption())
+        .decode()
+    )
+    captured = {}
+
+    class Forwarder(SSHTunnelForwarder):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            captured["keys"] = self.ssh_pkeys
+
+        def start(self):
+            pass
+
+        @property
+        def local_bind_port(self):
+            return 40000
+
+    with mock.patch("sshtunnel.SSHTunnelForwarder", Forwarder):
+        proxy = SshProxy(
+            mock.Mock(host="127.0.0.1", port=2222, user="kbc", private_key=key_text),
+            "https://om.example.com",
+        )
+        assert proxy.open() == "https://127.0.0.1:40000"
+    assert len(captured["keys"]) == 1
+
+
+def test_unreadable_key_is_a_user_error():
+    proxy = SshProxy(mock.Mock(host="h", port=22, user="u", private_key="not a key"), "https://om.example.com")
+    with pytest.raises(UserException, match="private key could not be read"):
+        proxy.open()
+
+
+def test_tunnel_session_speaks_tls_to_the_real_host():
+    """Through the tunnel the URL is 127.0.0.1, but SNI, certificate check and Host name the OM host."""
+    proxy = SshProxy(mock.Mock(), "https://om.example.com")
+    proxy.local_om_host = "https://127.0.0.1:40000"
+    proxy._remote_netloc = "om.example.com"
+
+    session = proxy.session()
+
+    adapter = session.get_adapter("https://127.0.0.1:40000/api/v1/system/version")
+    assert isinstance(adapter, HTTPAdapter)
+    pool = adapter.poolmanager.connection_from_url("https://127.0.0.1:40000")
+    assert pool.conn_kw["server_hostname"] == "om.example.com"
+    assert isinstance(pool, HTTPSConnectionPool)
+    assert pool.assert_hostname == "om.example.com"
+    assert session.headers["Host"] == "om.example.com"
+    assert session.verify is True
+
+
+def test_tunnel_session_keeps_a_non_default_port_in_the_host_header():
+    proxy = SshProxy(mock.Mock(), "https://om.example.com:8585")
+    proxy.local_om_host = "https://127.0.0.1:40000"
+    proxy._remote_netloc = "om.example.com:8585"
+    assert proxy.session().headers["Host"] == "om.example.com:8585"
+
+
+def test_plain_http_om_through_the_tunnel_gets_no_tls_settings():
+    """An http OM (e.g. port 8585) must not get TLS pool settings: urllib3 rejects them for http."""
+    proxy = SshProxy(mock.Mock(), "http://om.internal:8585")
+    proxy.local_om_host = "http://127.0.0.1:40000"
+    proxy._remote_netloc = "om.internal:8585"
+    session = proxy.session()
+    adapter = session.get_adapter("http://127.0.0.1:40000/api/v1/system/version")
+    assert isinstance(adapter, HTTPAdapter)
+    adapter.poolmanager.connection_from_url("http://127.0.0.1:40000")._new_conn()  # raised TypeError before
+    assert session.headers["Host"] == "om.internal:8585"
+
+
+def test_key_pasted_with_literal_newline_escapes_is_read():
+    from client.ssh_proxy import _load_private_key
+
+    escaped = _Ssh.private_key.replace("\n", "\\n")
+    assert _load_private_key(escaped).get_name() == "ssh-rsa"

@@ -7,9 +7,13 @@ resolving entity FQNs to ids just before ``PUT /lineage`` (entities exist first)
 
 from __future__ import annotations
 
+import dataclasses
+import io
 import logging
+import re
+import tokenize
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from lineage.column_lineage import LineageResult
@@ -21,6 +25,7 @@ SOURCE_PIPELINE = "PipelineLineage"
 SOURCE_QUERY = "QueryLineage"
 SOURCE_VIEW = "ViewLineage"
 SOURCE_DASHBOARD = "DashboardLineage"
+SOURCE_CROSS_DATABASE = "CrossDatabaseLineage"
 # Every source must be a member of OM's closed ``lineageDetails.source`` enum — an
 # unknown value fails deserialization (400 "Invalid request format"). ChildAssets is
 # OM's own marker for higher-level lineage aggregated from child-asset edges, which
@@ -89,28 +94,84 @@ def declared_edges(
     service_name: str,
     project: str,
     pipeline_fqn: str | None = None,
+    sql_table_edges: set[tuple[str, str]] | None = None,
+    sql_by_output: dict[str, str] | None = None,
+    bucket_paths: Mapping[str, str] | None = None,
 ) -> list[LineageEdge]:
-    """E16: coarse all-inputs -> all-outputs edges from a config's storage mapping."""
-    inputs = (storage.get("input") or {}).get("tables") or []
-    outputs = (storage.get("output") or {}).get("tables") or []
-    in_fqns = [f for t in inputs if (f := fqn.table_fqn_from_storage_id(service_name, project, t.get("source", "")))]
-    out_fqns = [
-        f for t in outputs if (f := fqn.table_fqn_from_storage_id(service_name, project, t.get("destination", "")))
-    ]
+    """E16: table -> table edges for one config, its pipeline attached to each edge.
+
+    The pipeline rides on the edge (``lineageDetails.pipeline``) instead of being a
+    node between the tables, so OpenMetadata keeps the table -> table path that
+    column-level lineage is drawn on. ``sql_by_output`` (output storage id -> the
+    statements that build it) becomes the edge's SQL query.
+
+    Edges are the coarse all-declared-inputs x all-declared-outputs product, plus
+    ``sql_table_edges``: the ``(input, output)`` storage-id pairs the SQL parser
+    resolved, which add inputs read by a direct fully-qualified ref with no input
+    mapping. The declared product is kept even where the SQL resolved an output: a
+    statement the parser missed must not drop a real dependency.
+    """
+    inputs = [t.get("source", "") for t in (storage.get("input") or {}).get("tables") or []]
+    outputs = [t.get("destination", "") for t in (storage.get("output") or {}).get("tables") or []]
+    pairs = [(source, dest) for source in inputs for dest in outputs]
+    pairs += sorted(sql_table_edges or ())
+
     edges: list[LineageEdge] = []
-    for source_fqn in in_fqns:
-        for dest_fqn in out_fqns:
-            if _is_self_loop(source_fqn, dest_fqn, SOURCE_PIPELINE):
-                continue
-            edges.append(
-                LineageEdge(
-                    from_fqn=source_fqn,
-                    to_fqn=dest_fqn,
-                    source=SOURCE_PIPELINE,
-                    pipeline_fqn=pipeline_fqn,
-                )
+    seen: set[tuple[str, str]] = set()
+    for source_id, dest_id in pairs:
+        source_fqn = fqn.table_fqn_from_storage_id(service_name, project, source_id, bucket_paths)
+        dest_fqn = fqn.table_fqn_from_storage_id(service_name, project, dest_id, bucket_paths)
+        if not source_fqn or not dest_fqn or (source_fqn, dest_fqn) in seen:
+            continue
+        seen.add((source_fqn, dest_fqn))
+        if _is_self_loop(source_fqn, dest_fqn, SOURCE_PIPELINE):
+            continue
+        edges.append(
+            LineageEdge(
+                from_fqn=source_fqn,
+                to_fqn=dest_fqn,
+                source=SOURCE_PIPELINE,
+                pipeline_fqn=pipeline_fqn,
+                sql_query=(sql_by_output or {}).get(dest_id),
             )
+        )
     return edges
+
+
+def merge_edges(edges: list[LineageEdge]) -> list[LineageEdge]:
+    """Collapse edges that share both endpoints into one.
+
+    OpenMetadata stores one edge per (from, to) pair; a second ``PUT /lineage`` for
+    the pair replaces the first one's details. So a coarse declared edge must not
+    overwrite the column-level edge for the same pair: the column-bearing edge wins,
+    and column mappings from several edges of one pair are unioned. The SQL query
+    is kept from whichever edge of the pair carries one. First-seen
+    order is kept, so the output is a stable function of the input.
+    """
+    merged: dict[tuple[str, str, str, str], LineageEdge] = {}
+    for edge in edges:
+        key = (edge.from_type, edge.from_fqn, edge.to_type, edge.to_fqn)
+        kept = merged.get(key)
+        if kept is None:
+            merged[key] = edge
+            continue
+        if edge.columns_lineage and not kept.columns_lineage:
+            merged[key] = dataclasses.replace(
+                edge,
+                pipeline_fqn=edge.pipeline_fqn or kept.pipeline_fqn,
+                sql_query=edge.sql_query or kept.sql_query,
+            )
+            continue
+        if not kept.sql_query and edge.sql_query:
+            kept.sql_query = edge.sql_query
+        if edge.columns_lineage:
+            known = {(tuple(c["fromColumns"]), c["toColumn"]) for c in kept.columns_lineage}
+            kept.columns_lineage = kept.columns_lineage + [
+                c for c in edge.columns_lineage if (tuple(c["fromColumns"]), c["toColumn"]) not in known
+            ]
+        if not kept.pipeline_fqn and edge.pipeline_fqn:
+            kept.pipeline_fqn = edge.pipeline_fqn
+    return list(merged.values())
 
 
 def pipeline_edges(
@@ -119,6 +180,7 @@ def pipeline_edges(
     service_name: str,
     project: str,
     pipeline_fqn: str | None,
+    bucket_paths: Mapping[str, str] | None = None,
 ) -> list[LineageEdge]:
     """Phase A: wire the Pipeline itself as a lineage node from DECLARED storage.
 
@@ -136,7 +198,7 @@ def pipeline_edges(
     outputs = (storage.get("output") or {}).get("tables") or []
     edges: list[LineageEdge] = []
     for t in inputs:
-        in_fqn = fqn.table_fqn_from_storage_id(service_name, project, t.get("source", ""))
+        in_fqn = fqn.table_fqn_from_storage_id(service_name, project, t.get("source", ""), bucket_paths)
         if not in_fqn:
             continue
         edges.append(
@@ -149,7 +211,7 @@ def pipeline_edges(
             )
         )
     for t in outputs:
-        out_fqn = fqn.table_fqn_from_storage_id(service_name, project, t.get("destination", ""))
+        out_fqn = fqn.table_fqn_from_storage_id(service_name, project, t.get("destination", ""), bucket_paths)
         if not out_fqn:
             continue
         edges.append(
@@ -164,9 +226,130 @@ def pipeline_edges(
     return edges
 
 
-def view_edge(view_fqn: str, source_fqn: str) -> LineageEdge:
-    """ViewLineage edge for a linked/shared bucket (base table -> view)."""
-    return LineageEdge(from_fqn=source_fqn, to_fqn=view_fqn, source=SOURCE_VIEW)
+def view_edge(view_fqn: str, source_fqn: str, columns: list[str] | None = None) -> LineageEdge:
+    """ViewLineage edge for a linked/shared bucket (base table -> view).
+
+    A linked table is an alias of its source table: each of its ``columns`` is the
+    same-named source column, so the edge carries a 1:1 column mapping.
+    """
+    columns_lineage = [
+        {"fromColumns": [fqn.column_fqn(source_fqn, col)], "toColumn": fqn.column_fqn(view_fqn, col)}
+        for col in columns or []
+    ]
+    return LineageEdge(from_fqn=source_fqn, to_fqn=view_fqn, source=SOURCE_VIEW, columns_lineage=columns_lineage)
+
+
+def external_source_matches(
+    hits: list[dict], backend_path: Sequence[str], table_name: str, own_service: str
+) -> list[str]:
+    """FQNs of the OM tables an external bucket's table reads, from search hits.
+
+    An external bucket's tables are the tables of a schema in the customer's own
+    warehouse (``backend_path``: ``[database, schema]`` on Snowflake, ``[project,
+    dataset]`` on BigQuery). OpenMetadata catalogs that warehouse in its own service,
+    so a hit matches when its table, schema and (when the path has one) database
+    names equal ours, ignoring case: warehouses differ in how they case names. Hits
+    in the writer's own service and soft-deleted ones never match.
+    """
+    if not backend_path:
+        return []
+    want_schema = backend_path[-1].lower()
+    want_database = backend_path[-2].lower() if len(backend_path) > 1 else None
+    matches: set[str] = set()
+    for hit in hits:
+        if hit.get("deleted") or (hit.get("service") or {}).get("name") == own_service:
+            continue
+        if str(hit.get("name") or "").lower() != table_name.lower():
+            continue
+        if str((hit.get("databaseSchema") or {}).get("name") or "").lower() != want_schema:
+            continue
+        if want_database is not None and str((hit.get("database") or {}).get("name") or "").lower() != want_database:
+            continue
+        if hit.get("fullyQualifiedName"):
+            matches.add(hit["fullyQualifiedName"])
+    return sorted(matches)
+
+
+def external_edge(table_fqn: str, source_fqn: str, columns: list[str], source_columns: list[str]) -> LineageEdge:
+    """Source warehouse table -> the external bucket's table that reads it.
+
+    Both are the same physical table seen from two services, so the edge is
+    ``CrossDatabaseLineage`` and each column maps to the source column of the same
+    name. Warehouses differ in how they case names, so a column with no exact match
+    takes the one source column that differs only in case; a quoted Snowflake table
+    can hold both ``ID`` and ``id``, and then only the exact match counts. A column
+    whose name is not FQN-safe on either side is left out: OpenMetadata would not
+    resolve its column FQN.
+    """
+    safe_sources = [name for name in source_columns if fqn.sanitize_name(name) == name]
+    by_case: dict[str, list[str]] = defaultdict(list)
+    for name in safe_sources:
+        by_case[name.lower()].append(name)
+
+    def source_of(col: str) -> str | None:
+        if col in safe_sources:
+            return col
+        same = by_case.get(col.lower(), [])
+        return same[0] if len(same) == 1 else None
+
+    columns_lineage = [
+        {"fromColumns": [f"{source_fqn}.{source}"], "toColumn": fqn.column_fqn(table_fqn, col)}
+        for col in columns
+        if fqn.sanitize_name(col) == col and (source := source_of(col))
+    ]
+    return LineageEdge(
+        from_fqn=source_fqn, to_fqn=table_fqn, source=SOURCE_CROSS_DATABASE, columns_lineage=columns_lineage
+    )
+
+
+# A table named in code: up to three quoted parts joined by dots, Snowflake style
+# ("DB"."in.c-bucket"."table") or BigQuery style (`project.dataset.table`).
+_DOUBLE_QUOTED_REF = re.compile(r'"([^"\n]+)"\s*\.\s*"([^"\n]+)"(?:\s*\.\s*"([^"\n]+)")?')
+_BACKTICK_REF = re.compile(r"`([^`\n]+)`((?:\s*\.\s*`[^`\n]+`)*)")
+# A database (or BigQuery project) name as code spells it out. Anything else, such
+# as an f-string placeholder ("{DB}") or a mis-paired quote, is not a name.
+_PLAIN_NAME = re.compile(r"[A-Za-z0-9_$-]+")
+
+
+def _without_comments(code: str) -> str:
+    """Python source without its ``#`` comments: a commented-out query is not read."""
+    try:
+        tokens = [t for t in tokenize.generate_tokens(io.StringIO(code).readline) if t.type != tokenize.COMMENT]
+        return tokenize.untokenize(tokens)
+    except tokenize.TokenError, SyntaxError, ValueError:
+        return code
+
+
+def _ref(parts: list[str]) -> tuple[tuple[str, ...], str, str]:
+    databases = tuple(part for part in parts[:-2] if _PLAIN_NAME.fullmatch(part))
+    return databases, parts[-2], parts[-1]
+
+
+def code_table_refs(code: str) -> set[tuple[tuple[str, ...], str, str]]:
+    """``(databases, schema, table)`` of every table a script names fully qualified.
+
+    A data app that queries the Query Service has no input mapping: its SQL is
+    in its code, as strings. Only qualified names are taken (a bare table name says
+    nothing about its bucket), and the caller keeps only those that resolve to a
+    cataloged table, so a quoted pair that is not a table drops out there. A
+    database part the code builds at run time (``f'"{DB}"."in.c-b"."t"'``) is
+    left out, so the name still resolves by its bucket and table.
+
+    Not found: unquoted names (``in_c_b.orders``), BigQuery names quoted part by
+    part in a mix (`` `proj`.in_c_b.orders ``), and a table named only as a column
+    qualifier (``"in.c-b"."t"."col"``). Text in strings that is not SQL, such as
+    markdown, is read like any other string.
+    """
+    code = _without_comments(code).replace('\\"', '"')
+    refs: set[tuple[tuple[str, ...], str, str]] = set()
+    for match in _DOUBLE_QUOTED_REF.finditer(code):
+        refs.add(_ref([part for part in match.groups() if part is not None]))
+    for match in _BACKTICK_REF.finditer(code):
+        quoted = [match.group(1), *re.findall(r"`([^`\n]+)`", match.group(2))]
+        parts = [piece for part in quoted for piece in part.split(".")]
+        if len(parts) in (2, 3):
+            refs.add(_ref(parts))
+    return refs
 
 
 def data_app_edges(
@@ -175,6 +358,7 @@ def data_app_edges(
     service_name: str,
     project: str,
     dashboard_fqn: str,
+    bucket_paths: Mapping[str, str] | None = None,
 ) -> list[LineageEdge]:
     """Upstream table -> data-app (Dashboard) edges from the app's input mapping.
 
@@ -187,7 +371,7 @@ def data_app_edges(
     edges: list[LineageEdge] = []
     seen: set[str] = set()
     for table in inputs:
-        source_fqn = fqn.table_fqn_from_storage_id(service_name, project, table.get("source", ""))
+        source_fqn = fqn.table_fqn_from_storage_id(service_name, project, table.get("source", ""), bucket_paths)
         if not source_fqn or source_fqn in seen:
             continue
         seen.add(source_fqn)
@@ -277,6 +461,7 @@ def _table_level_fallbacks(
     catalog: dict[str, set[str]],
     temp: list[str],
     pipeline_fqn: str | None,
+    sql_by_fqn: dict[str, str],
 ) -> list[LineageEdge]:
     """Degrade pairs that lost ALL their column mappings.
 
@@ -302,6 +487,7 @@ def _table_level_fallbacks(
                     source=SOURCE_QUERY,
                     temp_lineage_tables=temp,
                     pipeline_fqn=pipeline_fqn,
+                    sql_query=sql_by_fqn.get(to_tbl_fqn),
                 )
             )
         else:
@@ -321,6 +507,7 @@ def column_edges(
     project: str,
     pipeline_fqn: str | None = None,
     column_catalog: dict[str, set[str]] | None = None,
+    bucket_paths: Mapping[str, str] | None = None,
 ) -> list[LineageEdge]:
     """E17: group resolved column edges by (from_table, to_table) into QueryLineage edges.
 
@@ -333,19 +520,22 @@ def column_edges(
     ``column_catalog=None`` disables the check (legacy behaviour: emit every mapping).
     """
     grouped: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    sql_by_fqn: dict[str, str] = {}
     seen_pairs: set[tuple[str, str]] = set()
     # ``column_edges`` is a set; iterate it in stable ColumnEdge sort order so the
     # emitted PUT /lineage payloads (edge order, columnsLineage order) and the
     # "Dropping column-level mapping" warning order are deterministic run-to-run,
     # matching the already-sorted omit path in _table_level_fallbacks.
     for edge in sorted(result.column_edges):
-        from_tbl_fqn = fqn.table_fqn_from_storage_id(service_name, project, edge.from_table)
-        to_tbl_fqn = fqn.table_fqn_from_storage_id(service_name, project, edge.to_table)
+        from_tbl_fqn = fqn.table_fqn_from_storage_id(service_name, project, edge.from_table, bucket_paths)
+        to_tbl_fqn = fqn.table_fqn_from_storage_id(service_name, project, edge.to_table, bucket_paths)
         if not from_tbl_fqn or not to_tbl_fqn:
             continue
         if _is_self_loop(from_tbl_fqn, to_tbl_fqn, SOURCE_QUERY):
             continue
         seen_pairs.add((from_tbl_fqn, to_tbl_fqn))
+        if edge.to_table in result.sql_by_output:
+            sql_by_fqn[to_tbl_fqn] = result.sql_by_output[edge.to_table]
         if column_catalog is not None and not _column_ref_valid(
             column_catalog, from_tbl_fqn, edge.from_column, to_tbl_fqn, edge.to_column
         ):
@@ -375,11 +565,12 @@ def column_edges(
             columns_lineage=cols,
             temp_lineage_tables=temp,
             pipeline_fqn=pipeline_fqn,
+            sql_query=sql_by_fqn.get(to_tbl_fqn),
         )
         for (from_tbl_fqn, to_tbl_fqn), cols in grouped.items()
     ]
     if column_catalog is not None:
-        edges += _table_level_fallbacks(seen_pairs, grouped, column_catalog, temp, pipeline_fqn)
+        edges += _table_level_fallbacks(seen_pairs, grouped, column_catalog, temp, pipeline_fqn, sql_by_fqn)
     return edges
 
 

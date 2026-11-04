@@ -12,6 +12,7 @@ same FQN, so N independent project rows converge on one coherent catalog.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable, Mapping
 
 _UNSAFE = re.compile(r"[^0-9A-Za-z_-]+")
 _MULTI_UNDERSCORE = re.compile(r"_+")
@@ -83,18 +84,46 @@ def table_fqn(service_name: str, project: str, bucket_path: str, table_name: str
     )
 
 
-def table_fqn_from_storage_id(service_name: str, project: str, storage_id: str) -> str | None:
+def table_fqn_from_storage_id(
+    service_name: str, project: str, storage_id: str, bucket_paths: Mapping[str, str] | None = None
+) -> str | None:
     """OM Table FQN from a Keboola storage id (``stage.c-bucket.table``).
 
-    The first two dotted parts are the bucket path, the remainder the table
-    name. Returns ``None`` for an unparseable id.
+    The first two dotted parts are the bucket id, the remainder the table name.
+    A table is cataloged under its bucket's Storage ``path``, which is not always
+    the bucket id (a linked bucket's path is its source bucket's), so
+    ``bucket_paths`` (bucket id -> path) maps the id onto the cataloged schema.
+    Returns ``None`` for an unparseable id.
     """
     parts = str(storage_id).split(".")
     if len(parts) < 3:
         return None
-    bucket_path = ".".join(parts[:2])
+    bucket_id = ".".join(parts[:2])
     table_name = ".".join(parts[2:])
-    return table_fqn(service_name, project, bucket_path, table_name)
+    return table_fqn(service_name, project, (bucket_paths or {}).get(bucket_id, bucket_id), table_name)
+
+
+def storage_id_for_ref(
+    schema: str,
+    table: str,
+    databases: Iterable[str] = (),
+    *,
+    schema_buckets: Mapping[str, str] | None = None,
+    schema_databases: Mapping[str, str] | None = None,
+) -> str | None:
+    """Storage id of a table named in code by its warehouse ``schema`` and ``table``.
+
+    On Snowflake the schema is the bucket id (``"in.c-bucket"``); elsewhere the
+    warehouse names it differently (BigQuery dataset ``in_c_bucket``, an external
+    bucket's own schema), and ``schema_buckets`` (warehouse schema -> bucket id)
+    maps it back. A ref that names a database (a BigQuery project) other than the
+    bucket's own (``schema_databases``) reads another project's table of the same
+    name: ``None``. The caller still checks that the table was cataloged.
+    """
+    database = (schema_databases or {}).get(schema)
+    if database and any(name.lower() != database.lower() for name in databases):
+        return None
+    return f"{(schema_buckets or {}).get(schema, schema)}.{table}"
 
 
 def column_fqn(table_fqn_value: str, column_name: str) -> str:
@@ -102,14 +131,21 @@ def column_fqn(table_fqn_value: str, column_name: str) -> str:
     return f"{table_fqn_value}.{sanitize_name(column_name)}"
 
 
-def project_service_name(service_name: str, project_id: str) -> str:
-    """Name of one project's Pipeline or Dashboard service: ``<service>-<projectId>``.
+def project_service_name(service_name: str, project: str) -> str:
+    """Name of one project's Pipeline or Dashboard service: ``<service>-<project name>``.
 
     OM's Pipelines and Dashboards trees have no level between service and entity
     (unlike Databases -> Database -> Schema), so the service is the only place the
-    project can show. The id, not the name, keeps it stable across project renames;
-    the project name is the service's ``displayName``.
+    project can show. It is keyed by the project name, like the project's Database
+    (``<service>.<project name>``), so an FQN or URL says which project it is from
+    without knowing Keboola project ids. A project rename starts a new service,
+    exactly as it starts a new Database.
     """
+    return f"{sanitize_name(service_name)}-{sanitize_name(project)}"
+
+
+def legacy_project_service_name(service_name: str, project_id: str) -> str:
+    """The per-project service name releases up to 0.1.x used: ``<service>-<projectId>``."""
     return f"{sanitize_name(service_name)}-{sanitize_name(str(project_id))}"
 
 
@@ -118,9 +154,9 @@ def pipeline_name(config_or_flow_id: str) -> str:
     return sanitize_name(str(config_or_flow_id))
 
 
-def pipeline_fqn(service_name: str, project_id: str, config_or_flow_id: str) -> str:
+def pipeline_fqn(service_name: str, project: str, config_or_flow_id: str) -> str:
     """FQN of a Pipeline ← component config or flow (spec 2.1)."""
-    return f"{project_service_name(service_name, project_id)}.{pipeline_name(config_or_flow_id)}"
+    return f"{project_service_name(service_name, project)}.{pipeline_name(config_or_flow_id)}"
 
 
 def dashboard_name(config_id: str) -> str:
@@ -128,6 +164,6 @@ def dashboard_name(config_id: str) -> str:
     return sanitize_name(str(config_id))
 
 
-def dashboard_fqn(service_name: str, project_id: str, config_id: str) -> str:
+def dashboard_fqn(service_name: str, project: str, config_id: str) -> str:
     """FQN of a Dashboard ← Keboola data-app config."""
-    return f"{project_service_name(service_name, project_id)}.{dashboard_name(config_id)}"
+    return f"{project_service_name(service_name, project)}.{dashboard_name(config_id)}"

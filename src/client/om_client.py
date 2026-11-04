@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Entity kinds whose collection lives under ``/services/``.
 _SERVICE_KINDS = frozenset({"databaseServices", "pipelineServices", "dashboardServices"})
 
-_RETRYABLE_STATUS = frozenset({500, 502, 503, 504})
+_RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 _JSON_PATCH_CT = "application/json-patch+json"
 
 
@@ -128,8 +128,8 @@ class OMClient:
                     self._sleep(attempt)
                     continue
                 raise OMConnectionError(
-                    f"Could not reach OpenMetadata ({method} {path}) after {self.max_retries + 1} attempts: {exc}. "
-                    "Check om_host, network/proxy reachability, and the SSH tunnel if enabled."
+                    f"Could not reach OpenMetadata at {self.base_url} ({method} {path}) after "
+                    f"{self.max_retries + 1} attempts: {exc}"
                 ) from exc
 
             if response.status_code in (401, 403):
@@ -221,19 +221,24 @@ class OMClient:
 
     # -------------------------------------------------- custom properties
 
-    def ensure_custom_properties(self, entity_type: str, specs: list[tuple[str, str, str]]) -> set[str]:
-        """Ensure custom properties ``(name, field_type, description)`` exist on ``entity_type``.
+    def ensure_custom_properties(
+        self, entity_type: str, specs: list[tuple[str, str, str]], *, create: bool = True
+    ) -> set[str]:
+        """Return the custom properties ``(name, field_type, description)`` defined on ``entity_type``.
 
-        Returns the property names that exist afterwards. Defining a property is an
-        admin-level type change a bot token may be refused; such a failure is logged
-        and the property left out of the returned set, so the caller skips its value
-        instead of 400-ing the entity write.
+        With ``create`` a missing property is defined first. Defining a property is
+        an admin-level type change a bot token may be refused; such a failure is
+        logged and the property left out of the returned set, so the caller skips
+        its value instead of 400-ing the entity write. Without ``create`` only the
+        properties an OM admin already defined are returned.
         """
         entity = self._request(
             "GET", f"/metadata/types/name/{entity_type}", params={"fields": "customProperties"}
         ).json()
         type_id = entity.get("id")
         existing = {c.get("name") for c in (entity.get("customProperties") or [])}
+        if not create:
+            return existing
         for name, field_type, description in specs:
             if name in existing:
                 continue
@@ -287,6 +292,40 @@ class OMClient:
                 return source["id"]
         return None
 
+    def search_tables(self, table_name: str, schema_name: str, *, size: int = 100, max_pages: int = 10) -> list[dict]:
+        """Tables named ``table_name`` in a schema named ``schema_name``, in any service.
+
+        Returns each hit's ``_source`` (name, fullyQualifiedName, database,
+        databaseSchema, service, deleted). ``name`` matches in any case, but the
+        schema name is a case-sensitive keyword, so it is asked as given, upper- and
+        lower-cased (warehouses differ in how they case names). The caller must
+        check the names exactly, and decides whether one table matches, so every
+        page is read (up to ``max_pages``). Quotes and backslashes are escaped.
+        """
+
+        def phrase(value: str) -> str:
+            return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+        schemas = " OR ".join(phrase(s) for s in sorted({schema_name, schema_name.upper(), schema_name.lower()}))
+        sources: list[dict] = []
+        for page in range(max_pages):
+            response = self._request(
+                "GET",
+                "/search/query",
+                params={
+                    "q": f"name:{phrase(table_name)} AND databaseSchema.name:({schemas})",
+                    "index": "table_search_index",
+                    "from": page * size,
+                    "size": size,
+                    "deleted": "false",
+                },
+            )
+            hits = ((response.json() or {}).get("hits") or {}).get("hits") or []
+            sources += [hit.get("_source") or {} for hit in hits]
+            if len(hits) < size:
+                break
+        return sources
+
     def get_by_fqn(self, kind: str, fqn: str, *, fields: str | None = None) -> dict | None:
         params = {"fields": fields} if fields else None
         try:
@@ -316,17 +355,24 @@ class OMClient:
         params = {"hardDelete": "false", "recursive": "true" if recursive else "false"}
         self._request("DELETE", self._path_for(kind, f"/{entity_id}"), params=params)
 
-    def delete_lineage_by_source(self, entity_type: str, fqn: str, source: str) -> None:
+    def delete_lineage_edge(self, from_type: str, from_id: str, to_type: str, to_id: str) -> None:
+        """DELETE one edge by its endpoints (available on 1.13.4 and 2.x)."""
+        self._request("DELETE", f"/lineage/{from_type}/{from_id}/{to_type}/{to_id}")
+
+    def delete_lineage_by_source(
+        self, entity_type: str, fqn: str, source: str, *, entity_id: str | None = None
+    ) -> None:
         """Drop our edges of one ``source`` from an entity.
 
-        2.0+: by-name convenience endpoint. 1.13.4: resolve the id then use the
-        by-id form (spec 3.5). The capability exists on both; only the path differs.
+        2.0+: by-name convenience endpoint. 1.13.4: the by-id form (spec 3.5), with
+        the id looked up unless the caller already holds it. The capability exists
+        on both; only the path differs.
         """
         if self.is_2_0_or_newer:
             path = f"/lineage/source/name/{entity_type}/{quote(fqn, safe='')}/type/{quote(source, safe='')}"
             self._request("DELETE", path)
             return
-        entity_id = self._resolve_entity_id(entity_type, fqn)
+        entity_id = entity_id or self._resolve_entity_id(entity_type, fqn)
         if entity_id is None:
             logger.debug("delete_lineage_by_source: entity %s not found, skipping", fqn)
             return

@@ -46,8 +46,8 @@ def test_table_fqn_linked_bucket_resolves_to_owning_project():
 
 def test_pipeline_and_dashboard_fqns_live_under_a_per_project_service():
     # OM's Pipelines/Dashboards trees have no level between service and entity, so the
-    # project is the service (by stable id); the entity name is just the config id.
-    assert fqn.project_service_name("svc", "4214") == "svc-4214"
+    # project is the service (by name, like its Database); the entity name is the config id.
+    assert fqn.project_service_name("svc", "L0 Events") == "svc-L0_Events"
     assert fqn.pipeline_name("12345") == "12345"
-    assert fqn.pipeline_fqn("svc", "4214", "12345") == "svc-4214.12345"
-    assert fqn.dashboard_fqn("svc", "4214", "01app") == "svc-4214.01app"
+    assert fqn.pipeline_fqn("svc", "L0 Events", "12345") == "svc-L0_Events.12345"
+    assert fqn.dashboard_fqn("svc", "L0 Events", "01app") == "svc-L0_Events.01app"

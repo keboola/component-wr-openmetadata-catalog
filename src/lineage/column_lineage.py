@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 import sqlglot
@@ -47,6 +48,9 @@ class LineageResult:
     temp_lineage_tables: set[str] = field(default_factory=set)
     metrics: CoverageMetrics = field(default_factory=CoverageMetrics)
     unresolved_notes: list[str] = field(default_factory=list)
+    # Output storage table id -> the statements that build it, in script order: its
+    # own writes plus those of the workspace intermediates it is built from.
+    sql_by_output: dict[str, str] = field(default_factory=dict)
 
 
 def _has_column_ref(node: exp.Expression) -> bool:
@@ -78,6 +82,15 @@ class _WorkspaceGraph:
         # are built (see ``_build_inferred_map`` / ``extract_column_lineage``).
         self.qualified_sources: set[str] = set()
         self.qualified_targets: set[str] = set()
+        # Qualified key -> the database (BigQuery project) parts its refs named, if any.
+        self.qualified_catalogs: dict[str, set[str]] = defaultdict(set)
+        # (workspace target key, statement SQL) of every CREATE-AS / INSERT, in script order.
+        self.writes: list[tuple[str, str]] = []
+
+    def add_qualified(self, tbl: exp.Table, key: str, *, target: bool) -> None:
+        (self.qualified_targets if target else self.qualified_sources).add(key)
+        if tbl.catalog:
+            self.qualified_catalogs[key].add(tbl.catalog)
 
 
 def _table_key(tbl: exp.Table) -> str:
@@ -106,7 +119,7 @@ def _select_and_target(
         if created is not None:
             tgt_key = _table_key(created)
             if created.db:
-                graph.qualified_targets.add(tgt_key)
+                graph.add_qualified(created, tgt_key, target=True)
             if cols:
                 graph.ws_schema[tgt_key] = cols
         if isinstance(tree.expression, exp.Select | exp.Union):
@@ -121,7 +134,7 @@ def _select_and_target(
         if table is not None:
             tgt_tbl = _table_key(table)
             if table.db:
-                graph.qualified_targets.add(tgt_tbl)
+                graph.add_qualified(table, tgt_tbl, target=True)
         if isinstance(tree.expression, exp.Select):
             return tree.expression, tgt_tbl, explicit
     return None, None, []
@@ -165,7 +178,7 @@ def _trace_projection(
         if isinstance(src, exp.Table):
             src_tbl = _table_key(src)
             if src.db:
-                graph.qualified_sources.add(src_tbl)
+                graph.add_qualified(src, src_tbl, target=False)
             src_col = leaf.name.split(".")[-1].strip('"')
             graph.table_edges.add((src_tbl, tgt_tbl or ""))
             if src_col == "*":
@@ -190,25 +203,39 @@ def _build_inferred_map(
     service_name: str,
     project: str,
     known_table_fqns: set[str] | None,
+    bucket_paths: Mapping[str, str] | None = None,
+    schema_buckets: Mapping[str, str] | None = None,
+    catalogs: Mapping[str, set[str]] | None = None,
+    schema_databases: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Phase B: promote a QUALIFIED workspace key to a storage id, but only
     when the run actually cataloged it.
 
-    A qualified ref's key already *is* the Keboola storage id verbatim
-    (``db.name`` == ``stage.c-bucket.table`` for the Snowflake-validated
-    case — schema == bucket id), so ``storage_id = key``. Cross-checking its
-    derived Table FQN against ``known_table_fqns`` is what filters out CTEs,
-    workspace scratch tables and cross-project/non-cataloged refs that happen
-    to carry a dotted ``.db`` part but were never a real Storage table this
-    run saw. ``known_table_fqns=None`` disables Phase B entirely (returns
-    ``{}``), keeping every pre-Phase-B caller's behaviour unchanged.
+    A qualified ref's key is ``schema.table``, mapped to a storage id by
+    :func:`fqn.storage_id_for_ref` (with the database parts its refs named, from
+    ``catalogs``). Cross-checking the derived Table FQN against
+    ``known_table_fqns`` is what filters out CTEs, workspace scratch tables and
+    cross-project/non-cataloged refs that happen to carry a dotted ``.db`` part
+    but were never a real Storage table this run saw. ``known_table_fqns=None``
+    disables Phase B entirely (returns ``{}``), keeping every pre-Phase-B caller's
+    behaviour unchanged.
     """
     if known_table_fqns is None:
         return {}
     inferred: dict[str, str] = {}
     for key in sorted(qualified_keys):
-        storage_id = key
-        candidate_fqn = fqn_mod.table_fqn_from_storage_id(service_name, project, storage_id)
+        # Keboola table names hold no dot, so the last dot ends the schema.
+        schema, _, table = key.rpartition(".")
+        storage_id = fqn_mod.storage_id_for_ref(
+            schema,
+            table,
+            (catalogs or {}).get(key) or (),
+            schema_buckets=schema_buckets,
+            schema_databases=schema_databases,
+        )
+        if storage_id is None:
+            continue
+        candidate_fqn = fqn_mod.table_fqn_from_storage_id(service_name, project, storage_id, bucket_paths)
         if candidate_fqn is not None and candidate_fqn in known_table_fqns:
             inferred[key] = storage_id
     return inferred
@@ -223,6 +250,9 @@ def extract_column_lineage(
     service_name: str = "",
     project: str = "",
     known_table_fqns: set[str] | None = None,
+    bucket_paths: Mapping[str, str] | None = None,
+    schema_buckets: Mapping[str, str] | None = None,
+    schema_databases: Mapping[str, str] | None = None,
 ) -> LineageResult:
     """Extract resolved column/table lineage for one transformation config.
 
@@ -239,15 +269,20 @@ def extract_column_lineage(
         project: Keboola project name — see ``service_name``.
         known_table_fqns: the run's cataloged Table FQNs. When given, a
             transformation that reads/writes a table via a DIRECT
-            fully-qualified SQL ref (Snowflake: ``"PROJDB"."in.c-bucket"."t"``,
-            schema == bucket id — the validated dialect; other warehouses may
-            name schemas differently and are not yet mapped, so a qualified
-            ref there simply never matches and is recorded as unresolved,
-            never raised) is recovered as an input/output the same as a
+            fully-qualified SQL ref (Snowflake: ``"PROJDB"."in.c-bucket"."t"``;
+            BigQuery: ``project.in_c_bucket.t``, mapped through
+            ``schema_buckets``) is recovered as an input/output the same as a
             declared one, provided the ref resolves onto a table this run
-            actually cataloged. ``None`` (the default) disables this
-            inference outright — pure declared-mapping resolution, matching
-            every pre-Phase-B call site.
+            actually cataloged; one that does not is recorded as unresolved,
+            never raised. ``None`` (the default) disables this inference
+            outright — pure declared-mapping resolution, matching every
+            pre-Phase-B call site.
+        bucket_paths: bucket id -> the Storage ``path`` its tables are
+            cataloged under (see ``fqn.table_fqn_from_storage_id``).
+        schema_buckets: warehouse schema name -> bucket id, for qualified
+            refs whose schema is not the bucket id.
+        schema_databases: warehouse schema name -> the database (BigQuery
+            project) holding it; a ref naming another database is not mapped.
     """
     result = LineageResult()
     if not dialect.is_sql:
@@ -268,6 +303,8 @@ def extract_column_lineage(
             select, tgt_tbl, explicit = _select_and_target(tree, graph)
             if select is None:
                 continue
+            if tgt_tbl:
+                graph.writes.append((tgt_tbl, tree.sql(dialect=dialect.sqlglot_dialect, pretty=True)))
             first = select.find(exp.Select) if isinstance(select, exp.Union) else select
             projections = first.expressions if first is not None else []
             tgt_cols = explicit or graph.ws_schema.get(tgt_tbl or "", [])
@@ -281,8 +318,19 @@ def extract_column_lineage(
     # declared one is spread second so its entries overwrite the inferred
     # ones (spec: "declared mappings stay authoritative; inference only fills
     # gaps").
-    inferred_in_map = _build_inferred_map(graph.qualified_sources, service_name, project, known_table_fqns)
-    inferred_out_map = _build_inferred_map(graph.qualified_targets, service_name, project, known_table_fqns)
+    inferred_in_map, inferred_out_map = (
+        _build_inferred_map(
+            keys,
+            service_name,
+            project,
+            known_table_fqns,
+            bucket_paths,
+            schema_buckets,
+            graph.qualified_catalogs,
+            schema_databases,
+        )
+        for keys in (graph.qualified_sources, graph.qualified_targets)
+    )
     effective_in_map = {**inferred_in_map, **in_map}
     effective_out_map = {**inferred_out_map, **out_map}
 
@@ -365,6 +413,35 @@ def _resolve_to_storage(
                 if out_kind == "output" and s_id != out_id:
                     _add_column_edge(result, s_id, s_col, out_id, out_col)
                     result.temp_lineage_tables.add(mid_tbl)
+
+    _collect_output_sql(graph, in_map, out_map, result)
+
+
+def _collect_output_sql(
+    graph: _WorkspaceGraph,
+    in_map: dict[str, str],
+    out_map: dict[str, str],
+    result: LineageResult,
+) -> None:
+    """Record, per output table, the statements that write it or an intermediate it reads."""
+    pred: dict[str, set[str]] = defaultdict(set)
+    for s, t in graph.table_edges:
+        if t:
+            pred[t].add(s)
+    scopes: dict[str, set[str]] = defaultdict(set)
+    for key in {target for target, _ in graph.writes}:
+        out_id, kind = _classify(key, in_map, out_map)
+        if kind != "output":
+            continue
+        scope, stack = {key}, [key]
+        while stack:
+            for upstream in pred.get(stack.pop(), ()):
+                if upstream not in scope and _classify(upstream, in_map, out_map)[1] == "intermediate":
+                    scope.add(upstream)
+                    stack.append(upstream)
+        scopes[out_id] |= scope
+    for out_id, scope in scopes.items():
+        result.sql_by_output[out_id] = ";\n\n".join(sql for target, sql in graph.writes if target in scope) + ";"
 
 
 def _reachable_outputs(

@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 import os
 import subprocess
@@ -20,6 +21,7 @@ from mapping.lineage_builder import (
     column_edges,
     data_app_edges,
     declared_edges,
+    merge_edges,
     pipeline_edges,
     to_add_lineage_request,
     view_edge,
@@ -386,6 +388,82 @@ def test_e17_end_to_end_sql_to_add_lineage_request():
     }
 
 
+def test_edge_carries_the_sql_that_builds_its_target():
+    """The edge shows the statements that build its target: the target's own write
+    plus the write of the intermediate it reads, in script order. A statement that
+    builds another output is left out."""
+    statements = [
+        ("load_stg", 'CREATE TABLE "stg" AS SELECT "id", "amount" FROM "src"'),
+        ("build_other", 'CREATE TABLE "other" AS SELECT "id" FROM "src"'),
+        ("build_result", 'INSERT INTO "result" SELECT "id", "amount" AS "total" FROM "stg"'),
+    ]
+    result = extract_column_lineage(
+        statements,
+        in_map={"src": "in.c-main.orders"},
+        out_map={"result": "out.c-sales.result", "other": "out.c-sales.other"},
+        dialect=SNOW,
+    )
+    result_sql = result.sql_by_output["out.c-sales.result"]
+    assert result_sql.index('"stg"') < result_sql.index('INSERT INTO "result"')
+    assert '"other"' not in result_sql
+    assert result.sql_by_output["out.c-sales.other"].startswith('CREATE TABLE "other"')
+
+    catalog = {
+        "keboola-stack.Acme_Project.in_c-main.orders": {"id", "amount"},
+        "keboola-stack.Acme_Project.out_c-sales.result": {"id", "total"},
+        "keboola-stack.Acme_Project.out_c-sales.other": {"id"},
+    }
+    edges = column_edges(result, service_name=SVC, project=PROJ, column_catalog=catalog)
+    by_target = {e.to_fqn: e for e in edges}
+    edge = by_target["keboola-stack.Acme_Project.out_c-sales.result"]
+    assert edge.sql_query == result_sql
+    req = to_add_lineage_request(edge, _resolver({edge.from_fqn: "id-src", edge.to_fqn: "id-result"}))
+    assert req is not None
+    assert req["edge"]["lineageDetails"]["sqlQuery"] == result_sql
+
+
+def test_declared_edge_carries_the_sql_of_its_output():
+    storage = {
+        "input": {"tables": [{"source": "in.c-main.orders"}]},
+        "output": {"tables": [{"destination": "out.c-sales.result"}, {"destination": "out.c-sales.raw"}]},
+    }
+    edges = declared_edges(
+        storage, service_name=SVC, project=PROJ, sql_by_output={"out.c-sales.result": 'SELECT 1 AS "x";'}
+    )
+    sql = {e.to_fqn.rsplit(".", 1)[-1]: e.sql_query for e in edges}
+    assert sql == {"result": 'SELECT 1 AS "x";', "raw": None}
+
+
+def test_merge_keeps_the_sql_of_either_edge_of_a_pair():
+    columns = [{"fromColumns": ["a.t.c"], "toColumn": "b.t.c"}]
+    with_sql = LineageEdge(from_fqn="a.t", to_fqn="b.t", source=SOURCE_PIPELINE, sql_query="SELECT 1;")
+    with_columns = LineageEdge(from_fqn="a.t", to_fqn="b.t", source=SOURCE_QUERY, columns_lineage=columns)
+    for edges in ([with_sql, with_columns], [with_columns, with_sql]):
+        [merged] = merge_edges([dataclasses.replace(e) for e in edges])
+        assert merged.columns_lineage == columns
+        assert merged.sql_query == "SELECT 1;"
+
+
+def test_merge_keeps_the_pipeline_of_a_later_column_edge():
+    """Two column edges of one pair: a config without a pipeline (selected out) may come first."""
+    first = LineageEdge(
+        from_fqn="a.t",
+        to_fqn="b.t",
+        source=SOURCE_QUERY,
+        columns_lineage=[{"fromColumns": ["a.t.x"], "toColumn": "b.t.x"}],
+    )
+    second = LineageEdge(
+        from_fqn="a.t",
+        to_fqn="b.t",
+        source=SOURCE_QUERY,
+        columns_lineage=[{"fromColumns": ["a.t.y"], "toColumn": "b.t.y"}],
+        pipeline_fqn="svc-proj.cfg",
+    )
+    [merged] = merge_edges([first, second])
+    assert merged.pipeline_fqn == "svc-proj.cfg"
+    assert len(merged.columns_lineage) == 2
+
+
 # --------------------------------------------------------------------------
 # Determinism: the column-lineage set feeds emitted output (PUT /lineage
 # payloads + warning logs); its iteration order must be a stable function of
@@ -614,3 +692,58 @@ def test_to_add_lineage_request_drops_id_level_self_loop(caplog):
         req = to_add_lineage_request(edge, _resolver(known))
     assert req is None
     assert any("same OM entity" in rec.getMessage() for rec in caplog.records)
+
+
+# ------------------------------------------- table edges carry their pipeline
+
+
+def test_declared_edges_attach_pipeline_to_each_table_edge():
+    storage = {
+        "input": {"tables": [{"source": "in.c-main.a"}]},
+        "output": {"tables": [{"destination": "out.c-res.x"}]},
+    }
+    edges = declared_edges(storage, service_name=SVC, project=PROJ, pipeline_fqn="svc-p.cfg1")
+    assert [(e.from_type, e.to_type, e.pipeline_fqn) for e in edges] == [("table", "table", "svc-p.cfg1")]
+
+
+def test_declared_edges_add_sql_pairs_to_the_declared_product():
+    # The declared product stays (a statement the parser missed must not drop a
+    # dependency); the SQL adds an input read without an input mapping.
+    storage = {
+        "input": {"tables": [{"source": "in.c-main.a"}, {"source": "in.c-main.b"}]},
+        "output": {"tables": [{"destination": "out.c-res.x"}]},
+    }
+    edges = declared_edges(
+        storage,
+        service_name=SVC,
+        project=PROJ,
+        sql_table_edges={("in.c-main.a", "out.c-res.x"), ("in.c-main.direct", "out.c-res.x")},
+    )
+    pairs = {(e.from_fqn.rsplit(".", 1)[1], e.to_fqn.rsplit(".", 1)[1]) for e in edges}
+    assert pairs == {("a", "x"), ("b", "x"), ("direct", "x")}
+    assert len(edges) == 3  # the declared and SQL copies of a -> x collapse to one
+
+
+def test_merge_edges_keeps_column_edge_over_declared_and_unions_columns():
+    a, x = "svc.p.in_c-main.a", "svc.p.out_c-res.x"
+    col1 = {"fromColumns": [f"{a}.id"], "toColumn": f"{x}.id"}
+    col2 = {"fromColumns": [f"{a}.v"], "toColumn": f"{x}.v"}
+    edges = [
+        LineageEdge(from_fqn=a, to_fqn=x, source=SOURCE_PIPELINE, pipeline_fqn="svc-p.cfg1"),
+        LineageEdge(from_fqn=a, to_fqn=x, source=SOURCE_QUERY, columns_lineage=[col1]),
+        LineageEdge(from_fqn=a, to_fqn=x, source=SOURCE_QUERY, columns_lineage=[col1, col2]),
+    ]
+    merged = merge_edges(edges)
+    assert len(merged) == 1
+    assert merged[0].source == SOURCE_QUERY
+    assert merged[0].pipeline_fqn == "svc-p.cfg1"
+    assert merged[0].columns_lineage == [col1, col2]
+
+
+def test_view_edge_maps_each_alias_column_to_its_source_column():
+    edge = view_edge("svc.b.in_c-linked.t", "svc.a.out_c-shared.t", ["id", "name"])
+    assert edge.source == SOURCE_VIEW
+    assert edge.columns_lineage == [
+        {"fromColumns": ["svc.a.out_c-shared.t.id"], "toColumn": "svc.b.in_c-linked.t.id"},
+        {"fromColumns": ["svc.a.out_c-shared.t.name"], "toColumn": "svc.b.in_c-linked.t.name"},
+    ]

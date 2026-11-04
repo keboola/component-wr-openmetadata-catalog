@@ -222,6 +222,27 @@ def test_find_user_id_by_email_matches_exact_email():
     assert params["q"] == 'email:"jakub.smagin@keboola.com"'
 
 
+def test_search_tables_asks_the_schema_in_each_case():
+    session = mock.Mock()
+    session.request.return_value = FakeResponse(200, {"hits": {"hits": [{"_source": {"name": "ORDERS"}}]}})
+    c = _client(session)
+    assert c.search_tables('OR"DERS', "Sales") == [{"name": "ORDERS"}]
+    params = session.request.call_args.kwargs["params"]
+    assert params["index"] == "table_search_index"
+    # name is analysed (any case); the schema name is a case-sensitive keyword (verified live)
+    assert params["q"] == 'name:"OR\\"DERS" AND databaseSchema.name:("SALES" OR "Sales" OR "sales")'
+
+
+def test_search_tables_reads_every_page():
+    session = mock.Mock()
+    full = {"hits": {"hits": [{"_source": {"name": "T", "n": i}} for i in range(2)]}}
+    last = {"hits": {"hits": [{"_source": {"name": "T", "n": 2}}]}}
+    session.request.side_effect = [FakeResponse(200, full), FakeResponse(200, last)]
+    c = _client(session)
+    assert [h["n"] for h in c.search_tables("T", "S", size=2)] == [0, 1, 2]
+    assert [call.kwargs["params"]["from"] for call in session.request.call_args_list] == [0, 2]
+
+
 def test_find_user_id_by_email_none_when_no_exact_match():
     session = mock.Mock()
     # a token match returns a user whose email only contains the query terms -> no exact hit
@@ -245,3 +266,26 @@ def test_find_user_id_by_email_reraises_auth_error():
     c = _client(session)
     with pytest.raises(OMAuthError):
         c.find_user_id_by_email("x@keboola.com")
+
+
+def test_ensure_custom_properties_without_create_never_defines_a_property():
+    # A custom property applies to every entity of its type in the instance, so the
+    # default mode only reads what an OM admin defined and never PUTs a type change.
+    session = mock.Mock()
+    session.request.return_value = FakeResponse(200, {"id": "t1", "customProperties": [{"name": "kbcProjectId"}]})
+    c = _client(session)
+    out = c.ensure_custom_properties(
+        "table", [("kbcProjectId", "string", "d"), ("kbcUrl", "string", "d")], create=False
+    )
+    assert out == {"kbcProjectId"}
+    assert [call.args[0] for call in session.request.call_args_list] == ["GET"]
+
+
+def test_connection_error_names_the_host():
+    session = mock.Mock()
+    session.request.side_effect = requests.ConnectionError("boom")
+    c = OMClient("https://om.example.com", "tok", session=session, backoff_base=0, max_retries=0)
+    with pytest.raises(OMConnectionError) as exc:
+        c.probe_version()
+    assert "https://om.example.com/api/v1" in str(exc.value)
+    assert "SSH" not in str(exc.value)

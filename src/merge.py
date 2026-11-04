@@ -17,6 +17,7 @@ sources are ever dropped, so a ``Manual`` edge is never removed.
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import zlib
 from collections.abc import Iterable, Iterator
@@ -42,7 +43,7 @@ OWNED_TABLE_FIELDS = (
     "owners",
 )
 OWNED_PIPELINE_FIELDS = ("displayName", "description", "tasks", "sourceUrl", "extension", "owners")
-OWNED_DASHBOARD_FIELDS = ("displayName", "description", "sourceUrl", "extension", "owners")
+OWNED_DASHBOARD_FIELDS = ("displayName", "description", "project", "sourceUrl", "extension", "owners")
 OWNED_SCHEMA_FIELDS = ("displayName", "description", "sourceUrl", "extension", "owners")
 OWNED_DATABASE_FIELDS = ("displayName", "sourceUrl", "extension")
 
@@ -86,6 +87,17 @@ def _is_empty(value: object) -> bool:
 # a genuine type change is still caught by the case-stable ``dataType`` /
 # ``dataLength`` / ``arrayDataType`` fields, which OM returns in canonical form.
 _CASE_FOLDED_KEYS = frozenset({"dataTypeDisplay"})
+# Sub-keys that change on every run (the sync timestamp in ``extension``). They are
+# written along with a real change but never make one: comparing them would rewrite
+# every pipeline on every run, and after a run that failed between the OM write and
+# the snapshot upload, mark the field diverged until the next full refresh.
+_VOLATILE_KEYS = frozenset({"kbcSyncedAt"})
+
+
+def _stable(value: object) -> object:
+    if isinstance(value, dict):
+        return {k: v for k, v in value.items() if k not in _VOLATILE_KEYS}
+    return value
 
 
 def _project_owned(desired_value: object, om_value: object) -> object:
@@ -125,6 +137,9 @@ def _project_owned(desired_value: object, om_value: object) -> object:
         if len(desired_value) != len(om_value):
             return om_value  # a length change is a real change; leave it unequal to desired
         return [_project_owned(d, o) for d, o in zip(desired_value, om_value, strict=True)]
+    if isinstance(desired_value, str) and isinstance(om_value, str) and html.unescape(om_value) == desired_value:
+        # OM stores text HTML-escaped ("a->b" comes back as "a-&gt;b", "it's" as "it&#39;s").
+        return desired_value
     return om_value
 
 
@@ -162,15 +177,21 @@ class ThreeWayMerger:
             desired_val = desired[name]
             om_val = current.get(name)
             base_val = (base or {}).get(name)
+            stable_desired, stable_om, stable_base = _stable(desired_val), _stable(om_val), _stable(base_val)
 
-            if _is_empty(om_val):
+            if _is_empty(om_val) and _is_empty(desired_val):
+                # Nothing to write (e.g. an empty description): writing it would churn every run.
+                snapshot[name] = desired_val
+            elif _is_empty(om_val):
                 patch.append(_patch_op(current, name, desired_val))
                 snapshot[name] = desired_val
                 changed = True
-            elif _project_owned(desired_val, om_val) == desired_val:
+            elif _project_owned(stable_desired, stable_om) == stable_desired:
                 # OM already holds our value (ignoring server-only enrichment) -> no-op.
                 snapshot[name] = desired_val
-            elif (base is not None and _project_owned(base_val, om_val) == base_val) or self.keboola_always_wins:
+            elif (
+                base is not None and _project_owned(stable_base, stable_om) == stable_base
+            ) or self.keboola_always_wins:
                 # OM still matches what we last wrote (base) -> safe to update.
                 patch.append(_patch_op(current, name, desired_val))
                 snapshot[name] = desired_val

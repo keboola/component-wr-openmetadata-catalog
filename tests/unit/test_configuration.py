@@ -3,6 +3,7 @@ from keboola.component.exceptions import UserException
 
 from configuration import (
     Configuration,
+    CustomPropertiesMode,
     FailureMode,
     MergeMode,
 )
@@ -218,3 +219,14 @@ def test_flat_config_still_parses_without_nested_groups():
     assert cfg.write_buckets is False
     assert cfg.merge_mode == MergeMode.KEBOOLA_ALWAYS_WINS
     assert cfg.write_table_lineage is True
+
+
+def test_custom_properties_and_pipeline_node_are_opt_in_by_default():
+    cfg = Configuration(**_base_params())
+    assert cfg.custom_properties == CustomPropertiesMode.EXISTING_ONLY
+    assert cfg.pipeline_lineage_as_node is False
+
+
+def test_pipeline_lineage_as_node_lifts_from_advanced_lineage_group():
+    cfg = Configuration(**_base_params(advanced={"lineage": {"pipeline_lineage_as_node": True}}))
+    assert cfg.pipeline_lineage_as_node is True

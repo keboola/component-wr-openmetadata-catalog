@@ -67,7 +67,7 @@ class DashboardBuilder:
         """One DashboardService per project, shown under the project's name."""
         return _drop_none(
             {
-                "name": fqn.project_service_name(self.service_name, self.project_id),
+                "name": fqn.project_service_name(self.service_name, self.project),
                 "displayName": fqn.sanitize_display_name(self.project),
                 "serviceType": _SERVICE_TYPE,
                 "description": f"Data apps of Keboola project {self.project_id}, catalogued by "
@@ -161,7 +161,10 @@ class DashboardBuilder:
                 # Always emit description (empty when the app has none) so it overwrites
                 # any earlier value rather than leaving a stale one in place.
                 "description": fqn.sanitize_display_name(config.get("description")) or "",
-                "service": fqn.project_service_name(self.service_name, self.project_id),
+                "service": fqn.project_service_name(self.service_name, self.project),
+                # OM's own "Project" field (Tableau fills it with the workbook's project):
+                # the Keboola project the app lives in, shown on the dashboard page.
+                "project": fqn.sanitize_display_name(self.project),
                 "sourceUrl": app_url or self._config_url(config_id),
                 "owners": self._owners(config, owner_resolver),
                 "extension": self._extension(config, available_properties, app_states, synced_at),
@@ -169,6 +172,6 @@ class DashboardBuilder:
         )
         return BuiltDashboard(
             body=body,
-            fqn=fqn.dashboard_fqn(self.service_name, self.project_id, config_id),
+            fqn=fqn.dashboard_fqn(self.service_name, self.project, config_id),
             config_id=config_id,
         )

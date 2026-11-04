@@ -11,7 +11,7 @@ def _builder(stack_id=None):
 def test_pipeline_service_body():
     svc = _builder().pipeline_service_body()
     assert svc["serviceType"] == "CustomPipeline"
-    assert svc["name"] == "keboola-stack-1234"  # one service per project...
+    assert svc["name"] == "keboola-stack-Acme_Project"  # one service per project...
     assert svc["displayName"] == "Acme_Project"  # ...shown under the project's name
 
 
@@ -29,10 +29,10 @@ def test_config_to_pipeline_with_ordered_tasks_and_sql():
         },
     }
     built = _builder().build_pipeline("keboola.snowflake-transformation", config)
-    assert built.fqn == "keboola-stack-1234.999"
+    assert built.fqn == "keboola-stack-Acme_Project.999"
     body = built.body
     assert body["name"] == "999"
-    assert body["service"] == "keboola-stack-1234"
+    assert body["service"] == "keboola-stack-Acme_Project"
     tasks = body["tasks"]
     assert [t["name"] for t in tasks] == ["block_1", "block_2"]
     assert tasks[0]["taskType"] == "QUERY"
@@ -371,3 +371,20 @@ def test_pipeline_extension_names_its_project():
     assert ext["kbcProjectId"] == "1234"
     assert ext["kbcProjectName"] == "Acme_Project"
     assert ext["kbcProjectUrl"]["url"] == "https://connection.us-east4.gcp.keboola.com/admin/projects/1234"
+
+
+def test_flow_tasks_running_one_config_keep_every_task_name_in_phase_order():
+    configuration = {
+        "phases": [{"id": 1}, {"id": 2}],
+        "tasks": [
+            {"name": "Late", "phase": 2, "task": {"componentId": "keboola.ex-db-mysql", "configId": "1"}},
+            {"name": "Early", "phase": 1, "task": {"componentId": "keboola.ex-db-mysql", "configId": "1"}},
+            {
+                "name": "Off",
+                "phase": 1,
+                "enabled": False,
+                "task": {"componentId": "keboola.ex-db-mysql", "configId": "1"},
+            },
+        ],
+    }
+    assert PipelineBuilder.flow_task_names_by_job(configuration) == {"keboola.ex-db-mysql-1": ["Early", "Late"]}

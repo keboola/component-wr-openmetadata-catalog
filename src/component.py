@@ -10,13 +10,17 @@ snapshot/state/report -> raise at the end in collect_and_fail mode.
 from __future__ import annotations
 
 import csv
+import dataclasses
 import json
 import logging
 import os
 import re
 import sys
+from collections.abc import Callable
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any, ClassVar
 
 from keboola.component.base import ComponentBase, sync_action
@@ -28,10 +32,23 @@ from keboola.vcr import BaseSanitizer, DefaultSanitizer
 import report as report_mod
 from client import ssh_proxy
 from client.data_app_reader import fetch_app_states
-from client.job_queue_reader import JobQueueReader
-from client.om_client import OMAuthError, OMClient, OMClientError, OMPreconditionFailed
-from client.storage_reader import SourceBucket, SourceTable, StorageReader, resolve_storage_credentials
-from configuration import Configuration, FailureMode
+from client.job_queue_reader import JobQueueReader, status_record
+from client.om_client import (
+    OMAuthError,
+    OMClient,
+    OMClientError,
+    OMConnectionError,
+    OMNotFound,
+    OMPreconditionFailed,
+)
+from client.storage_reader import (
+    SourceBucket,
+    SourceTable,
+    StorageReader,
+    needs_detail,
+    resolve_storage_credentials,
+)
+from configuration import Configuration, CustomPropertiesMode, FailureMode
 from lineage.column_lineage import LineageResult, extract_column_lineage
 from lineage.dialect import dialect_for
 from mapping import fqn as fqn_mod
@@ -42,10 +59,18 @@ from mapping.entity_builder import (
     DATABASE_CUSTOM_PROPERTIES,
     SCHEMA_CUSTOM_PROPERTIES,
     TABLE_CUSTOM_PROPERTIES,
+    TABLE_STAT_PROPERTIES,
     EntityBuilder,
 )
 from mapping.pipeline_builder import CUSTOM_PROPERTIES as PIPELINE_CUSTOM_PROPERTIES
-from mapping.pipeline_builder import PipelineBuilder, component_kind, is_flow_component
+from mapping.pipeline_builder import (
+    FLOW_COMPONENT_ID,
+    LEGACY_ORCHESTRATOR_ID,
+    PipelineBuilder,
+    component_kind,
+    is_flow_component,
+)
+from mapping.table_type import EXTERNAL
 from merge import (
     OUR_DASHBOARD_LINEAGE_SOURCES,
     OUR_LINEAGE_SOURCES,
@@ -59,9 +84,26 @@ from merge import (
     ThreeWayMerger,
 )
 from report import RunReport
-from sync import StateManager, TombstonePlanner, bucket_digest, digest_fields, should_process_bucket
+from sync import (
+    LINEAGE_LAYOUT_EDGE,
+    LINEAGE_LAYOUT_NODE,
+    StateManager,
+    TombstonePlanner,
+    bucket_digest,
+    digest_fields,
+    lineage_digest,
+    should_process_bucket,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class ProjectNameCollision(UserException):
+    """Two Keboola projects map onto one OpenMetadata Database; the run must stop."""
+
+
+# The Keboola project id in a Database's sourceUrl (``.../admin/projects/<id>/storage``).
+_PROJECT_ID_IN_URL = re.compile(r"/projects/(\d+)(?:/|$)")
 
 
 class CredentialScrubber(BaseSanitizer):
@@ -239,13 +281,43 @@ VCR_SANITIZERS = [
 # content, so an unchanged bucket is skipped even when a release changed what would be
 # written for it (e.g. deep links moved to the public host). Bump this with any such
 # change: the saved digests are then dropped once and every bucket is written again.
-_CATALOG_FORMAT_VERSION = 2
+_CATALOG_FORMAT_VERSION = 3
+
+
+class EdgeOutcome(StrEnum):
+    """What happened to one lineage edge PUT."""
+
+    WRITTEN = "written"
+    SKIPPED = "skipped"  # a self-loop or malformed edge: never sent, nothing to retry
+    UNRESOLVED = "unresolved"  # an endpoint is not in OpenMetadata
+    FAILED = "failed"
+
+
+def _pipelines_as_lineage_nodes(config: Configuration) -> bool:
+    """Whether pipelines are lineage nodes (table -> pipeline -> table).
+
+    Normally the pipeline rides on the table -> table edge. With table lineage off
+    there is no such edge to carry it, so pipeline lineage keeps the node layout.
+    """
+    return config.pipeline_lineage_as_node or not config.write_table_lineage
+
 
 _BASE_TYPE_FACTORY = {
     "STRING": BaseType.string,
     "INTEGER": BaseType.integer,
     "TIMESTAMP": BaseType.timestamp,
 }
+
+
+@dataclass
+class _StorageEdges:
+    """The lineage edges of one storage mapping of a config."""
+
+    table_edges: list[lineage_builder.LineageEdge] = field(default_factory=list)
+    column_edges: list[lineage_builder.LineageEdge] = field(default_factory=list)
+    # The config's pipeline as a node between its tables (written in the legacy
+    # layout, or when no table edge can carry the pipeline).
+    node_edges: list[lineage_builder.LineageEdge] = field(default_factory=list)
 
 
 @dataclass
@@ -266,18 +338,37 @@ class _ProjectRun:
     pipelines: PipelineBuilder
     dashboards: DashboardBuilder
     seen_table_fqns: set[str] = field(default_factory=set)
-    # DatabaseSchema FQNs this run actually enumerated (in-scope buckets only) —
-    # the tombstone pass reconciles *only* within these, so allowlist/denylist
-    # excluded buckets are never a deletion scope (spec risk #4).
+    # DatabaseSchema FQNs this run re-wrote (in-scope, changed buckets only) — the
+    # tombstone pass reconciles *only* within these, so allowlist/denylist excluded
+    # buckets are never a deletion scope (spec risk #4), and an unchanged bucket
+    # (no table removed since its last sync) costs no listing.
     seen_schema_fqns: set[str] = field(default_factory=set)
+    bucket_id_by_schema: dict[str, str] = field(default_factory=dict)
+    # Every production bucket of the project, listed once per run (None until then).
+    buckets: list[SourceBucket] | None = None
+    # Bucket id -> the Storage ``path`` its tables are cataloged under: lineage names
+    # tables by storage id, and a linked bucket's path is its source bucket's.
+    bucket_paths: dict[str, str] = field(default_factory=dict)
+    # Warehouse schema name (the last ``backendPath`` part) -> bucket id, so SQL that
+    # names a table by its warehouse schema (a BigQuery dataset, an external
+    # bucket's own schema) resolves to the Storage table.
+    schema_buckets: dict[str, str] = field(default_factory=dict)
+    # Warehouse schema name -> the database (BigQuery project) of the bucket it names.
+    schema_databases: dict[str, str] = field(default_factory=dict)
     # Cataloged table FQN -> its (sanitised) column names. The column-lineage pass
     # validates each columnsLineage entry against this so it never references a
     # column an endpoint table lacks (empty-stub tables map to an empty set).
     column_catalog: dict[str, set[str]] = field(default_factory=dict)
     pipeline_fqn_by_config: dict[str, str] = field(default_factory=dict)
+    # (component id, config id) -> storage ids of the cataloged tables Storage
+    # metadata says it last wrote; the outputs of a config with no output mapping.
+    produced_tables: dict[tuple[str, str], set[str]] = field(default_factory=dict)
     # Data-app config id -> its Dashboard FQN, recorded by the dashboard pass so the
     # lineage pass can attach table -> dashboard edges to the entity it just wrote.
     dashboard_fqn_by_config: dict[str, str] = field(default_factory=dict)
+    # Legacy orchestration ids that a migrated flow of the same id supersedes.
+    migrated_orchestration_ids: set[str] = field(default_factory=set)
+    job_queue: JobQueueReader | None = None
     id_cache: dict[str, str | None] = field(default_factory=dict)
     # FQNs this run had to create (they were absent from OM when the run started).
     created_fqns: set[str] = field(default_factory=set)
@@ -313,10 +404,15 @@ class Component(ComponentBase):
         synced_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
         try:
             om = self._build_om_client(config, proxy)
-            om.probe_version()
+            try:
+                om.probe_version()
+            except OMConnectionError as exc:
+                raise UserException(f"{exc}. {self._connection_hint(config)}") from exc
+            except (OMClientError, ValueError) as exc:
+                raise UserException(self._unexpected_answer(config, exc)) from exc
             server_version = om.server_version
             version_changed = state.om_version_seen not in (None, server_version)
-            snapshot = self._load_snapshot(env, state)
+            snapshot = self._load_snapshot(env, state, fqn_mod.sanitize_name(config.resolve_service_name()))
             self._process_project(config, om, project, env, state, snapshot, report, version_changed, synced_at)
             state.om_version_seen = server_version
         finally:
@@ -355,10 +451,34 @@ class Component(ComponentBase):
     def _ui_base(storage_url: str) -> str:
         return storage_url.rstrip("/")
 
-    def _build_om_client(self, config: Configuration, proxy: ssh_proxy.SshProxy | None) -> OMClient:
-        host = proxy.local_om_host if proxy and proxy.local_om_host else config.om_host
-        verify_ssl = proxy is None  # a loopback tunnel terminates TLS at the bastion
-        return OMClient(host, config.bot_token, verify_ssl=verify_ssl)
+    def _build_om_client(self, config: Configuration, proxy: ssh_proxy.SshProxy | None, **client_kwargs) -> OMClient:
+        if proxy is not None and proxy.local_om_host:
+            # TLS runs end to end through the tunnel and is checked against the OM host name.
+            return OMClient(proxy.local_om_host, config.bot_token, session=proxy.session(), **client_kwargs)
+        return OMClient(config.om_host, config.bot_token, **client_kwargs)
+
+    @staticmethod
+    def _connection_hint(config: Configuration) -> str:
+        """Say which network path was used, so a reachability error is not misread."""
+        if config.use_ssh_tunnel and config.ssh is not None:
+            return (
+                f"The SSH tunnel is ON: the component connected through bastion {config.ssh.host}:{config.ssh.port} "
+                f"to {config.om_host}. Check that the bastion can reach that host and port."
+            )
+        return (
+            f"The SSH tunnel is OFF: the component connected directly to {config.om_host}. That host must be "
+            "reachable from Keboola's static egress IP addresses; if it is on a private network, allow-list those "
+            "IPs or turn on 'Use SSH Tunnel' with a bastion that can reach it."
+        )
+
+    @classmethod
+    def _unexpected_answer(cls, config: Configuration, exc: Exception) -> str:
+        """A host that answers, but not as the OpenMetadata API (wrong path, a login page)."""
+        return (
+            f"{config.om_host} answered, but not as the OpenMetadata API ({exc}). Check that OpenMetadata Host "
+            "is the base URL of the OpenMetadata UI, without '/api', and that no login page or proxy sits in "
+            f"front of it. {cls._connection_hint(config)}"
+        )
 
     # ------------------------------------------------------ project resolve
 
@@ -383,13 +503,19 @@ class Component(ComponentBase):
     # -------------------------------------------------------------- snapshot
 
     @staticmethod
-    def _load_snapshot(env: dict, state: StateManager) -> SnapshotStore:
+    def _load_snapshot(env: dict, state: StateManager, service_name: str) -> SnapshotStore:
+        """Load the merge base, keeping only this service's entities.
+
+        Every configuration in the project writes to the same snapshot table, so it
+        also holds other configurations' entities; holding those would only cost memory.
+        """
         snapshot = SnapshotStore()
         if not state.snapshot_table or not env["token"] or not env["url"]:
             return snapshot
         reader = StorageReader(env["url"], env["token"])
-        rows = reader.read_snapshot_rows(state.snapshot_table)
-        snapshot.load_rows(rows)
+        # FQNs of this service start with its name: "<service>", "<service>.<db>...",
+        # "<service>-<project>.<pipeline>" (pipeline and dashboard services).
+        snapshot.load_rows(reader.read_snapshot_rows(state.snapshot_table, key_prefix=service_name))
         return snapshot
 
     # ------------------------------------------------------ per-project run
@@ -435,14 +561,96 @@ class Component(ComponentBase):
             or config.write_dashboard_lineage
             or config.write_bucket_lineage
         ):
-            self._lineage_pass(config, om, run, report)
-        self._tombstone_pass(om, run, report)
+            layout = LINEAGE_LAYOUT_NODE if _pipelines_as_lineage_nodes(config) else LINEAGE_LAYOUT_EDGE
+            cleaned = self._lineage_pass(
+                config,
+                om,
+                run,
+                report,
+                state,
+                force=config.full_refresh or version_changed or state.full_refresh_due(),
+                drop_legacy_node_edges=layout == LINEAGE_LAYOUT_EDGE and state.lineage_layout == LINEAGE_LAYOUT_NODE,
+            )
+            if cleaned:
+                state.lineage_layout = layout
+        else:
+            # Lineage written later must not be skipped against digests from before a
+            # pause: entities re-created meanwhile hold none of their old edges.
+            state.set_lineage_digests(ctx.project_id, {})
+        self._tombstone_pass(config, om, run, report, state)
+
+    @staticmethod
+    def _index_buckets(run: _ProjectRun) -> list[SourceBucket]:
+        """The project's buckets, listed and indexed on the first call of a run."""
+        if run.buckets is not None:
+            return run.buckets
+        buckets = run.buckets = run.reader.list_buckets()
+        for bucket in buckets:
+            run.bucket_paths[bucket.id] = bucket.path or bucket.name
+        run.entities.bucket_paths = run.bucket_paths
+        # A bucket of this project wins a schema name it shares with a linked one (whose
+        # path is its source project's schema). A name two buckets of the same kind
+        # share (external buckets on PUBLIC of two databases) names neither: SQL that
+        # gives only the schema cannot tell them apart.
+        claims: dict[str, dict[bool, set[str]]] = {}
+        databases: dict[str, str] = {}
+        for bucket in buckets:
+            if bucket.backend_path:
+                own = bucket.source_bucket is None
+                claims.setdefault(bucket.backend_path[-1], {}).setdefault(own, set()).add(bucket.id)
+                if len(bucket.backend_path) > 1:
+                    databases[bucket.id] = bucket.backend_path[-2]
+        for schema, by_kind in claims.items():
+            ids = by_kind.get(True) or by_kind[False]
+            if len(ids) == 1:
+                bucket_id = next(iter(ids))
+                run.schema_buckets[schema] = bucket_id
+                if bucket_id in databases:
+                    run.schema_databases[schema] = databases[bucket_id]
+        return buckets
+
+    @staticmethod
+    def _parallel[T](
+        config: Configuration, items: list[T], task: Callable[[T, RunReport], None], report: RunReport
+    ) -> None:
+        """Run ``task(item, item_report)`` for every item on ``config.parallel_requests`` threads.
+
+        Each item records into its own report, merged back in input order, so the
+        run report reads the same as a sequential run. The first exception (an auth
+        error, fail-fast mode) cancels the items not yet started and is re-raised;
+        when several items failed, the one earliest in input order wins.
+        """
+        if config.parallel_requests <= 1 or len(items) <= 1:
+            for item in items:
+                task(item, report)
+            return
+        item_reports = [report.fork() for _ in items]
+        pool = ThreadPoolExecutor(max_workers=config.parallel_requests)
+        try:
+            futures = [pool.submit(task, item, r) for item, r in zip(items, item_reports, strict=True)]
+            wait(futures, return_when=FIRST_EXCEPTION)
+            for future in futures:
+                if future.done() and not future.cancelled():
+                    future.result()  # re-raises the item's exception
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+            for item_report in item_reports:
+                report.extend(item_report)
 
     @staticmethod
     def _ensure_custom_properties(
-        om: OMClient, entity_type: str, specs: list[tuple[str, str, str]], label: str
+        om: OMClient,
+        entity_type: str,
+        specs: list[tuple[str, str, str]],
+        label: str,
+        mode: CustomPropertiesMode = CustomPropertiesMode.CREATE,
     ) -> set[str]:
         """Guarded ``ensure_custom_properties`` — never fails the run.
+
+        ``mode`` OFF writes no ``extension`` at all; EXISTING_ONLY fills only the
+        properties an OM admin defined (a custom property applies to every entity
+        of its type in the instance, so the writer does not define it unasked);
+        CREATE defines the missing ones first.
 
         Defining a custom-property type is an admin-level change a bot token
         may be refused; such a failure (or any other type-registration error)
@@ -451,11 +659,22 @@ class Component(ComponentBase):
         write. Shared by every pass (catalog/pipeline/dashboard) that
         registers one entity type's custom properties.
         """
+        if mode == CustomPropertiesMode.OFF:
+            return set()
         try:
-            return om.ensure_custom_properties(entity_type, specs)
+            available = om.ensure_custom_properties(entity_type, specs, create=mode == CustomPropertiesMode.CREATE)
         except Exception as exc:  # noqa: BLE001 - metadata-type read/define is best-effort
             logger.warning("%s custom properties unavailable (%s); writing without extension", label, exc)
             return set()
+        missing = [name for name, _type, _description in specs if name not in available]
+        if mode == CustomPropertiesMode.EXISTING_ONLY and missing:
+            logger.info(
+                "%s custom properties not defined in OpenMetadata, so not written: %s. Set Custom Properties to "
+                "'Define missing properties' to have the writer define them.",
+                label,
+                ", ".join(missing),
+            )
+        return available
 
     def _catalog_pass(
         self,
@@ -469,11 +688,15 @@ class Component(ComponentBase):
         version_changed: bool,
         synced_at: str | None = None,
     ) -> None:
-        available_database = self._ensure_custom_properties(om, "database", DATABASE_CUSTOM_PROPERTIES, "Database")
-        available_schema = self._ensure_custom_properties(
-            om, "databaseSchema", SCHEMA_CUSTOM_PROPERTIES, "DatabaseSchema"
+        available_database = self._ensure_custom_properties(
+            om, "database", DATABASE_CUSTOM_PROPERTIES, "Database", config.custom_properties
         )
-        available_table = self._ensure_custom_properties(om, "table", TABLE_CUSTOM_PROPERTIES, "Table")
+        available_schema = self._ensure_custom_properties(
+            om, "databaseSchema", SCHEMA_CUSTOM_PROPERTIES, "DatabaseSchema", config.custom_properties
+        )
+        available_table = self._ensure_custom_properties(
+            om, "table", TABLE_CUSTOM_PROPERTIES, "Table", config.custom_properties
+        )
 
         def resolve_owner(email: str) -> str | None:
             return self._resolve_owner(om, run, email)
@@ -503,6 +726,7 @@ class Component(ComponentBase):
             snapshot,
             report,
             merger,
+            check_current=lambda current: self._check_database_owner(run, database_fqn, current),
         )
 
         if not config.write_buckets:
@@ -514,14 +738,21 @@ class Component(ComponentBase):
         if catalog_is_new and state.has_bucket_digests(run.ctx.project_id):
             logger.info("OpenMetadata holds none of this project's catalog (was it deleted?); syncing every bucket.")
         full_refresh_due = state.full_refresh_due()
-        for bucket in run.reader.list_buckets():
-            if not self._bucket_in_scope(config, bucket):
-                continue
-            # This bucket is in scope this run: its schema is a valid tombstone scope.
+        # Row count, size and last import change on every data load. Unless their
+        # custom properties are written, they must not mark the bucket as changed.
+        volatile = frozenset(f for f, prop in TABLE_STAT_PROPERTIES.items() if prop not in available_table)
+        buckets = [bucket for bucket in self._index_buckets(run) if self._bucket_in_scope(config, bucket)]
+        # Written after every bucket: an alias may sit in another bucket than its
+        # source table, which a parallel worker may still be creating.
+        view_edges: list[tuple[str, lineage_builder.LineageEdge]] = []
+        # (bucket, table name, table FQN, column names) of every external table synced:
+        # its source table is looked up in OM once every bucket is written.
+        external_tables: list[tuple[SourceBucket, str, str, list[str]]] = []
+
+        def sync_bucket(bucket: SourceBucket, bucket_report: RunReport) -> None:
             schema_fqn = fqn_mod.schema_fqn(run.entities.service_name, run.entities.project, bucket.path or bucket.name)
-            run.seen_schema_fqns.add(schema_fqn)
             tables = list(run.reader.iter_tables(bucket.id))
-            digest = bucket_digest(digest_fields(bucket), [digest_fields(t) for t in tables])
+            digest = bucket_digest(digest_fields(bucket), [digest_fields(t, exclude=volatile) for t in tables])
             if not should_process_bucket(
                 previous_digest=state.bucket_digest(run.ctx.project_id, bucket.id),
                 current_digest=digest,
@@ -529,7 +760,7 @@ class Component(ComponentBase):
                 version_changed=version_changed,
                 full_refresh_due=full_refresh_due,
             ):
-                report.record(
+                bucket_report.record(
                     project_id=run.ctx.project_id,
                     entity_type="Schema",
                     entity_fqn=bucket.id,
@@ -542,8 +773,15 @@ class Component(ComponentBase):
                     )
                     run.seen_table_fqns.add(table_fqn)
                     self._record_column_catalog(run, table_fqn, table)
-                continue
+                    self._record_producer(run, bucket, table)
+                return
 
+            # Re-written this run: its schema is a valid tombstone scope. An unchanged
+            # bucket lost no table since its last sync, so it has nothing to tombstone.
+            run.seen_schema_fqns.add(schema_fqn)
+            run.bucket_id_by_schema[schema_fqn] = bucket.id
+            linked = bucket.source_bucket is not None
+            tables = [run.reader.get_table(t.id) if linked or needs_detail(t) else t for t in tables]
             self._upsert(
                 om,
                 run,
@@ -555,7 +793,7 @@ class Component(ComponentBase):
                 ),
                 OWNED_SCHEMA_FIELDS,
                 snapshot,
-                report,
+                bucket_report,
                 merger,
             )
             bucket_ok = True
@@ -565,15 +803,130 @@ class Component(ComponentBase):
                 )
                 run.seen_table_fqns.add(built.fqn)
                 self._record_column_catalog(run, built.fqn, table)
+                self._record_producer(run, bucket, table)
                 ok = self._upsert(
-                    om, run, "tables", "Table", built.fqn, built.body, OWNED_TABLE_FIELDS, snapshot, report, merger
+                    om,
+                    run,
+                    "tables",
+                    "Table",
+                    built.fqn,
+                    built.body,
+                    OWNED_TABLE_FIELDS,
+                    snapshot,
+                    bucket_report,
+                    merger,
                 )
                 bucket_ok = bucket_ok and ok
+                columns = [col["name"] for col in built.body.get("columns") or []]
                 if built.view_source_fqn:
-                    self._put_lineage(om, run, report, lineage_builder.view_edge(built.fqn, built.view_source_fqn))
+                    view_edges.append((bucket.id, lineage_builder.view_edge(built.fqn, built.view_source_fqn, columns)))
+                elif built.table_type == EXTERNAL and bucket.backend_path:
+                    external_tables.append((bucket, table.name, built.fqn, columns))
             # advance-after-success: persist the digest only once the bucket's writes succeeded
             if bucket_ok:
                 state.set_bucket_digest(run.ctx.project_id, bucket.id, digest)
+
+        def write_view_edge(item: tuple[str, lineage_builder.LineageEdge], item_report: RunReport) -> None:
+            bucket_id, edge = item
+            if self._put_lineage(om, run, item_report, edge, retry_table_level=True) == EdgeOutcome.FAILED:
+                # Re-sync the bucket next run so its view edge is written again. An
+                # unresolved source keeps the digest: it may never be cataloged.
+                state.forget_bucket_digest(run.ctx.project_id, bucket_id)
+
+        def write_external_edge(item: tuple[SourceBucket, str, str, list[str]], item_report: RunReport) -> None:
+            bucket, table_name, table_fqn, columns = item
+            if not config.write_table_lineage:
+                return
+            try:
+                edge = self._external_source_edge(
+                    om, run, item_report, bucket, table_name, table_fqn, columns, service_fqn
+                )
+                outcome = self._put_lineage(om, run, item_report, edge, retry_table_level=True) if edge else None
+            except Exception as exc:  # noqa: BLE001 - one table's lookup or write fails alone
+                # A 403 here is about the source warehouse's service, not the bot token:
+                # every Keboola entity was just written with it.
+                hint = (
+                    " (the bot may lack the right to view the source table or edit its lineage)"
+                    if isinstance(exc, OMAuthError)
+                    else ""
+                )
+                item_report.record(
+                    project_id=run.ctx.project_id,
+                    entity_type="Lineage",
+                    entity_fqn=table_fqn,
+                    action=report_mod.ACTION_FAILED,
+                    detail=f"external bucket source: {exc}{hint}",
+                )
+                outcome = EdgeOutcome.FAILED
+            if outcome == EdgeOutcome.FAILED:
+                # Re-sync the bucket next run, so the edge is looked up and written again.
+                state.forget_bucket_digest(run.ctx.project_id, bucket.id)
+
+        self._parallel(config, buckets, sync_bucket, report)
+        view_edges.sort(key=lambda item: (item[1].to_fqn, item[1].from_fqn))  # buckets finish in any order
+        self._parallel(config, view_edges, write_view_edge, report)
+        external_tables.sort(key=lambda item: item[2])
+        self._parallel(config, external_tables, write_external_edge, report)
+
+    @staticmethod
+    def _check_database_owner(run: _ProjectRun, database_fqn: str, existing: dict | None) -> None:
+        """Stop when the project's Database already belongs to another Keboola project.
+
+        The Database is named after the project, so two projects with the same name,
+        or names that differ only in characters an FQN cannot hold ("[CF] Sales" and
+        "(CF) Sales"), map onto one Database. Their runs would overwrite each other's
+        entities, and each would tombstone the other's tables in a bucket of the same
+        name. The owner is the project id in the Database's ``sourceUrl``, which every
+        release has written; a Database without one is taken over as before.
+        """
+        match = _PROJECT_ID_IN_URL.search(str((existing or {}).get("sourceUrl") or ""))
+        if match and match.group(1) != str(run.ctx.project_id):
+            raise ProjectNameCollision(
+                f'OpenMetadata database "{database_fqn}" already belongs to Keboola project {match.group(1)}, '
+                f'whose name maps to the same database as project {run.ctx.project_id} ("{run.ctx.project_name}"). '
+                "Set a Project Name Override on this row, or a different Service Name when the other project "
+                "is on another Keboola stack. Nothing was written for this project."
+            )
+
+    def _external_source_edge(
+        self,
+        om: OMClient,
+        run: _ProjectRun,
+        report: RunReport,
+        bucket: SourceBucket,
+        table_name: str,
+        table_fqn: str,
+        columns: list[str],
+        own_service: str,
+    ) -> lineage_builder.LineageEdge | None:
+        """The edge from the warehouse table an external bucket's table reads, if OM has it.
+
+        The source is found by its database, schema and table name in any other
+        service of the OpenMetadata instance. None found, or several, is reported as
+        unresolved: the source warehouse may not be cataloged (yet). A lookup error
+        is raised to the caller.
+        """
+        hits = om.search_tables(table_name, bucket.backend_path[-1])
+        matches = lineage_builder.external_source_matches(hits, bucket.backend_path, table_name, own_service)
+        source = om.get_by_fqn("tables", matches[0], fields="columns") if len(matches) == 1 else None
+        if source is None:
+            where = ".".join([*bucket.backend_path, table_name])
+            if len(matches) > 1:
+                detail = f"several OpenMetadata tables match: {', '.join(matches)}"
+            elif matches:
+                detail = f"search found {matches[0]}, but it could not be read"
+            else:
+                detail = "not in OpenMetadata"
+            report.record(
+                project_id=run.ctx.project_id,
+                entity_type="Lineage",
+                entity_fqn=table_fqn,
+                action=report_mod.ACTION_UNRESOLVED,
+                detail=f"external bucket source {where}: {detail}",
+            )
+            return None
+        source_columns = [str(col.get("name")) for col in source.get("columns") or [] if col.get("name")]
+        return lineage_builder.external_edge(table_fqn, matches[0], columns, source_columns)
 
     @staticmethod
     def _record_column_catalog(run: _ProjectRun, table_fqn: str, table: SourceTable) -> None:
@@ -583,6 +936,13 @@ class Component(ComponentBase):
         a column the endpoint table does not actually hold (OM 400).
         """
         run.column_catalog[table_fqn] = {fqn_mod.sanitize_name(col.name) for col in table.columns}
+
+    @staticmethod
+    def _record_producer(run: _ProjectRun, bucket: SourceBucket, table: SourceTable) -> None:
+        # A linked bucket or an alias holds another project's (or table's) data: its
+        # producer metadata names a config that does not write it here.
+        if table.producer and bucket.source_bucket is None and not table.is_alias:
+            run.produced_tables.setdefault(table.producer, set()).add(table.id)
 
     @staticmethod
     def _bucket_in_scope(config: Configuration, bucket: SourceBucket) -> bool:
@@ -617,7 +977,8 @@ class Component(ComponentBase):
         # is fetched under ``_lineage_pass``.)
         if not (config.write_transformations or config.write_components or config.write_flows):
             return
-        self._upsert(
+        # Retire the pre-0.2 service only once its replacement is in place.
+        if self._upsert(
             om,
             run,
             "pipelineServices",
@@ -628,46 +989,104 @@ class Component(ComponentBase):
             snapshot,
             report,
             merger,
+        ):
+            self._retire_legacy_service(
+                om, run, report, "pipelineServices", "PipelineService", run.pipelines.pipeline_service_body()["name"]
+            )
+        available = self._ensure_custom_properties(
+            om, "pipeline", PIPELINE_CUSTOM_PROPERTIES, "Pipeline", config.custom_properties
         )
-        available = self._ensure_custom_properties(om, "pipeline", PIPELINE_CUSTOM_PROPERTIES, "Pipeline")
 
         def resolve_owner(email: str) -> str | None:
             return self._resolve_owner(om, run, email)
 
+        selected: list[tuple[str, str, dict]] = []
+        flow_ids: set[str] = set()
         for component in run.reader.list_component_configs():
             component_id = str(component.get("id") or component.get("componentId") or "")
             kind = component_kind(component_id, component.get("type"))
             if kind == "data_app":
                 continue  # data apps are catalogued as Dashboards, not Pipelines
             for cfg in component.get("configurations") or []:
-                if kind != "orchestration" and not self._is_producing(cfg):
+                if component_id == FLOW_COMPONENT_ID:
+                    flow_ids.add(str(cfg.get("id")))
+                if kind != "orchestration" and not (
+                    self._is_producing(cfg) or self._produced_outputs(run, component_id, kind, cfg)
+                ):
                     continue
-                cfg_id = str(cfg.get("id"))
-                if not self._pipeline_config_in_scope(config, kind, cfg_id):
-                    continue
-                built = run.pipelines.build_pipeline(
-                    component_id,
-                    cfg,
-                    kind=kind,
-                    available_properties=available,
-                    synced_at=synced_at,
-                    owner_resolver=resolve_owner,
-                )
-                run.pipeline_fqn_by_config[cfg_id] = built.fqn
-                self._upsert(
-                    om,
-                    run,
-                    "pipelines",
-                    "Pipeline",
-                    built.fqn,
-                    built.body,
-                    OWNED_PIPELINE_FIELDS,
-                    snapshot,
-                    report,
-                    merger,
-                )
-                if config.write_pipeline_status:
-                    self._push_pipeline_status(run, built.fqn, cfg, env, om, report)
+                if self._pipeline_config_in_scope(config, kind, str(cfg.get("id"))):
+                    selected.append((component_id, kind, cfg))
+        # A legacy orchestration that was migrated to a flow shares the flow's id (and
+        # pipeline FQN): the flow is the live one, so the leftover is not cataloged.
+        run.migrated_orchestration_ids = {
+            str(cfg.get("id")) for cid, _kind, cfg in selected if cid == LEGACY_ORCHESTRATOR_ID
+        } & flow_ids
+        selected = [s for s in selected if not (s[0] == LEGACY_ORCHESTRATOR_ID and str(s[2].get("id")) in flow_ids)]
+
+        def sync_pipeline(item: tuple[str, str, dict], item_report: RunReport) -> None:
+            component_id, kind, cfg = item
+            built = run.pipelines.build_pipeline(
+                component_id,
+                cfg,
+                kind=kind,
+                available_properties=available,
+                synced_at=synced_at,
+                owner_resolver=resolve_owner,
+            )
+            run.pipeline_fqn_by_config[str(cfg.get("id"))] = built.fqn
+            self._upsert(
+                om,
+                run,
+                "pipelines",
+                "Pipeline",
+                built.fqn,
+                built.body,
+                OWNED_PIPELINE_FIELDS,
+                snapshot,
+                item_report,
+                merger,
+            )
+            if config.write_pipeline_status:
+                self._push_pipeline_status(run, built.fqn, component_id, cfg, om, item_report)
+
+        self._parallel(config, selected, sync_pipeline, report)
+
+    @staticmethod
+    def _retire_legacy_service(
+        om: OMClient, run: _ProjectRun, report: RunReport, kind: str, entity_type: str, name: str
+    ) -> None:
+        """Soft-delete the project's service under its pre-0.2 name ``<service>-<projectId>``.
+
+        Pipeline and dashboard services are now named after the project. The old
+        service (and, recursively, its pipelines / dashboards and their lineage
+        edges) would otherwise stay in OpenMetadata as a duplicate. A soft delete
+        keeps it restorable in OpenMetadata; once deleted, the lookup no longer
+        finds it, so this is a single GET on every later run.
+        """
+        legacy = fqn_mod.legacy_project_service_name(run.entities.service_name, run.ctx.project_id)
+        if legacy == name:
+            return
+        try:
+            entity = om.get_by_fqn(kind, legacy)
+            if not entity or not entity.get("id"):
+                return
+            # Our services say "Keboola project <id>" in their description; anything
+            # else (e.g. another project that happens to be named like this id) is kept.
+            if f"Keboola project {run.ctx.project_id}," not in (entity.get("description") or ""):
+                return
+            om.soft_delete(kind, entity["id"], recursive=True)
+            logger.info("Soft-deleted legacy %s %s (renamed to %s).", entity_type, legacy, name)
+            report.record(
+                project_id=run.ctx.project_id,
+                entity_type=entity_type,
+                entity_fqn=legacy,
+                action=report_mod.ACTION_TOMBSTONED,
+                detail=f"renamed to {name}",
+            )
+        except OMAuthError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - cleanup of a renamed service is best-effort
+            logger.warning("Could not soft-delete legacy %s %s: %s", entity_type, legacy, exc)
 
     @staticmethod
     def _pipeline_config_in_scope(config: Configuration, kind: str, cfg_id: str) -> bool:
@@ -688,20 +1107,82 @@ class Component(ComponentBase):
         return not (selector and cfg_id not in selector)
 
     @staticmethod
-    def _is_producing(cfg: dict) -> bool:
-        storage = (cfg.get("configuration") or {}).get("storage") or {}
-        return bool((storage.get("output") or {}).get("tables") or (storage.get("input") or {}).get("tables"))
+    def _storage_tables(storage: object, side: str) -> list[dict]:
+        """The ``input`` or ``output`` tables of a storage mapping.
 
-    def _push_pipeline_status(self, run, pipeline_fqn, cfg, env, om, report) -> None:
-        job_id = ((cfg.get("configuration") or {}).get("_lastJobId")) or cfg.get("lastJobId")
-        if not job_id or not env["url"]:
+        An empty mapping can arrive as ``[]`` instead of ``{}`` (Storage stores what
+        the UI sent), at any level.
+        """
+        mapping = storage.get(side) if isinstance(storage, dict) else None
+        tables = mapping.get("tables") if isinstance(mapping, dict) else None
+        return [table for table in tables or [] if isinstance(table, dict)]
+
+    @classmethod
+    def _storages_of(cls, cfg: dict) -> list[dict]:
+        """The storage mappings of a config: its own first, then each enabled row's.
+
+        Many writers and extractors map their tables per row. Each row is one job
+        step with its own mapping, so it stays a separate storage: a row's inputs
+        never pair with another row's outputs.
+        """
+        top = (cfg.get("configuration") or {}).get("storage")
+        storages = [
+            {side: {"tables": cls._storage_tables(top, side)} for side in ("input", "output")}
+            if isinstance(top, dict)
+            else {}
+        ]
+        for row in cfg.get("rows") or []:
+            if not isinstance(row, dict) or row.get("isDisabled"):
+                continue
+            storage = (row.get("configuration") or {}).get("storage")
+            row_storage = {side: {"tables": cls._storage_tables(storage, side)} for side in ("input", "output")}
+            if row_storage["input"]["tables"] or row_storage["output"]["tables"]:
+                storages.append(row_storage)
+        return storages
+
+    @classmethod
+    def _is_producing(cls, cfg: dict) -> bool:
+        return any(
+            cls._storage_tables(storage, "input") or cls._storage_tables(storage, "output")
+            for storage in cls._storages_of(cfg)
+        )
+
+    @classmethod
+    def _produced_outputs(cls, run: _ProjectRun, component_id: str, kind: str, cfg: dict) -> list[str]:
+        """The tables a config without any output mapping writes, per Storage metadata.
+
+        A DB extractor writes through its own parameters (``outputTable``), so only the
+        tables' ``KBC.lastUpdatedBy`` metadata names it. The metadata is a fallback: a
+        table keeps naming a config after the config stops writing it (an output
+        re-pointed elsewhere, a row disabled), so an output mapping on the config or
+        on any of its rows, disabled ones too, wins. A transformation's outputs come
+        from its mapping and SQL.
+        """
+        if kind in ("transformation", "orchestration", "data_app"):
+            return []
+        rows = [row for row in cfg.get("rows") or [] if isinstance(row, dict)]
+        mappings = [(cfg.get("configuration") or {}).get("storage")]
+        mappings += [(row.get("configuration") or {}).get("storage") for row in rows]
+        if any(cls._storage_tables(storage, "output") for storage in mappings):
+            return []
+        return sorted(run.produced_tables.get((component_id, str(cfg.get("id"))), ()))
+
+    def _push_pipeline_status(self, run, pipeline_fqn, component_id, cfg, om, report) -> None:
+        if not run.ctx.storage_url:
             return
-        queue_url = env["url"].replace("connection.", "queue.")
+        if run.job_queue is None:
+            run.job_queue = JobQueueReader(run.ctx.storage_url.replace("connection.", "queue."), run.ctx.storage_token)
+        queue = run.job_queue
         try:
-            events = JobQueueReader(queue_url, run.ctx.storage_token).get_lineage_events(str(job_id))
-            record = JobQueueReader.summarize_run(events)
-            if record is not None:
-                om.put_pipeline_status(pipeline_fqn, record.to_status_body())
+            # The configuration listing carries no job id: ask the queue for the latest job
+            # on the production branch (the listing is production-only too).
+            job = queue.latest_job(component_id, str(cfg.get("id")), branch_id=run.reader.branch_id)
+            if job is None:
+                return  # never ran
+            # Only a flow's child jobs map to tasks of its pipeline; others keep the overall status.
+            task_names = PipelineBuilder.flow_task_names_by_job(cfg.get("configuration") or {})
+            children = queue.child_jobs(str(job["runId"])) if task_names and job.get("runId") else []
+            om.put_pipeline_status(pipeline_fqn, status_record(job, children, task_names).to_status_body())
         except OMAuthError:
             # Auth stays fatal, consistent with the per-entity write paths (_upsert /
             # _put_lineage) — an invalid #bot_token must fail the run, not be swallowed.
@@ -736,7 +1217,7 @@ class Component(ComponentBase):
         upserted as a Dashboard under one ``CustomDashboard`` service, so its metadata
         (name, description, deep link to the Keboola config) shows up in OpenMetadata.
         """
-        self._upsert(
+        if self._upsert(
             om,
             run,
             "dashboardServices",
@@ -747,8 +1228,18 @@ class Component(ComponentBase):
             snapshot,
             report,
             merger,
+        ):
+            self._retire_legacy_service(
+                om,
+                run,
+                report,
+                "dashboardServices",
+                "DashboardService",
+                run.dashboards.dashboard_service_body()["name"],
+            )
+        available = self._ensure_custom_properties(
+            om, "dashboard", DASHBOARD_CUSTOM_PROPERTIES, "Dashboard", config.custom_properties
         )
-        available = self._ensure_custom_properties(om, "dashboard", DASHBOARD_CUSTOM_PROPERTIES, "Dashboard")
         stack_id = run.dashboards.stack_id
         app_states = (
             fetch_app_states(f"https://data-science.{stack_id.removeprefix('connection.')}", run.ctx.storage_token)
@@ -780,19 +1271,33 @@ class Component(ComponentBase):
                     merger,
                 )
 
-    def _lineage_pass(self, config: Configuration, om: OMClient, run: _ProjectRun, report: RunReport) -> None:
+    def _lineage_pass(
+        self,
+        config: Configuration,
+        om: OMClient,
+        run: _ProjectRun,
+        report: RunReport,
+        state: StateManager,
+        *,
+        force: bool = False,
+        drop_legacy_node_edges: bool = False,
+    ) -> bool:
+        """Emit every lineage edge of the project.
+
+        ``force`` re-writes targets whose edges did not change since the last run.
+        ``drop_legacy_node_edges`` deletes the table -> pipeline -> table node edges an
+        earlier run wrote in the legacy layout (when the layout changed). Returns
+        ``False`` when some of those deletes failed, so the caller retries them.
+        """
+        self._index_buckets(run)
         edges: list[lineage_builder.LineageEdge] = []
+        legacy_node_edges: list[lineage_builder.LineageEdge] = []
         for component in run.reader.list_component_configs():
             component_id = str(component.get("id") or component.get("componentId") or "")
             kind = component_kind(component_id, component.get("type"))
             for cfg in component.get("configurations") or []:
-                # rows[]-declared storage (some extractors/transforms map storage
-                # per config row, not at the top level) is not read here — Phase A
-                # scope is the top-level configuration.storage only; a follow-up.
-                storage = (cfg.get("configuration") or {}).get("storage") or {}
-                if kind == "data_app":
-                    edges += self._data_app_edges_for(config, run, cfg, storage)
-                    continue  # a data app is a Dashboard: upstream table -> app, no table -> table
+                if component_id == LEGACY_ORCHESTRATOR_ID and str(cfg.get("id")) in run.migrated_orchestration_ids:
+                    continue  # superseded by the flow of the same id (see _pipeline_pass)
                 pipeline_fqn = run.pipeline_fqn_by_config.get(str(cfg.get("id")))
                 if kind == "orchestration":
                     # A flow has no storage mapping of its own; its only lineage is
@@ -800,43 +1305,107 @@ class Component(ComponentBase):
                     if config.write_pipeline_lineage and pipeline_fqn:
                         edges += self._flow_child_edges_for(run, cfg, pipeline_fqn)
                     continue
-                # Phase B: the column-lineage engine also recovers input/output
-                # tables a transform reads/writes via a DIRECT fully-qualified SQL
-                # ref instead of a declared mapping. Parsed once here whenever ANY
-                # lineage is wanted — the table-level inferred inputs feed the
-                # pipeline edges below even when column lineage is off — and reused
-                # for both the column edges and the inferred-input -> pipeline
-                # wiring, so the SQL is never parsed twice.
-                column_result = (
-                    self._column_lineage_for(run, component_id, cfg, storage)
-                    if (config.write_table_lineage or config.write_pipeline_lineage or config.write_column_lineage)
-                    else None
-                )
-                if pipeline_fqn and config.write_pipeline_lineage:
-                    # The pipeline is a first-class lineage node, wired from the
-                    # DECLARED input/output mapping (plus the Phase B SQL-inferred
-                    # input, when nothing was declared).
-                    edges += lineage_builder.pipeline_edges(
-                        storage,
-                        service_name=run.entities.service_name,
-                        project=run.entities.project,
-                        pipeline_fqn=pipeline_fqn,
-                    )
-                    edges += self._inferred_input_pipeline_edges(run, storage, pipeline_fqn, column_result)
-                elif config.write_table_lineage:
-                    # No pipeline node (no pipeline built this run, or pipeline
-                    # lineage off) -> fall back to the coarse table->table cartesian
-                    # edges so lineage still exists without a pipeline to hang it on.
-                    edges += lineage_builder.declared_edges(
-                        storage,
-                        service_name=run.entities.service_name,
-                        project=run.entities.project,
-                    )
-                if config.write_column_lineage:
-                    edges += self._column_edges_for(run, cfg, pipeline_fqn, column_result, report)
+                storages = self._storages_of(cfg)
+                produced = self._produced_outputs(run, component_id, kind, cfg)
+                if produced:
+                    top = storages[0]
+                    output = {"tables": self._storage_tables(top, "output") + [{"destination": t} for t in produced]}
+                    storages[0] = {**top, "output": output}
+                if kind == "data_app":
+                    edges += self._data_app_edges_for(config, run, cfg, storages[0])
+                    continue  # a data app is a Dashboard: upstream table -> app, no table -> table
+                # The pipeline FQN a legacy-layout run gave this config, for when it has
+                # no pipeline this run.
+                legacy_fqn = fqn_mod.pipeline_fqn(run.entities.service_name, run.entities.project, str(cfg.get("id")))
+                for storage in storages:
+                    storage_edges = self._storage_lineage(config, run, report, component_id, cfg, storage)
+                    edges += storage_edges.table_edges + storage_edges.column_edges
+                    if not pipeline_fqn:
+                        if drop_legacy_node_edges:
+                            # A config with no pipeline this run (selector, family switch) may
+                            # still hold node edges from the legacy layout: drop them too.
+                            legacy_node_edges += lineage_builder.pipeline_edges(
+                                storage,
+                                service_name=run.entities.service_name,
+                                project=run.entities.project,
+                                pipeline_fqn=legacy_fqn,
+                                bucket_paths=run.bucket_paths,
+                            )
+                        continue
+                    # The pipeline as its own node between tables: the legacy layout, and
+                    # the only way to show an extractor (outputs only) or a writer (inputs
+                    # only), which has no table -> table edge to carry its pipeline. Edges
+                    # that cannot be written (an endpoint outside the catalog) do not count:
+                    # the pipeline would otherwise show no lineage at all.
+                    if config.write_pipeline_lineage and (
+                        _pipelines_as_lineage_nodes(config)
+                        or not self._writable_edges(om, run, storage_edges.table_edges)
+                    ):
+                        edges += storage_edges.node_edges
+                    elif drop_legacy_node_edges:
+                        legacy_node_edges += storage_edges.node_edges
+        edges = lineage_builder.merge_edges(edges)
         if config.write_bucket_lineage:
             edges += lineage_builder.bucket_edges(edges)
-        self._refresh_lineage(om, run, report, edges)
+        # One row of a config may keep the node edge another row drops (both read
+        # the same table): never delete an edge this run writes.
+        written = {(e.from_type, e.from_fqn, e.to_type, e.to_fqn) for e in edges}
+        legacy_node_edges = [
+            e for e in legacy_node_edges if (e.from_type, e.from_fqn, e.to_type, e.to_fqn) not in written
+        ]
+        self._refresh_lineage(config, om, run, report, state, edges, force=force)
+        return self._delete_legacy_node_edges(om, run, legacy_node_edges)
+
+    def _storage_lineage(
+        self, config: Configuration, run: _ProjectRun, report: RunReport, component_id: str, cfg: dict, storage: dict
+    ) -> _StorageEdges:
+        """The lineage of one storage mapping of a config (its own or one row's)."""
+        pipeline_fqn = run.pipeline_fqn_by_config.get(str(cfg.get("id")))
+        # Phase B: the column-lineage engine also recovers input/output
+        # tables a transform reads/writes via a DIRECT fully-qualified SQL
+        # ref instead of a declared mapping. Parsed once here whenever ANY
+        # lineage is wanted and reused for the table edges, the column edges
+        # and the legacy pipeline-node wiring, so the SQL is never parsed twice.
+        column_result = (
+            self._column_lineage_for(run, component_id, cfg, storage)
+            if (config.write_table_lineage or config.write_pipeline_lineage or config.write_column_lineage)
+            else None
+        )
+        # The pipeline rides on each table -> table edge (lineageDetails.pipeline),
+        # so OM keeps the table -> table path its column lineage is drawn on.
+        edge_pipeline_fqn = pipeline_fqn if config.write_pipeline_lineage else None
+        edges = _StorageEdges()
+        if config.write_table_lineage:
+            edges.table_edges = lineage_builder.declared_edges(
+                storage,
+                service_name=run.entities.service_name,
+                project=run.entities.project,
+                pipeline_fqn=edge_pipeline_fqn,
+                sql_table_edges=column_result.table_edges if column_result else None,
+                sql_by_output=column_result.sql_by_output if column_result else None,
+                bucket_paths=run.bucket_paths,
+            )
+        if pipeline_fqn:
+            edges.node_edges = lineage_builder.pipeline_edges(
+                storage,
+                service_name=run.entities.service_name,
+                project=run.entities.project,
+                pipeline_fqn=pipeline_fqn,
+                bucket_paths=run.bucket_paths,
+            ) + self._inferred_input_pipeline_edges(run, storage, pipeline_fqn, column_result)
+        if config.write_column_lineage:
+            edges.column_edges = self._column_edges_for(run, cfg, edge_pipeline_fqn, column_result, report)
+        return edges
+
+    def _writable_edges(self, om, run, edges: list[lineage_builder.LineageEdge]) -> list[lineage_builder.LineageEdge]:
+        """The edges whose two endpoints exist in OM: cataloged this run, or found by name."""
+
+        def exists(fqn: str, entity_type: str) -> bool:
+            if entity_type == "table" and fqn in run.seen_table_fqns:
+                return True
+            return self._resolve_id(om, run, fqn, entity_type) is not None
+
+        return [e for e in edges if exists(e.from_fqn, e.from_type) and exists(e.to_fqn, e.to_type)]
 
     @staticmethod
     def _flow_child_edges_for(run: _ProjectRun, cfg: dict, flow_pipeline_fqn: str) -> list[lineage_builder.LineageEdge]:
@@ -913,6 +1482,9 @@ class Component(ComponentBase):
             service_name=run.entities.service_name,
             project=run.entities.project,
             known_table_fqns=known_table_fqns,
+            bucket_paths=run.bucket_paths,
+            schema_buckets=run.schema_buckets,
+            schema_databases=run.schema_databases,
         )
 
     def _column_edges_for(self, run: _ProjectRun, cfg: dict, pipeline_fqn, result: LineageResult | None, report):
@@ -932,26 +1504,67 @@ class Component(ComponentBase):
             project=run.entities.project,
             pipeline_fqn=pipeline_fqn,
             column_catalog=run.column_catalog,
+            bucket_paths=run.bucket_paths,
         )
 
     def _data_app_edges_for(self, config, run, cfg, storage) -> list[lineage_builder.LineageEdge]:
         """Upstream table -> data-app (Dashboard) edges for one data-app config.
 
-        Gated on both ``write_data_apps`` (the Dashboard must exist — the dashboard
-        pass wrote it and recorded its FQN) and ``write_dashboard_lineage``. Returns
-        nothing if the config produced no Dashboard this run.
+        The app's inputs are its input mapping plus the tables its inline code names
+        (see :meth:`_code_inputs`). Gated on both ``write_data_apps`` (the Dashboard
+        must exist — the dashboard pass wrote it and recorded its FQN) and
+        ``write_dashboard_lineage``. Returns nothing if the config produced no
+        Dashboard this run.
         """
         if not (config.write_data_apps and config.write_dashboard_lineage):
             return []
         dashboard_fqn = run.dashboard_fqn_by_config.get(str(cfg.get("id")))
         if not dashboard_fqn:
             return []
+        if code_inputs := self._code_inputs(run, cfg):
+            tables = self._storage_tables(storage, "input") + [{"source": sid} for sid in code_inputs]
+            storage = {**storage, "input": {"tables": tables}}
         return lineage_builder.data_app_edges(
             storage,
             service_name=run.entities.service_name,
             project=run.entities.project,
             dashboard_fqn=dashboard_fqn,
+            bucket_paths=run.bucket_paths,
         )
+
+    @staticmethod
+    def _code_inputs(run: _ProjectRun, cfg: dict) -> list[str]:
+        """Storage ids of the cataloged tables a data app's inline code names.
+
+        Most data apps query the Query Service from their code and have no input
+        mapping, so the tables they read are only in that code. A Git-hosted app's
+        code is not in the configuration and yields nothing.
+        """
+        configuration = cfg.get("configuration")
+        params = configuration.get("parameters") if isinstance(configuration, dict) else None
+        script = params.get("script") if isinstance(params, dict) else None
+        if isinstance(script, list):
+            code = "\n".join(line for line in script if isinstance(line, str))
+        else:
+            code = script if isinstance(script, str) else ""
+        known = set(run.column_catalog) | run.seen_table_fqns
+        inputs: set[str] = set()
+        for databases, schema, table in lineage_builder.code_table_refs(code):
+            storage_id = fqn_mod.storage_id_for_ref(
+                schema,
+                table,
+                databases,
+                schema_buckets=run.schema_buckets,
+                schema_databases=run.schema_databases,
+            )
+            if storage_id is None:
+                continue
+            table_fqn = fqn_mod.table_fqn_from_storage_id(
+                run.entities.service_name, run.entities.project, storage_id, run.bucket_paths
+            )
+            if table_fqn in known:
+                inputs.add(storage_id)
+        return sorted(inputs)
 
     @staticmethod
     def _inferred_input_pipeline_edges(
@@ -974,7 +1587,9 @@ class Component(ComponentBase):
         sids = sorted({sid for sid, _tid in result.table_edges})
         edges: list[lineage_builder.LineageEdge] = []
         for sid in sids:
-            in_fqn = fqn_mod.table_fqn_from_storage_id(run.entities.service_name, run.entities.project, sid)
+            in_fqn = fqn_mod.table_fqn_from_storage_id(
+                run.entities.service_name, run.entities.project, sid, run.bucket_paths
+            )
             if not in_fqn:
                 continue
             edges.append(
@@ -1000,48 +1615,234 @@ class Component(ComponentBase):
             statements.append(("legacy", query))
         return statements
 
-    def _refresh_lineage(self, om, run, report, edges) -> None:
-        # drop our stale edges (never Manual) on affected targets, then add current.
-        # Keyed on each edge's TARGET type: an input->pipeline edge's target is the
-        # pipeline itself (cleanup must hit /lineage/.../pipeline/..., not a hardcoded
-        # "table"), dashboard (data-app) targets carry DashboardLineage and bucket
-        # (databaseSchema) targets carry ChildAssets — clean each target with the
-        # lineage sources it can actually hold.
-        sources_by_type = {"dashboard": OUR_DASHBOARD_LINEAGE_SOURCES, "databaseSchema": OUR_SCHEMA_LINEAGE_SOURCES}
-        targets = {(e.to_type, e.to_fqn) for e in edges}
-        for to_type, target_fqn in targets:
-            sources = sources_by_type.get(to_type, OUR_LINEAGE_SOURCES)
-            for source in sources:
-                try:
-                    om.delete_lineage_by_source(to_type, target_fqn, source)
-                except Exception:
-                    logger.debug("lineage cleanup skipped for %s/%s", target_fqn, source, exc_info=True)
-        for edge in edges:
-            self._put_lineage(om, run, report, edge)
+    def _delete_legacy_node_edges(self, om: OMClient, run: _ProjectRun, edges) -> bool:
+        """Delete exact legacy node edges; return whether every delete went through.
 
-    def _put_lineage(self, om, run, report, edge) -> None:
-        request = lineage_builder.to_add_lineage_request(edge, lambda f, t: self._resolve_id(om, run, f, t))
+        An absent edge or endpoint is fine (404). Any other failure is logged and
+        reported back, so the caller keeps the migration pending for the next run.
+        """
+        complete = True
+        for edge in edges:
+            try:
+                from_id = self._resolve_id(om, run, edge.from_fqn, edge.from_type)
+                to_id = self._resolve_id(om, run, edge.to_fqn, edge.to_type)
+                if from_id and to_id:
+                    om.delete_lineage_edge(edge.from_type, from_id, edge.to_type, to_id)
+            except OMAuthError:
+                raise
+            except OMNotFound:
+                continue
+            except Exception as exc:  # noqa: BLE001 - retried by the next run
+                complete = False
+                logger.warning("Legacy lineage edge %s -> %s not deleted: %s", edge.from_fqn, edge.to_fqn, exc)
+        return complete
+
+    def _refresh_lineage(self, config, om, run, report, state, edges, *, force: bool) -> None:
+        """Re-write the lineage of every target whose edges changed since the last run.
+
+        Drop our stale edges (never Manual) on each changed target first, then add
+        the current ones — all deletes before any write, because a delete on a
+        pipeline also removes every edge that carries that pipeline, wherever it
+        points. The cleanup is keyed on each edge's TARGET type: an input->pipeline
+        edge's target is the pipeline itself (cleanup must hit
+        /lineage/.../pipeline/..., not a hardcoded "table"), dashboard (data-app)
+        targets carry DashboardLineage and bucket (databaseSchema) targets carry
+        ChildAssets — each target is cleaned with the lineage sources it can hold.
+
+        A target whose edges match the digest saved after its last complete write
+        is skipped, unless ``force``, an entity on its edges was created this run (a
+        new entity id means OM holds none of its edges), or its edges carry or start
+        at a pipeline whose own lineage is re-written (whose delete drops them).
+        """
+        sources_by_type = {"dashboard": OUR_DASHBOARD_LINEAGE_SOURCES, "databaseSchema": OUR_SCHEMA_LINEAGE_SOURCES}
+        by_target: dict[tuple[str, str], list[lineage_builder.LineageEdge]] = {}
+        for edge in edges:
+            by_target.setdefault((edge.to_type, edge.to_fqn), []).append(edge)
+        previous = state.lineage_digests(run.ctx.project_id)
+        previous_unresolved = state.lineage_unresolved(run.ctx.project_id)
+        digests = {target: lineage_digest(target_edges) for target, target_edges in by_target.items()}
+
+        def touches(target_edges, fqns: set[str]) -> bool:
+            return any(fqn in fqns for e in target_edges for fqn in (e.from_fqn, e.to_fqn, e.pipeline_fqn))
+
+        changed = {
+            target
+            for target, target_edges in by_target.items()
+            if force
+            or touches(target_edges, run.created_fqns)
+            or previous.get(f"{target[0]}:{target[1]}") != digests[target]
+        }
+        changed |= self._targets_with_appeared_endpoints(
+            config, om, run, [t for t in by_target if t not in changed], previous_unresolved
+        )
+        # A cleaned pipeline can pull in another pipeline target (a flow inside a flow),
+        # so repeat until no target is added.
+        while True:
+            cleaned_pipelines = {fqn for to_type, fqn in changed if to_type == "pipeline"}
+            added = {t for t, t_edges in by_target.items() if t not in changed and touches(t_edges, cleaned_pipelines)}
+            if not added:
+                break
+            changed |= added
+
+        # A target whose stale edges could not all be dropped gets no digest, so the
+        # next run cleans it again.
+        cleanup_failed: set[tuple[str, str]] = set()
+
+        def clean_target(target: tuple[str, str], _report: RunReport) -> None:
+            to_type, target_fqn = target
+            try:
+                # 2.0+ deletes by name; 1.13.4 needs the entity id.
+                target_id = None if om.is_2_0_or_newer else self._resolve_id(om, run, target_fqn, to_type)
+            except OMAuthError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - cleanup is best-effort, retried next run
+                logger.warning("Lineage cleanup skipped for %s: %s", target_fqn, exc)
+                cleanup_failed.add(target)
+                return
+            if target_id is None and not om.is_2_0_or_newer:
+                return  # not in OM: it holds no edges to drop
+            for source in sources_by_type.get(to_type, OUR_LINEAGE_SOURCES):
+                try:
+                    om.delete_lineage_by_source(to_type, target_fqn, source, entity_id=target_id)
+                except OMAuthError:
+                    raise
+                except OMNotFound:
+                    continue  # target not in OM (2.0+ deletes by name): nothing to drop
+                except Exception as exc:  # noqa: BLE001 - cleanup is best-effort, retried next run
+                    logger.warning("Lineage cleanup of %s edges on %s failed: %s", source, target_fqn, exc)
+                    cleanup_failed.add(target)
+
+        written: dict[str, str] = {}
+        unresolved: dict[str, list[str]] = {}
+
+        def write_target(target: tuple[str, str], item_report: RunReport) -> None:
+            key = f"{target[0]}:{target[1]}"
+            target_edges = by_target[target]
+            if target in changed:
+                outcomes = [(edge, self._put_lineage(om, run, item_report, edge)) for edge in target_edges]
+                if target in cleanup_failed or any(o == EdgeOutcome.FAILED for _e, o in outcomes):
+                    return
+                # An endpoint absent from OM does not block the digest: it is looked up
+                # again next run, and the target is re-written once it appears.
+                missing = sorted(
+                    {
+                        m
+                        for edge, o in outcomes
+                        if o == EdgeOutcome.UNRESOLVED
+                        for m in self._missing_endpoints(run, edge)
+                    }
+                )
+                if missing:
+                    unresolved[key] = missing
+            else:
+                if key in previous_unresolved:
+                    unresolved[key] = previous_unresolved[key]
+                for edge in target_edges:
+                    item_report.record(
+                        project_id=run.ctx.project_id,
+                        entity_type="Lineage",
+                        entity_fqn=f"{edge.from_fqn}->{edge.to_fqn}",
+                        action=report_mod.ACTION_SKIPPED_UNCHANGED,
+                        detail=edge.source,
+                    )
+            written[key] = digests[target]
+
+        self._parallel(config, [t for t in by_target if t in changed], clean_target, report)
+        self._parallel(config, list(by_target), write_target, report)
+        state.set_lineage_digests(run.ctx.project_id, written, unresolved)
+
+    def _targets_with_appeared_endpoints(
+        self, config, om, run, candidates: list[tuple[str, str]], previous_unresolved: dict[str, list[str]]
+    ) -> set[tuple[str, str]]:
+        """Skipped targets whose endpoints were missing last run and exist in OM now."""
+        pending = {
+            t: previous_unresolved[f"{t[0]}:{t[1]}"] for t in candidates if f"{t[0]}:{t[1]}" in previous_unresolved
+        }
+        endpoints = sorted({e for keys in pending.values() for e in keys})
+        appeared: set[str] = set()
+
+        def look_up(endpoint: str, _report: RunReport) -> None:
+            entity_type, fqn = endpoint.split(":", 1)
+            try:
+                found = self._resolve_id(om, run, fqn, entity_type) is not None
+            except OMAuthError:
+                raise
+            except Exception:  # noqa: BLE001 - unsure counts as appeared: re-write the target
+                found = True
+            if found:
+                appeared.add(endpoint)
+
+        self._parallel(config, endpoints, look_up, RunReport(run_id=run.ctx.project_id))
+        return {t for t, keys in pending.items() if appeared & set(keys)}
+
+    @staticmethod
+    def _missing_endpoints(run: _ProjectRun, edge: lineage_builder.LineageEdge) -> list[str]:
+        """``type:fqn`` of the edge endpoints the run found absent from OM."""
+        ends = ((edge.from_type, edge.from_fqn), (edge.to_type, edge.to_fqn))
+        return [f"{t}:{f}" for t, f in ends if f"{t}:{f}" in run.id_cache and run.id_cache[f"{t}:{f}"] is None]
+
+    def _put_lineage(self, om, run, report, edge, *, retry_table_level: bool = False) -> EdgeOutcome:
+        """PUT one edge; record the outcome in the run report.
+
+        ``retry_table_level`` re-sends a rejected column-level edge without its
+        column mappings — for a linked table whose source table (cataloged by
+        another project's row) may not hold every column under the same name.
+        """
+        edge_fqn = f"{edge.from_fqn}->{edge.to_fqn}"
+        try:
+            request = lineage_builder.to_add_lineage_request(edge, lambda f, t: self._resolve_id(om, run, f, t))
+        except OMAuthError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - an id lookup failure is per-edge, retried next run
+            report.record(
+                project_id=run.ctx.project_id,
+                entity_type="Lineage",
+                entity_fqn=edge_fqn,
+                action=report_mod.ACTION_FAILED,
+                detail=f"entity lookup: {exc}",
+            )
+            return EdgeOutcome.FAILED
         if request is None:
-            return
+            missing = self._missing_endpoints(run, edge)
+            if not missing:
+                return EdgeOutcome.SKIPPED
+            report.record(
+                project_id=run.ctx.project_id,
+                entity_type="Lineage",
+                entity_fqn=edge_fqn,
+                action=report_mod.ACTION_UNRESOLVED,
+                detail=f"not in OpenMetadata: {', '.join(missing)}",
+            )
+            return EdgeOutcome.UNRESOLVED
         try:
             om.put_lineage(request)
             report.record(
                 project_id=run.ctx.project_id,
                 entity_type="Lineage",
-                entity_fqn=f"{edge.from_fqn}->{edge.to_fqn}",
+                entity_fqn=edge_fqn,
                 action=report_mod.ACTION_UPDATED,
                 detail=edge.source,
             )
+            return EdgeOutcome.WRITTEN
         except OMAuthError:
             raise
         except Exception as exc:  # noqa: BLE001 - a single edge failure is per-entity
+            if retry_table_level and edge.columns_lineage and isinstance(exc, OMClientError):
+                logger.warning(
+                    "Column-level lineage %s -> %s rejected (%s); writing it table-level.",
+                    edge.from_fqn,
+                    edge.to_fqn,
+                    exc,
+                )
+                return self._put_lineage(om, run, report, dataclasses.replace(edge, columns_lineage=[]))
             report.record(
                 project_id=run.ctx.project_id,
                 entity_type="Lineage",
-                entity_fqn=f"{edge.from_fqn}->{edge.to_fqn}",
+                entity_fqn=edge_fqn,
                 action=report_mod.ACTION_FAILED,
                 detail=str(exc),
             )
+            return EdgeOutcome.FAILED
 
     _KIND_BY_LINEAGE_TYPE: ClassVar[dict[str, str]] = {
         "pipeline": "pipelines",
@@ -1069,8 +1870,10 @@ class Component(ComponentBase):
             run.id_cache[cache_key] = om.find_user_id_by_email(email)
         return run.id_cache[cache_key]
 
-    def _tombstone_pass(self, om: OMClient, run: _ProjectRun, report: RunReport) -> None:
-        """Reconcile stale OM tables — scoped to the buckets this run enumerated.
+    def _tombstone_pass(
+        self, config: Configuration, om: OMClient, run: _ProjectRun, report: RunReport, state: StateManager
+    ) -> None:
+        """Reconcile stale OM tables — scoped to the buckets this run re-wrote.
 
         Scope-safety (spec risk #4 / §6.2 step 8): reconciliation happens *per
         DatabaseSchema* the run actually enumerated, never over the whole Database.
@@ -1080,9 +1883,17 @@ class Component(ComponentBase):
         The delete path stays fail-closed within each schema (skip on a listing
         error or an implausibly short scope).
         """
-        for schema_fqn in sorted(run.seen_schema_fqns):
+
+        def tombstone(schema_fqn: str, item_report: RunReport) -> None:
             seen_in_schema = sorted(f for f in run.seen_table_fqns if f.startswith(f"{schema_fqn}."))
-            self._tombstone_schema(om, run, report, schema_fqn, seen_in_schema)
+            if not self._tombstone_schema(om, run, item_report, schema_fqn, seen_in_schema):
+                # Forget the bucket's digest: an unchanged bucket is not tombstoned
+                # again, so the next run must re-sync it to retry.
+                bucket_id = run.bucket_id_by_schema.get(schema_fqn)
+                if bucket_id:
+                    state.forget_bucket_digest(run.ctx.project_id, bucket_id)
+
+        self._parallel(config, sorted(run.seen_schema_fqns), tombstone, report)
 
     def _tombstone_schema(
         self,
@@ -1091,7 +1902,8 @@ class Component(ComponentBase):
         report: RunReport,
         schema_fqn: str,
         seen_in_schema: list[str],
-    ) -> None:
+    ) -> bool:
+        """Soft-delete the schema's stale tables. Returns False when it could not reconcile."""
         if om.is_2_0_or_newer:
             # 2.0+ deleteStale, scoped to this DatabaseSchema (not the whole Database).
             body = TombstonePlanner.deletestale_body(schema_fqn, "databaseSchema", seen_in_schema, dry_run=False)
@@ -1099,7 +1911,8 @@ class Component(ComponentBase):
                 om.delete_stale(body)
             except Exception as exc:  # noqa: BLE001 - tombstoning never fails the run
                 logger.warning("deleteStale failed for %s (fail-closed): %s", schema_fqn, exc)
-            return
+                return False
+            return True
         try:
             listed = [
                 fqn
@@ -1108,11 +1921,11 @@ class Component(ComponentBase):
             ]
         except Exception as exc:  # noqa: BLE001 - fail closed on listing error
             logger.warning("Tombstone listing failed for %s (fail-closed): %s", schema_fqn, exc)
-            return
+            return False
         plan = TombstonePlanner.self_diff(listed, seen_in_schema)
         if plan.blocked:
             logger.warning("Tombstoning skipped for %s (fail-closed): %s", schema_fqn, plan.fail_closed_reason)
-            return
+            return False
         for stale_fqn in plan.to_delete:
             entity = om.get_by_fqn("tables", stale_fqn)
             if entity and entity.get("id"):
@@ -1123,6 +1936,7 @@ class Component(ComponentBase):
                     entity_fqn=stale_fqn,
                     action=report_mod.ACTION_TOMBSTONED,
                 )
+        return True
 
     # ---------------------------------------------------------- merge upsert
 
@@ -1139,7 +1953,7 @@ class Component(ComponentBase):
     # separate, best-effort ``_with_extension_owners`` call below.
     _PRIMARY_FIELDS_BY_KIND: ClassVar[dict[str, str]] = {
         "tables": "columns,tableConstraints",
-        "pipelines": "extension,owners",
+        "pipelines": "extension,owners,tasks",  # tasks are owned: without them every pipeline looks changed
         "dashboards": "extension,owners",
     }
 
@@ -1162,10 +1976,29 @@ class Component(ComponentBase):
             current = {**current, **{k: v for k, v in extra.items() if k in ("extension", "owners")}}
         return current
 
-    def _upsert(self, om, run, kind, entity_type, entity_fqn, desired, owned_fields, snapshot, report, merger) -> bool:
-        """Create-or-merge one entity; returns True on success (for advance-after-success)."""
+    def _upsert(
+        self,
+        om,
+        run,
+        kind,
+        entity_type,
+        entity_fqn,
+        desired,
+        owned_fields,
+        snapshot,
+        report,
+        merger,
+        check_current: Callable[[dict | None], None] | None = None,
+    ) -> bool:
+        """Create-or-merge one entity; returns True on success (for advance-after-success).
+
+        ``check_current`` sees the entity as OM holds it, before anything is written,
+        and may stop the run (``ProjectNameCollision``).
+        """
         try:
             current = om.get_by_fqn(kind, entity_fqn, fields=self._PRIMARY_FIELDS_BY_KIND.get(kind))
+            if check_current is not None:
+                check_current(current)
             primary_fields = self._PRIMARY_FIELDS_BY_KIND.get(kind) or ""
             if (
                 current is not None
@@ -1202,7 +2035,7 @@ class Component(ComponentBase):
                 detail=",".join(decision.diverged_fields),
             )
             return True
-        except OMAuthError:
+        except OMAuthError, ProjectNameCollision:
             raise
         except Exception as exc:  # noqa: BLE001 - per-entity failure handled per failure_mode
             return self._handle_entity_failure(run, report, entity_type, entity_fqn, exc)
@@ -1285,8 +2118,13 @@ class Component(ComponentBase):
     def test_connection(self) -> ValidationResult:
         config = Configuration(**self.configuration.parameters)
         env = self._read_environment()
-        om = OMClient(config.om_host, config.bot_token)
+        # Same network path as run(): through the bastion when the tunnel is on.
+        proxy = ssh_proxy.maybe_open_tunnel(config)
         try:
+            # Fail fast: a sync action has a short platform time limit, so the
+            # run-time retry budget (5 x 60 s) would end in a bare platform timeout.
+            # One 15 s attempt leaves room for the SSH tunnel setup.
+            om = self._build_om_client(config, proxy, timeout=15, max_retries=0)
             om.probe_version()
             version = om.server_version
             # /system/version is unauthenticated (OM JwtFilter.EXCLUDED_ENDPOINTS),
@@ -1295,6 +2133,13 @@ class Component(ComponentBase):
             om.verify_auth()
         except OMAuthError as exc:
             raise UserException(str(exc)) from exc
+        except OMConnectionError as exc:
+            raise UserException(f"{exc}. {self._connection_hint(config)}") from exc
+        except (OMClientError, ValueError) as exc:
+            raise UserException(self._unexpected_answer(config, exc)) from exc
+        finally:
+            if proxy is not None:
+                proxy.close()
         token, url = resolve_storage_credentials(
             row_token=config.storage_token, injected_token=env["token"], injected_url=env["url"]
         )
@@ -1347,9 +2192,9 @@ class Component(ComponentBase):
             kind = component_kind(component_id, component.get("type"))
             if kind in ("transformation", "orchestration", "data_app"):
                 continue
+            # Not filtered by storage mappings: a DB extractor writes through its own
+            # parameters, and the run finds its tables from Storage metadata.
             for cfg in component.get("configurations") or []:
-                if not self._is_producing(cfg):
-                    continue
                 name = cfg.get("name") or str(cfg.get("id"))
                 elements.append(SelectElement(value=str(cfg.get("id")), label=f"{component_id} / {name}"))
         return elements

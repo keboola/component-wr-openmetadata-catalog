@@ -70,7 +70,7 @@ def test_view_table_yields_schema_definition_and_source_fqn():
         id="in.c-linked",
         name="c-linked",
         stage="in",
-        path="in.c-linked",
+        path="out.c-shared",  # Storage gives a linked bucket its source bucket's path
         source_bucket={"id": "out.c-shared", "project": {"name": "Owner_Project"}},
     )
     table = SourceTable(
@@ -83,7 +83,7 @@ def test_view_table_yields_schema_definition_and_source_fqn():
     assert built.table_type == "View"
     assert built.view_source_fqn == "keboola-stack.Owner_Project.out_c-shared.customers"
     assert built.body["schemaDefinition"].startswith(
-        "CREATE VIEW keboola-stack.Acme_Project.in_c-linked.customers AS SELECT * FROM "
+        "CREATE VIEW keboola-stack.Acme_Project.out_c-shared.customers AS SELECT * FROM "
     )
 
 

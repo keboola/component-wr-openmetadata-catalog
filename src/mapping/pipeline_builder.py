@@ -41,6 +41,10 @@ CUSTOM_PROPERTIES = [
 ]
 
 _FLOW_COMPONENT_IDS = frozenset({"keboola.orchestrator", "keboola.flow"})
+# A flow migrated from a legacy orchestration keeps the orchestration's config id,
+# and the legacy configuration stays. Both would map to one pipeline FQN.
+FLOW_COMPONENT_ID = "keboola.flow"
+LEGACY_ORCHESTRATOR_ID = "keboola.orchestrator"
 _SQL_COMPONENT_IDS = frozenset(
     {
         "keboola.snowflake-transformation",
@@ -141,7 +145,7 @@ class PipelineBuilder:
         """One PipelineService per project, shown under the project's name."""
         return _drop_none(
             {
-                "name": fqn.project_service_name(self.service_name, self.project_id),
+                "name": fqn.project_service_name(self.service_name, self.project),
                 "displayName": fqn.sanitize_display_name(self.project),
                 "serviceType": _SERVICE_TYPE,
                 "description": f"Pipelines of Keboola project {self.project_id}, catalogued by "
@@ -241,7 +245,7 @@ class PipelineBuilder:
                 "name": fqn.pipeline_name(config_id),
                 "displayName": fqn.sanitize_display_name(config.get("name")),
                 "description": fqn.sanitize_display_name(config.get("description")),
-                "service": fqn.project_service_name(self.service_name, self.project_id),
+                "service": fqn.project_service_name(self.service_name, self.project),
                 "sourceUrl": self._component_url(component_id, config_id),
                 "tasks": tasks or None,
                 "extension": self._extension(component_id, config_id, config, config_url, available, synced_at, kind),
@@ -250,7 +254,7 @@ class PipelineBuilder:
         )
         return BuiltPipeline(
             body=body,
-            fqn=fqn.pipeline_fqn(self.service_name, self.project_id, config_id),
+            fqn=fqn.pipeline_fqn(self.service_name, self.project, config_id),
             component_id=component_id,
             config_id=config_id,
         )
@@ -319,7 +323,7 @@ class PipelineBuilder:
                 "name": fqn.pipeline_name(flow_id),
                 "displayName": fqn.sanitize_display_name(config.get("name")),
                 "description": fqn.sanitize_display_name(config.get("description")),
-                "service": fqn.project_service_name(self.service_name, self.project_id),
+                "service": fqn.project_service_name(self.service_name, self.project),
                 "sourceUrl": self._flow_url(flow_id),
                 "tasks": tasks or None,
                 "extension": self._extension(component_id, flow_id, config, config_url, available, synced_at, kind),
@@ -328,10 +332,33 @@ class PipelineBuilder:
         )
         return BuiltPipeline(
             body=body,
-            fqn=fqn.pipeline_fqn(self.service_name, self.project_id, flow_id),
+            fqn=fqn.pipeline_fqn(self.service_name, self.project, flow_id),
             component_id=component_id,
             config_id=flow_id,
         )
+
+    @staticmethod
+    def flow_task_names_by_job(configuration: dict) -> dict[str, list[str]]:
+        """OpenLineage job name of each flow task's child job -> the pipeline task names that run it.
+
+        The Job Queue names a child job ``<componentId>-<configId>``; OM accepts a task
+        status only under a task name of the pipeline, as :meth:`_flow_to_tasks` builds it.
+        Several tasks can run one configuration; their names are in phase order.
+        """
+        phase_index = {p.get("id"): i for i, p in enumerate(configuration.get("phases") or [])}
+        tasks = [
+            task
+            for task in configuration.get("tasks") or []
+            if task.get("enabled") is not False and task.get("phase") in phase_index
+        ]
+        names: dict[str, list[str]] = {}
+        for task in sorted(tasks, key=lambda t: phase_index[t.get("phase")]):
+            child = task.get("task") or {}
+            if child.get("componentId") and child.get("configId"):
+                names.setdefault(f"{child['componentId']}-{child['configId']}", []).append(
+                    fqn.sanitize_name(task.get("name") or task.get("id"))
+                )
+        return names
 
     @staticmethod
     def _flow_to_tasks(configuration: dict) -> list[dict]:

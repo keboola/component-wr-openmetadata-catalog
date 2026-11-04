@@ -35,6 +35,14 @@ _SERVICE_TYPE = "CustomDatabase"
 # Custom properties defined on the OpenMetadata Table/DatabaseSchema/Database
 # types: (name, field type, description). om_types used across this component
 # are only ever "string", "email", "hyperlink-cp".
+# Table statistics that change on every data load -> the custom property that
+# carries each. Kept out of the incremental digest when the property is not written.
+TABLE_STAT_PROPERTIES = {
+    "row_count": "kbcRowsCount",
+    "data_size_bytes": "kbcDataSizeBytes",
+    "last_import_date": "kbcLastImport",
+}
+
 TABLE_CUSTOM_PROPERTIES = [
     ("kbcTableId", "string", "Keboola Storage table id"),
     ("kbcBucketId", "string", "Keboola Storage bucket id"),
@@ -84,6 +92,8 @@ class EntityBuilder:
         self.project_id = project_id or "unknown"
         self.ui_base = ui_base.rstrip("/")
         self.stack_id = stack_id
+        # Bucket id -> Storage ``path`` of this project's buckets (see fqn.table_fqn_from_storage_id).
+        self.bucket_paths: dict[str, str] = {}
 
     # --------------------------------------------------------------- helpers
 
@@ -268,13 +278,22 @@ class EntityBuilder:
         available: set[str] | None,
         synced_at: str | None,
     ) -> dict | None:
+        # Storage does not measure a table of an external bucket (it reports 0 rows and
+        # 0 bytes): the data lives in the customer's warehouse. Said explicitly, as a
+        # left-out value would keep the 0 an earlier run wrote.
+        not_measured = "not measured (external bucket)"
+        external = bucket.has_external_schema
         values = {
             "kbcTableId": table.id,
             "kbcBucketId": bucket.id,
             "kbcStage": bucket.stage,
-            "kbcRowsCount": str(table.row_count) if table.row_count is not None else None,
-            "kbcDataSizeBytes": str(table.data_size_bytes) if table.data_size_bytes is not None else None,
-            "kbcLastImport": table.last_import_date,
+            "kbcRowsCount": not_measured
+            if external
+            else (str(table.row_count) if table.row_count is not None else None),
+            "kbcDataSizeBytes": not_measured
+            if external
+            else (str(table.data_size_bytes) if table.data_size_bytes is not None else None),
+            "kbcLastImport": None if external else table.last_import_date,
             "kbcIsAlias": "true" if table.is_alias else "false",
             "kbcTableUrl": enrichment.hyperlink(self._table_url(bucket.id, table.id), "Open table"),
             "kbcSyncedAt": synced_at,
@@ -319,7 +338,7 @@ class EntityBuilder:
 
         view_source_fqn: str | None = None
         if table_type == VIEW:
-            view_source_fqn = self._view_source_fqn(table)
+            view_source_fqn = self._view_source_fqn(bucket, table)
             if view_source_fqn:
                 body["schemaDefinition"] = f"CREATE VIEW {table_fqn} AS SELECT * FROM {view_source_fqn}"
 
@@ -330,8 +349,14 @@ class EntityBuilder:
             view_source_fqn=view_source_fqn,
         )
 
-    def _view_source_fqn(self, table: SourceTable) -> str | None:
-        """FQN of a linked/shared table's source, resolved onto its owning project."""
+    def _view_source_fqn(self, bucket: SourceBucket, table: SourceTable) -> str | None:
+        """FQN of a linked/shared table's source, resolved onto its owning project.
+
+        The source is cataloged under its own bucket's Storage path. A linked
+        bucket's path is its source bucket's; an alias of a table in this project
+        takes this project's bucket paths and cataloged name (which may be the
+        Project Name Override). Projects are compared by id: names are not unique.
+        """
         source = table.source_table or {}
         source_id = source.get("id")
         if not source_id:
@@ -339,8 +364,18 @@ class EntityBuilder:
         parts = str(source_id).split(".")
         if len(parts) < 3:
             return None
-        source_bucket_path = ".".join(parts[:2])
+        source_bucket_id = ".".join(parts[:2])
         source_table_name = ".".join(parts[2:])
         project_info = source.get("project") or {}
-        source_project = project_info.get("name") or self.project
+        if project_info.get("id") is not None:
+            same_project = str(project_info["id"]) == str(self.project_id)
+        else:
+            same_project = project_info.get("name") in (None, self.project)
+        source_project = self.project if same_project else (project_info.get("name") or self.project)
+        if (bucket.source_bucket or {}).get("id") == source_bucket_id and bucket.path:
+            source_bucket_path = bucket.path
+        elif same_project:
+            source_bucket_path = self.bucket_paths.get(source_bucket_id, source_bucket_id)
+        else:
+            source_bucket_path = source_bucket_id
         return fqn.table_fqn(self.service_name, source_project, source_bucket_path, source_table_name)
