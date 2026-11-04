@@ -736,7 +736,6 @@ def test_external_table_does_not_claim_to_be_empty():
     table = SourceTable(id="in.ext.T", name="T", columns=[SourceColumn(name="id")], row_count=0, data_size_bytes=0)
     external = SourceBucket(id="in.ext", name="ext", stage="in", path="in.ext", has_external_schema=True)
     extension = builder.table_body(external, table).body["extension"]
-    assert "kbcRowsCount" not in extension
-    assert "kbcDataSizeBytes" not in extension
+    assert extension["kbcRowsCount"] == extension["kbcDataSizeBytes"] == "not measured (external bucket)"
     regular = SourceBucket(id="in.c-a", name="c-a", stage="in", path="in.c-a")
     assert builder.table_body(regular, table).body["extension"]["kbcRowsCount"] == "0"
