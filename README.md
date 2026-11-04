@@ -84,9 +84,9 @@ Settings → Preferences → Lineage.
 | External bucket → its source table in BigQuery / Snowflake | Yes, with 1:1 column lineage, when OpenMetadata catalogs that warehouse in another service (found by database, schema and table name). Not found → `unresolved` in `catalog_run_report`; a source cataloged later is linked on the next full refresh | Bucket `backendPath` |
 | Bucket → bucket | Yes, aggregated from table lineage | — |
 | Flow → its tasks | Yes, pipeline → pipeline | Flow definition |
-| Table → data app | Yes | Data app input mapping |
+| Table → data app | Yes, from the input mapping and from tables the app's inline code names fully qualified (e.g. `"KBC_USE4_123"."in.c-bucket"."table"` in a Query Service query), when cataloged in the same run | Data app input mapping; app code |
 | Source system → extractor | The extractor → table part, yes (row above). The source database table itself (e.g. a MySQL table) is not drawn: catalog that database in OpenMetadata with its own connector | — |
-| Data app code / Git-hosted apps | No — the writer cannot read app code | — |
+| Git-hosted data apps | No — their code is not in the configuration | — |
 
 Settings reference
 ==================

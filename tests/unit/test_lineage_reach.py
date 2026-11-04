@@ -559,3 +559,60 @@ def test_alias_of_a_table_here_uses_the_project_name_override():
     )
     built = builder.table_body(SourceBucket(id="in.c-a", name="c-a", stage="in", path="in.c-a"), table)
     assert built.view_source_fqn == fqn_mod.table_fqn(SVC, "Override", "in.c-src", "t")
+
+
+def test_external_edge_prefers_the_exact_column_over_one_differing_in_case():
+    """A quoted Snowflake table can hold both ``ID`` and ``id``: each maps to itself."""
+    edge = lineage_builder.external_edge("k.P.s.T", "sf.D.S.T", ["ID", "id", "Note"], ["ID", "id", "NOTE", "note"])
+    assert edge.columns_lineage == [
+        {"fromColumns": ["sf.D.S.T.ID"], "toColumn": "k.P.s.T.ID"},
+        {"fromColumns": ["sf.D.S.T.id"], "toColumn": "k.P.s.T.id"},
+    ]  # "Note" has two case-only matches and no exact one: left out
+
+
+# ------------------------------------------------------------- data app code
+
+
+def test_code_table_refs_finds_qualified_names_in_strings():
+    code = '''
+    q = """SELECT * FROM "KBC_USE4_5922"."in.c-otlp"."traces" t JOIN "out.c-main"."users" u"""
+    other = "SELECT 1 FROM \\"in.c-esc\\".\\"t2\\""
+    bq = "SELECT * FROM `my-project.in_c_main.orders`"
+    label = ", ".join(["a", "b"])
+    '''
+    assert lineage_builder.code_table_refs(code) == {
+        (("KBC_USE4_5922",), "in.c-otlp", "traces"),
+        ((), "out.c-main", "users"),
+        ((), "in.c-esc", "t2"),
+        (("my-project",), "in_c_main", "orders"),
+    }
+
+
+def _data_app_run(script: str):
+    class _Reader:
+        def list_buckets(self):
+            return [
+                SourceBucket(
+                    id="in.c-otlp", name="c-otlp", path="in.c-otlp", backend_path=("KBC_USE4_5922", "in.c-otlp")
+                )
+            ]
+
+    run = _run(_Reader())
+    component_mod.Component._index_buckets(run)
+    run.seen_table_fqns.add(_t("in.c-otlp.traces"))
+    dashboard_fqn = fqn_mod.dashboard_fqn(SVC, PROJ, "app1")
+    run.dashboard_fqn_by_config["app1"] = dashboard_fqn
+    cfg = {"id": "app1", "configuration": {"storage": {}, "parameters": {"script": [script]}}}
+    config = SimpleNamespace(write_data_apps=True, write_dashboard_lineage=True)
+    edges = _component()._data_app_edges_for(config, run, cfg, {})
+    return {(e.from_fqn, e.to_fqn) for e in edges}, dashboard_fqn
+
+
+def test_data_app_without_input_mapping_reads_the_tables_its_code_queries():
+    pairs, dashboard_fqn = _data_app_run('query_data("""SELECT * FROM "KBC_USE4_5922"."in.c-otlp"."traces" """)')
+    assert pairs == {(_t("in.c-otlp.traces"), dashboard_fqn)}
+
+
+def test_data_app_code_naming_another_project_or_an_uncataloged_table_gets_no_edge():
+    pairs, _ = _data_app_run('"KBC_USE4_9999"."in.c-otlp"."traces" and "in.c-otlp"."missing"')
+    assert pairs == set()

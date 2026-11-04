@@ -211,13 +211,9 @@ def _build_inferred_map(
     """Phase B: promote a QUALIFIED workspace key to a storage id, but only
     when the run actually cataloged it.
 
-    A qualified ref's key is ``schema.table``. On Snowflake the schema is the
-    bucket id (``"in.c-bucket"``), so the key already is the storage id; elsewhere
-    the warehouse names the schema differently (BigQuery dataset ``in_c_bucket``,
-    an external bucket's own schema), and ``schema_buckets`` (warehouse schema ->
-    bucket id) maps it back. A ref that also names a database (a BigQuery project)
-    other than the bucket's own (``schema_databases``) reads another project's
-    table of the same name, so it is not mapped. Cross-checking the derived Table FQN against
+    A qualified ref's key is ``schema.table``, mapped to a storage id by
+    :func:`fqn.storage_id_for_ref` (with the database parts its refs named, from
+    ``catalogs``). Cross-checking the derived Table FQN against
     ``known_table_fqns`` is what filters out CTEs, workspace scratch tables and
     cross-project/non-cataloged refs that happen to carry a dotted ``.db`` part
     but were never a real Storage table this run saw. ``known_table_fqns=None``
@@ -230,11 +226,15 @@ def _build_inferred_map(
     for key in sorted(qualified_keys):
         # Keboola table names hold no dot, so the last dot ends the schema.
         schema, _, table = key.rpartition(".")
-        database = (schema_databases or {}).get(schema)
-        named = (catalogs or {}).get(key) or set()
-        if database and any(name.lower() != database.lower() for name in named):
+        storage_id = fqn_mod.storage_id_for_ref(
+            schema,
+            table,
+            (catalogs or {}).get(key) or (),
+            schema_buckets=schema_buckets,
+            schema_databases=schema_databases,
+        )
+        if storage_id is None:
             continue
-        storage_id = f"{(schema_buckets or {}).get(schema, schema)}.{table}"
         candidate_fqn = fqn_mod.table_fqn_from_storage_id(service_name, project, storage_id, bucket_paths)
         if candidate_fqn is not None and candidate_fqn in known_table_fqns:
             inferred[key] = storage_id

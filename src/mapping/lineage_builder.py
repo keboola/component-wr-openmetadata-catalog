@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import re
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -272,18 +273,58 @@ def external_edge(table_fqn: str, source_fqn: str, columns: list[str], source_co
 
     Both are the same physical table seen from two services, so the edge is
     ``CrossDatabaseLineage`` and each column maps to the source column of the same
-    name, ignoring case. A column whose name is not FQN-safe on either side is left
-    out: OpenMetadata would not resolve its column FQN.
+    name. Warehouses differ in how they case names, so a column with no exact match
+    takes the one source column that differs only in case; a quoted Snowflake table
+    can hold both ``ID`` and ``id``, and then only the exact match counts. A column
+    whose name is not FQN-safe on either side is left out: OpenMetadata would not
+    resolve its column FQN.
     """
-    source_by_name = {name.lower(): name for name in source_columns if fqn.sanitize_name(name) == name}
+    safe_sources = [name for name in source_columns if fqn.sanitize_name(name) == name]
+    by_case: dict[str, list[str]] = defaultdict(list)
+    for name in safe_sources:
+        by_case[name.lower()].append(name)
+
+    def source_of(col: str) -> str | None:
+        if col in safe_sources:
+            return col
+        same = by_case.get(col.lower(), [])
+        return same[0] if len(same) == 1 else None
+
     columns_lineage = [
-        {"fromColumns": [f"{source_fqn}.{source_by_name[col.lower()]}"], "toColumn": fqn.column_fqn(table_fqn, col)}
+        {"fromColumns": [f"{source_fqn}.{source}"], "toColumn": fqn.column_fqn(table_fqn, col)}
         for col in columns
-        if col.lower() in source_by_name and fqn.sanitize_name(col) == col
+        if fqn.sanitize_name(col) == col and (source := source_of(col))
     ]
     return LineageEdge(
         from_fqn=source_fqn, to_fqn=table_fqn, source=SOURCE_CROSS_DATABASE, columns_lineage=columns_lineage
     )
+
+
+# A table named in code: up to three quoted parts joined by dots, Snowflake style
+# ("DB"."in.c-bucket"."table") or BigQuery style (`project.dataset.table`).
+_DOUBLE_QUOTED_REF = re.compile(r'"([^"\n]+)"\s*\.\s*"([^"\n]+)"(?:\s*\.\s*"([^"\n]+)")?')
+_BACKTICK_REF = re.compile(r"`([^`\n]+)`((?:\s*\.\s*`[^`\n]+`)*)")
+
+
+def code_table_refs(code: str) -> set[tuple[tuple[str, ...], str, str]]:
+    """``(databases, schema, table)`` of every table a script names fully qualified.
+
+    A data app that queries the Query Service has no input mapping: its SQL is
+    in its code, as strings. Only qualified names are taken (a bare table name says
+    nothing about its bucket), and the caller keeps only those that resolve to a
+    cataloged table, so a quoted pair that is not a table drops out there.
+    """
+    code = code.replace('\\"', '"')
+    refs: set[tuple[tuple[str, ...], str, str]] = set()
+    for match in _DOUBLE_QUOTED_REF.finditer(code):
+        parts = [part for part in match.groups() if part is not None]
+        refs.add((tuple(parts[:-2]), parts[-2], parts[-1]))
+    for match in _BACKTICK_REF.finditer(code):
+        quoted = [match.group(1), *re.findall(r"`([^`\n]+)`", match.group(2))]
+        parts = [piece for part in quoted for piece in part.split(".")]
+        if len(parts) in (2, 3):
+            refs.add((tuple(parts[:-2]), parts[-2], parts[-1]))
+    return refs
 
 
 def data_app_edges(

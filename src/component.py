@@ -1481,15 +1481,20 @@ class Component(ComponentBase):
     def _data_app_edges_for(self, config, run, cfg, storage) -> list[lineage_builder.LineageEdge]:
         """Upstream table -> data-app (Dashboard) edges for one data-app config.
 
-        Gated on both ``write_data_apps`` (the Dashboard must exist — the dashboard
-        pass wrote it and recorded its FQN) and ``write_dashboard_lineage``. Returns
-        nothing if the config produced no Dashboard this run.
+        The app's inputs are its input mapping plus the tables its inline code names
+        (see :meth:`_code_inputs`). Gated on both ``write_data_apps`` (the Dashboard
+        must exist — the dashboard pass wrote it and recorded its FQN) and
+        ``write_dashboard_lineage``. Returns nothing if the config produced no
+        Dashboard this run.
         """
         if not (config.write_data_apps and config.write_dashboard_lineage):
             return []
         dashboard_fqn = run.dashboard_fqn_by_config.get(str(cfg.get("id")))
         if not dashboard_fqn:
             return []
+        if code_inputs := self._code_inputs(run, cfg):
+            tables = self._storage_tables(storage, "input") + [{"source": sid} for sid in code_inputs]
+            storage = {**storage, "input": {"tables": tables}}
         return lineage_builder.data_app_edges(
             storage,
             service_name=run.entities.service_name,
@@ -1497,6 +1502,35 @@ class Component(ComponentBase):
             dashboard_fqn=dashboard_fqn,
             bucket_paths=run.bucket_paths,
         )
+
+    @staticmethod
+    def _code_inputs(run: _ProjectRun, cfg: dict) -> list[str]:
+        """Storage ids of the cataloged tables a data app's inline code names.
+
+        Most data apps query the Query Service from their code and have no input
+        mapping, so the tables they read are only in that code. A Git-hosted app's
+        code is not in the configuration and yields nothing.
+        """
+        script = ((cfg.get("configuration") or {}).get("parameters") or {}).get("script")
+        code = "\n".join(str(line) for line in script) if isinstance(script, list) else str(script or "")
+        known = set(run.column_catalog) | run.seen_table_fqns
+        inputs: set[str] = set()
+        for databases, schema, table in lineage_builder.code_table_refs(code):
+            storage_id = fqn_mod.storage_id_for_ref(
+                schema,
+                table,
+                databases,
+                schema_buckets=run.schema_buckets,
+                schema_databases=run.schema_databases,
+            )
+            if storage_id is None:
+                continue
+            table_fqn = fqn_mod.table_fqn_from_storage_id(
+                run.entities.service_name, run.entities.project, storage_id, run.bucket_paths
+            )
+            if table_fqn in known:
+                inputs.add(storage_id)
+        return sorted(inputs)
 
     @staticmethod
     def _inferred_input_pipeline_edges(

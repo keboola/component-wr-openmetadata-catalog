@@ -12,7 +12,7 @@ same FQN, so N independent project rows converge on one coherent catalog.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 
 _UNSAFE = re.compile(r"[^0-9A-Za-z_-]+")
 _MULTI_UNDERSCORE = re.compile(r"_+")
@@ -101,6 +101,29 @@ def table_fqn_from_storage_id(
     bucket_id = ".".join(parts[:2])
     table_name = ".".join(parts[2:])
     return table_fqn(service_name, project, (bucket_paths or {}).get(bucket_id, bucket_id), table_name)
+
+
+def storage_id_for_ref(
+    schema: str,
+    table: str,
+    databases: Iterable[str] = (),
+    *,
+    schema_buckets: Mapping[str, str] | None = None,
+    schema_databases: Mapping[str, str] | None = None,
+) -> str | None:
+    """Storage id of a table named in code by its warehouse ``schema`` and ``table``.
+
+    On Snowflake the schema is the bucket id (``"in.c-bucket"``); elsewhere the
+    warehouse names it differently (BigQuery dataset ``in_c_bucket``, an external
+    bucket's own schema), and ``schema_buckets`` (warehouse schema -> bucket id)
+    maps it back. A ref that names a database (a BigQuery project) other than the
+    bucket's own (``schema_databases``) reads another project's table of the same
+    name: ``None``. The caller still checks that the table was cataloged.
+    """
+    database = (schema_databases or {}).get(schema)
+    if database and any(name.lower() != database.lower() for name in databases):
+        return None
+    return f"{(schema_buckets or {}).get(schema, schema)}.{table}"
 
 
 def column_fqn(table_fqn_value: str, column_name: str) -> str:
