@@ -728,3 +728,15 @@ def test_bigquery_data_app_resolves_the_dataset_name_and_checks_the_project():
 
     assert inputs("SELECT * FROM `my-project.in_c_main.orders`") == ["in.c-main.orders"]
     assert inputs("SELECT * FROM `other-project.in_c_main.orders`") == []
+
+
+def test_external_table_does_not_claim_to_be_empty():
+    """Storage reports 0 rows / 0 bytes for an external table: it does not measure it."""
+    builder = EntityBuilder(SVC, PROJ, PID, "https://ui.example")
+    table = SourceTable(id="in.ext.T", name="T", columns=[SourceColumn(name="id")], row_count=0, data_size_bytes=0)
+    external = SourceBucket(id="in.ext", name="ext", stage="in", path="in.ext", has_external_schema=True)
+    extension = builder.table_body(external, table).body["extension"]
+    assert "kbcRowsCount" not in extension
+    assert "kbcDataSizeBytes" not in extension
+    regular = SourceBucket(id="in.c-a", name="c-a", stage="in", path="in.c-a")
+    assert builder.table_body(regular, table).body["extension"]["kbcRowsCount"] == "0"

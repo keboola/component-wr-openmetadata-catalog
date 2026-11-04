@@ -278,13 +278,18 @@ class EntityBuilder:
         available: set[str] | None,
         synced_at: str | None,
     ) -> dict | None:
+        # Storage does not measure a table of an external bucket (it reports 0 rows and
+        # 0 bytes): the data lives in the customer's warehouse, so the stats are left out.
+        measured = not bucket.has_external_schema
         values = {
             "kbcTableId": table.id,
             "kbcBucketId": bucket.id,
             "kbcStage": bucket.stage,
-            "kbcRowsCount": str(table.row_count) if table.row_count is not None else None,
-            "kbcDataSizeBytes": str(table.data_size_bytes) if table.data_size_bytes is not None else None,
-            "kbcLastImport": table.last_import_date,
+            "kbcRowsCount": str(table.row_count) if measured and table.row_count is not None else None,
+            "kbcDataSizeBytes": (
+                str(table.data_size_bytes) if measured and table.data_size_bytes is not None else None
+            ),
+            "kbcLastImport": table.last_import_date if measured else None,
             "kbcIsAlias": "true" if table.is_alias else "false",
             "kbcTableUrl": enrichment.hyperlink(self._table_url(bucket.id, table.id), "Open table"),
             "kbcSyncedAt": synced_at,
