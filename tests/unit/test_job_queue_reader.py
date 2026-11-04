@@ -61,10 +61,33 @@ def test_latest_job_asks_for_the_newest_job_of_one_config():
 
 def test_child_jobs_are_found_by_the_parent_run_id():
     session = mock.Mock()
-    session.get.return_value = _response([{"id": "2"}])
+    session.get.return_value = _response([{"id": "2", "parentRunId": "1.2"}])
     reader = JobQueueReader("https://queue.keboola.com", "tok", session=session)
-    assert reader.child_jobs("1.2") == [{"id": "2"}]
+    assert reader.child_jobs("1.2") == [{"id": "2", "parentRunId": "1.2"}]
     assert session.get.call_args.kwargs["params"]["parentRunId"] == "1.2"
+
+
+def test_a_tasks_own_row_jobs_do_not_stand_for_the_task():
+    """The search returns every descendant: an extractor task that failed must not
+    show the success of its newest row job (seen live on a flow's GitHub task)."""
+    session = mock.Mock()
+    session.get.return_value = _response(
+        [
+            {"id": "63", "parentRunId": "37.49", "component": "keboola.ex-github-v2", "config": "1", "status": "error"},
+            {
+                "id": "18",
+                "parentRunId": "37.49.63",
+                "component": "keboola.ex-github-v2",
+                "config": "1",
+                "status": "success",
+            },
+        ]
+    )
+    reader = JobQueueReader("https://queue.keboola.com", "tok", session=session)
+    children = reader.child_jobs("37.49")
+    assert [job["id"] for job in children] == ["63"]
+    record = status_record({"status": "error"}, children, {"keboola.ex-github-v2-1": ["Extract"]})
+    assert record.task_status == [{"name": "Extract", "executionStatus": "Failed"}]
 
 
 def test_rate_limited_queue_call_is_retried():
@@ -122,3 +145,57 @@ def test_two_tasks_running_one_config_each_get_their_job():
         {"name": "Early", "executionStatus": "Successful"},
         {"name": "Late", "executionStatus": "Failed"},
     ]
+
+
+def _row_run():
+    container = {
+        "id": "63",
+        "runId": "37.49.63",
+        "parentRunId": "37.49",
+        "type": "container",
+        "component": "keboola.ex-github-v2",
+        "config": "1",
+        "status": "error",
+        "configRowIds": [],
+    }
+    row_ok = {
+        "id": "18",
+        "runId": "37.49.63.18",
+        "parentRunId": "37.49.63",
+        "type": "standard",
+        "component": "keboola.ex-github-v2",
+        "config": "1",
+        "status": "success",
+        "configRowIds": ["r2"],
+    }
+    return container, row_ok
+
+
+def test_a_row_based_config_reports_its_container_job_not_its_newest_row():
+    """Seen live: the newest job of a row-based extractor was a successful row while
+    the run (its container job) had failed."""
+    container, row_ok = _row_run()
+    row_ok["id"] = "64"  # rows start after the container
+    session = mock.Mock()
+    session.get.return_value = _response([row_ok, container])
+    reader = JobQueueReader("https://queue.keboola.com", "tok", session=session)
+    assert (reader.latest_job("keboola.ex-github-v2", "1") or {}).get("id") == "63"
+
+
+def test_a_row_job_whose_container_is_on_another_page_is_still_skipped():
+    container, row_ok = _row_run()
+    session = mock.Mock()
+    session.get.side_effect = [_response([row_ok]), _response(container), _response([])]
+    reader = JobQueueReader("https://queue.keboola.com", "tok", session=session)
+    assert reader.latest_job("keboola.ex-github-v2", "1") is None
+    assert session.get.call_args_list[1].args[0].endswith("/jobs/63")
+
+
+def test_a_single_row_run_by_hand_is_the_latest_job():
+    """Running one row by hand makes a job with a row id but no container."""
+    _, row_ok = _row_run()
+    row_ok.pop("parentRunId")
+    session = mock.Mock()
+    session.get.return_value = _response([row_ok])
+    reader = JobQueueReader("https://queue.keboola.com", "tok", session=session)
+    assert (reader.latest_job("keboola.ex-github-v2", "1") or {}).get("id") == "18"

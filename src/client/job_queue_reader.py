@@ -137,7 +137,9 @@ class JobQueueReader:
 
         A dev branch keeps the production config id, so its jobs are skipped; the
         newest production job wins. Pages are read until one is found, up to
-        ``_MAX_JOB_PAGES`` pages, so a run of dev-branch jobs does not hide it.
+        ``_MAX_JOB_PAGES`` pages, so a run of dev-branch jobs does not hide it. A
+        row-based config runs each row as a job of its own under one container
+        job; the container's result is the run's, so the row jobs are skipped.
         """
         params = {"componentId": component_id, "configId": config_id, "limit": _LATEST_JOBS}
         for page in range(_MAX_JOB_PAGES):
@@ -145,14 +147,40 @@ class JobQueueReader:
                 "/search/jobs", params | {"sortBy": "id", "sortOrder": "desc", "offset": page * _LATEST_JOBS}
             )
             jobs = jobs if isinstance(jobs, list) else []
+            by_id = {str(job.get("id")): job for job in jobs}
             for job in jobs:
-                if branch_id is None or job.get("branchId") is None or str(job.get("branchId")) == str(branch_id):
+                on_branch = (
+                    branch_id is None or job.get("branchId") is None or str(job.get("branchId")) == str(branch_id)
+                )
+                if on_branch and not self._is_row_job(job, by_id):
                     return job
             if len(jobs) < _LATEST_JOBS:
                 break
         return None
 
+    def _is_row_job(self, job: dict, by_id: dict[str, dict]) -> bool:
+        """Whether a job runs one row of a config whose container job runs them all."""
+        parent_run = str(job.get("parentRunId") or "")
+        if not parent_run or not job.get("configRowIds"):
+            return False
+        parent_id = parent_run.rsplit(".", 1)[-1]
+        parent = by_id.get(parent_id)
+        if parent is None:
+            fetched = self._get(f"/jobs/{parent_id}")
+            parent = fetched if isinstance(fetched, dict) else {}
+        return (
+            parent.get("type") == "container"
+            and parent.get("component") == job.get("component")
+            and str(parent.get("config")) == str(job.get("config"))
+        )
+
     def child_jobs(self, run_id: str) -> list[dict]:
-        """The jobs a flow job started (its tasks)."""
+        """The jobs a flow job started (its tasks).
+
+        The search returns every descendant, including the jobs a task started in
+        turn (a row-based component runs each row as a job of its own), and a
+        row's success must not stand for its task's failure: only direct children
+        are kept.
+        """
         jobs = self._get("/search/jobs", {"parentRunId": run_id, "limit": _MAX_CHILD_JOBS})
-        return jobs if isinstance(jobs, list) else []
+        return [job for job in jobs if str(job.get("parentRunId")) == run_id] if isinstance(jobs, list) else []
