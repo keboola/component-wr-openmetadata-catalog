@@ -437,7 +437,9 @@ class StorageReader:
                     definition=(typed or {}).get("definition"),
                     basetype=(typed or {}).get("basetype"),
                     legacy={k: v for k, v in legacy.items() if v is not None},
-                    description=((typed or {}).get("definition") or {}).get("description"),
+                    description=((typed or {}).get("definition") or {}).get("description")
+                    if "definition" in raw
+                    else _metadata_value(legacy_entries, _DESCRIPTION_KEY),
                 )
             )
 
@@ -448,7 +450,9 @@ class StorageReader:
             id=raw["id"],
             name=raw.get("name", raw["id"]),
             display_name=raw.get("displayName"),
-            description=definition.get("description"),
+            description=definition.get("description")
+            if "definition" in raw
+            else _metadata_value(raw.get("metadata"), _DESCRIPTION_KEY) or raw.get("description"),
             primary_key=list(primary_key),
             columns=columns,
             row_count=raw.get("rowsCount"),

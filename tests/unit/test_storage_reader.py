@@ -165,6 +165,7 @@ def test_get_table_ignores_legacy_description_metadata():
         "columns": ["id"],
         "columnMetadata": {"id": [{"key": "KBC.description", "value": "stale column text"}]},
         "metadata": [{"key": "KBC.description", "value": "stale table text"}],
+        "definition": {"columns": [{"name": "id", "definition": {}}]},
     }
     session = mock.Mock()
     session.get.return_value = FakeResponse(200, body)
@@ -172,6 +173,25 @@ def test_get_table_ignores_legacy_description_metadata():
     table = reader.get_table("out.c-sales.orders")
     assert table.description is None
     assert table.columns[0].description is None
+
+
+def test_bucket_list_table_reads_description_metadata():
+    # The bucket table list returns no ``definition``, so the native descriptions are not there.
+    body = [
+        {
+            "id": "in.c-sales.orders",
+            "name": "orders",
+            "columns": ["id"],
+            "columnMetadata": {"id": [{"key": "KBC.description", "value": "Order id"}]},
+            "metadata": [{"key": "KBC.description", "value": "Orders"}],
+        }
+    ]
+    session = mock.Mock()
+    session.get.return_value = FakeResponse(200, body)
+    reader = StorageReader("https://connection.keboola.com", "t", session=session)
+    [table] = reader.iter_tables("in.c-sales")
+    assert table.description == "Orders"
+    assert table.columns[0].description == "Order id"
 
 
 @pytest.mark.parametrize("column_definition", [None, [], {}])
