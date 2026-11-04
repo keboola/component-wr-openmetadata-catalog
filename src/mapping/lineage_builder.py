@@ -8,8 +8,10 @@ resolving entity FQNs to ids just before ``PUT /lineage`` (entities exist first)
 from __future__ import annotations
 
 import dataclasses
+import io
 import logging
 import re
+import tokenize
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -304,6 +306,23 @@ def external_edge(table_fqn: str, source_fqn: str, columns: list[str], source_co
 # ("DB"."in.c-bucket"."table") or BigQuery style (`project.dataset.table`).
 _DOUBLE_QUOTED_REF = re.compile(r'"([^"\n]+)"\s*\.\s*"([^"\n]+)"(?:\s*\.\s*"([^"\n]+)")?')
 _BACKTICK_REF = re.compile(r"`([^`\n]+)`((?:\s*\.\s*`[^`\n]+`)*)")
+# A database (or BigQuery project) name as code spells it out. Anything else, such
+# as an f-string placeholder ("{DB}") or a mis-paired quote, is not a name.
+_PLAIN_NAME = re.compile(r"[A-Za-z0-9_$-]+")
+
+
+def _without_comments(code: str) -> str:
+    """Python source without its ``#`` comments: a commented-out query is not read."""
+    try:
+        tokens = [t for t in tokenize.generate_tokens(io.StringIO(code).readline) if t.type != tokenize.COMMENT]
+        return tokenize.untokenize(tokens)
+    except tokenize.TokenError, SyntaxError, ValueError:
+        return code
+
+
+def _ref(parts: list[str]) -> tuple[tuple[str, ...], str, str]:
+    databases = tuple(part for part in parts[:-2] if _PLAIN_NAME.fullmatch(part))
+    return databases, parts[-2], parts[-1]
 
 
 def code_table_refs(code: str) -> set[tuple[tuple[str, ...], str, str]]:
@@ -312,18 +331,24 @@ def code_table_refs(code: str) -> set[tuple[tuple[str, ...], str, str]]:
     A data app that queries the Query Service has no input mapping: its SQL is
     in its code, as strings. Only qualified names are taken (a bare table name says
     nothing about its bucket), and the caller keeps only those that resolve to a
-    cataloged table, so a quoted pair that is not a table drops out there.
+    cataloged table, so a quoted pair that is not a table drops out there. A
+    database part the code builds at run time (``f'"{DB}"."in.c-b"."t"'``) is
+    left out, so the name still resolves by its bucket and table.
+
+    Not found: unquoted names (``in_c_b.orders``), BigQuery names quoted part by
+    part in a mix (`` `proj`.in_c_b.orders ``), and a table named only as a column
+    qualifier (``"in.c-b"."t"."col"``). Text in strings that is not SQL, such as
+    markdown, is read like any other string.
     """
-    code = code.replace('\\"', '"')
+    code = _without_comments(code).replace('\\"', '"')
     refs: set[tuple[tuple[str, ...], str, str]] = set()
     for match in _DOUBLE_QUOTED_REF.finditer(code):
-        parts = [part for part in match.groups() if part is not None]
-        refs.add((tuple(parts[:-2]), parts[-2], parts[-1]))
+        refs.add(_ref([part for part in match.groups() if part is not None]))
     for match in _BACKTICK_REF.finditer(code):
         quoted = [match.group(1), *re.findall(r"`([^`\n]+)`", match.group(2))]
         parts = [piece for part in quoted for piece in part.split(".")]
         if len(parts) in (2, 3):
-            refs.add((tuple(parts[:-2]), parts[-2], parts[-1]))
+            refs.add(_ref(parts))
     return refs
 
 

@@ -1540,8 +1540,13 @@ class Component(ComponentBase):
         mapping, so the tables they read are only in that code. A Git-hosted app's
         code is not in the configuration and yields nothing.
         """
-        script = ((cfg.get("configuration") or {}).get("parameters") or {}).get("script")
-        code = "\n".join(str(line) for line in script) if isinstance(script, list) else str(script or "")
+        configuration = cfg.get("configuration")
+        params = configuration.get("parameters") if isinstance(configuration, dict) else None
+        script = params.get("script") if isinstance(params, dict) else None
+        if isinstance(script, list):
+            code = "\n".join(line for line in script if isinstance(line, str))
+        else:
+            code = script if isinstance(script, str) else ""
         known = set(run.column_catalog) | run.seen_table_fqns
         inputs: set[str] = set()
         for databases, schema, table in lineage_builder.code_table_refs(code):

@@ -674,3 +674,57 @@ def test_catalog_pass_writes_nothing_for_a_project_whose_database_is_taken():
     else:
         raise AssertionError("expected ProjectNameCollision")
     assert om.puts == ["databaseServices"]  # the shared service only: no database, schema or table
+
+
+def test_code_refs_skip_a_database_built_at_run_time():
+    """Apps take the database from the environment: the name still resolves by bucket and table."""
+    code = """
+    sql = f'SELECT * FROM "{DB}"."in.c-otlp"."traces"'
+    env = f'SELECT * FROM "{os.environ["KBC_DB"]}"."in.c-otlp"."traces"'
+    bq = f"SELECT * FROM `{project}.in_c_main.orders`"
+    """
+    refs = lineage_builder.code_table_refs(code)
+    assert ((), "in.c-otlp", "traces") in refs
+    assert ((), "in_c_main", "orders") in refs
+    assert not any(databases for databases, _, _ in refs)
+
+
+def test_code_refs_ignore_commented_out_queries():
+    code = '# SELECT * FROM "in.c-old"."gone"  (old query)\nq = "SELECT 1 FROM \\"in.c-live\\".\\"t\\""\n'
+    assert lineage_builder.code_table_refs(code) == {((), "in.c-live", "t")}
+
+
+def test_data_app_reads_a_table_through_an_f_string_database():
+    pairs, dashboard_fqn = _data_app_run('query_data(f\'SELECT * FROM "{DB}"."in.c-otlp"."traces"\')')
+    assert pairs == {(_t("in.c-otlp.traces"), dashboard_fqn)}
+
+
+def test_data_app_with_no_inline_code_or_odd_shapes_has_no_code_inputs():
+    run = _run(None)
+    for cfg in (
+        {"id": "a", "configuration": {"parameters": {"dataApp": {"git": {"repository": "https://example.com/r"}}}}},
+        {"id": "a", "configuration": {"parameters": {"script": None}}},
+        {"id": "a", "configuration": {"parameters": {"script": {"main": "x"}}}},
+        {"id": "a", "configuration": {"parameters": {"script": [1, None]}}},
+        {"id": "a", "configuration": {"parameters": ["x"]}},
+        {"id": "a", "configuration": []},
+    ):
+        assert component_mod.Component._code_inputs(run, cfg) == []
+
+
+def test_bigquery_data_app_resolves_the_dataset_name_and_checks_the_project():
+    class _Reader:
+        def list_buckets(self):
+            return [
+                SourceBucket(id="in.c-main", name="c-main", path="in_c_main", backend_path=("my-project", "in_c_main"))
+            ]
+
+    run = _run(_Reader())
+    component_mod.Component._index_buckets(run)
+    run.seen_table_fqns.add(_t("in.c-main.orders", {"in.c-main": "in_c_main"}))
+
+    def inputs(code):
+        return component_mod.Component._code_inputs(run, {"configuration": {"parameters": {"script": code}}})
+
+    assert inputs("SELECT * FROM `my-project.in_c_main.orders`") == ["in.c-main.orders"]
+    assert inputs("SELECT * FROM `other-project.in_c_main.orders`") == []
