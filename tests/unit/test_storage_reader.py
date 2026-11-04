@@ -128,18 +128,20 @@ def test_get_table_typed_and_legacy_columns_and_pk():
         "primaryKey": ["id"],
         "columns": ["id", "amount", "note"],
         "definition": {
+            "description": "Orders table",
             "columns": [
-                {"name": "id", "definition": {"type": "NUMBER", "length": "38,0"}},
+                {"name": "id", "definition": {"type": "NUMBER", "length": "38,0", "description": "Order ID"}},
                 {"name": "amount", "definition": {"type": "FLOAT"}},
-            ]
+                {"name": "note", "definition": {"description": "free text"}},
+            ],
         },
         "columnMetadata": {
             "note": [
                 {"key": "KBC.datatype.basetype", "value": "STRING"},
-                {"key": "KBC.description", "value": "free text"},
+                {"key": "KBC.description", "value": "stale column text"},
             ]
         },
-        "metadata": [{"key": "KBC.description", "value": "Orders table"}],
+        "metadata": [{"key": "KBC.description", "value": "stale table text"}],
         "rowsCount": 10,
     }
     session = mock.Mock()
@@ -149,9 +151,43 @@ def test_get_table_typed_and_legacy_columns_and_pk():
     assert table.primary_key == ["id"]
     assert table.description == "Orders table"
     cols = {c.name: c for c in table.columns}
-    assert cols["id"].definition == {"type": "NUMBER", "length": "38,0"}
+    assert cols["id"].definition == {"type": "NUMBER", "length": "38,0", "description": "Order ID"}
+    assert cols["id"].description == "Order ID"
+    assert cols["amount"].description is None
     assert cols["note"].legacy == {"basetype": "STRING"}
     assert cols["note"].description == "free text"
+
+
+def test_get_table_ignores_legacy_description_metadata():
+    body = {
+        "id": "out.c-sales.orders",
+        "name": "orders",
+        "columns": ["id"],
+        "columnMetadata": {"id": [{"key": "KBC.description", "value": "stale column text"}]},
+        "metadata": [{"key": "KBC.description", "value": "stale table text"}],
+    }
+    session = mock.Mock()
+    session.get.return_value = FakeResponse(200, body)
+    reader = StorageReader("https://connection.keboola.com", "t", session=session)
+    table = reader.get_table("out.c-sales.orders")
+    assert table.description is None
+    assert table.columns[0].description is None
+
+
+@pytest.mark.parametrize("column_definition", [None, [], {}])
+def test_get_table_without_native_description_shapes(column_definition):
+    body = {
+        "id": "out.c-sales.orders",
+        "name": "orders",
+        "columns": ["id"],
+        "definition": {"columns": [{"name": "id", "definition": column_definition}]},
+    }
+    session = mock.Mock()
+    session.get.return_value = FakeResponse(200, body)
+    reader = StorageReader("https://connection.keboola.com", "t", session=session)
+    table = reader.get_table("out.c-sales.orders")
+    assert table.description is None
+    assert table.columns[0].description is None
 
 
 def test_get_table_collects_created_by_metadata():
