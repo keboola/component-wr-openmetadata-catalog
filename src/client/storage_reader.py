@@ -162,6 +162,20 @@ def _path_and_query(url: str) -> str:
     return f"{parts.path}?{parts.query}" if parts.query else parts.path
 
 
+def with_listed_descriptions(detail: SourceTable, listed: SourceTable) -> SourceTable:
+    """``detail`` with the table and column descriptions of ``listed`` (from :meth:`StorageReader.iter_tables`).
+
+    The table detail's ``definition`` falls back to ``KBC.description`` metadata when the
+    native description is empty; table list V2 does not. Taking the listed descriptions
+    keeps the written values native and equal to the ones in the bucket digest.
+    """
+    listed_columns = {column.name: column.description for column in listed.columns}
+    detail.description = listed.description
+    for column in detail.columns:
+        column.description = listed_columns.get(column.name)
+    return detail
+
+
 def needs_detail(table: SourceTable) -> bool:
     """Whether a table read from a bucket list lacks data only its own GET returns.
 

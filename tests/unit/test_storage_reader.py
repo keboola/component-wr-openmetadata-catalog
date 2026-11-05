@@ -6,7 +6,13 @@ from unittest import mock
 import pytest
 from keboola.component.exceptions import UserException
 
-from client.storage_reader import StorageReader, resolve_storage_credentials
+from client.storage_reader import (
+    SourceColumn,
+    SourceTable,
+    StorageReader,
+    resolve_storage_credentials,
+    with_listed_descriptions,
+)
 
 
 class FakeResponse:
@@ -594,3 +600,20 @@ def test_table_producer_is_the_config_that_last_wrote_it():
     )
     assert reader._parse_table({"id": "in.c-db.t", "metadata": created}).producer == ("keboola.ex-db-mysql", "100")
     assert reader._parse_table({"id": "in.c-db.t", "metadata": []}).producer is None
+
+
+def test_with_listed_descriptions_replaces_the_detail_descriptions():
+    detail = SourceTable(
+        id="in.c-sales.t",
+        name="t",
+        description="Legacy table text",
+        columns=[SourceColumn(name="id", description="Legacy id"), SourceColumn(name="extra", description="x")],
+    )
+    listed = SourceTable(
+        id="in.c-sales.t", name="t", description=None, columns=[SourceColumn(name="id", description="Native id")]
+    )
+
+    table = with_listed_descriptions(detail, listed)
+
+    assert table.description is None
+    assert [(c.name, c.description) for c in table.columns] == [("id", "Native id"), ("extra", None)]
