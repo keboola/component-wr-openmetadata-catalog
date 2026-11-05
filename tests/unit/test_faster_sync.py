@@ -52,21 +52,38 @@ def _component() -> component_mod.Component:
 # ------------------------------------------------------------- Storage reads
 
 
-def test_iter_tables_reads_a_bucket_in_one_call_with_columns_and_metadata():
+def test_iter_tables_reads_a_bucket_with_two_list_calls_and_no_table_detail():
+    tables_list = [
+        {"id": "in.c-a.t1", "name": "t1", "columns": ["id"], "isTyped": True},
+        {"id": "in.c-a.t2", "name": "t2", "columns": ["id"], "isAlias": True},
+        {"id": "in.c-a.t3", "name": "t3", "columns": ["id"]},
+    ]
+
+    def _get(url, params=None, timeout=None):
+        if url.endswith("/v2/storage/dev-branches"):
+            return _Response([{"id": 7, "isDefault": True}])
+        if url.endswith("/table-list"):
+            return _Response({"data": [], "links": {}})
+        return _Response(tables_list)
+
     session = mock.Mock()
-    session.get.return_value = _Response(
-        [
-            {"id": "in.c-a.t1", "name": "t1", "columns": ["id"], "isTyped": True},
-            {"id": "in.c-a.t2", "name": "t2", "columns": ["id"], "isAlias": True},
-            {"id": "in.c-a.t3", "name": "t3", "columns": ["id"]},
-        ]
-    )
+    session.get.side_effect = _get
     reader = StorageReader("https://connection.keboola.com", "t", session=session)
 
     tables = list(reader.iter_tables("in.c-a"))
 
-    session.get.assert_called_once()
-    assert session.get.call_args.kwargs["params"] == {"include": "columns,metadata,columnMetadata"}
+    calls = [(c.args[0], c.kwargs.get("params")) for c in session.get.call_args_list]
+    assert calls == [
+        (
+            "https://connection.keboola.com/v2/storage/buckets/in.c-a/tables",
+            {"include": "columns,metadata,columnMetadata"},
+        ),
+        ("https://connection.keboola.com/v2/storage/dev-branches", None),
+        (
+            "https://connection.keboola.com/v2/storage/branch/7/table-list",
+            {"include": "definition", "filter[bucketId]": "in.c-a"},
+        ),
+    ]
     assert [t.name for t in tables] == ["t1", "t2", "t3"]
     # typed definitions and alias sources are only in the per-table GET
     assert [needs_detail(t) for t in tables] == [True, True, False]
@@ -657,3 +674,57 @@ def test_absent_target_on_om_2_0_is_nothing_to_clean():
     state = StateManager()
     _refresh(om, state, _edges(pipeline=None))
     assert f"table:{_t('b')}" in state.lineage_digests(PID)
+
+
+class _FallbackDetailReader(_CatalogReader):
+    """The table detail returns the KBC.description fallback the bucket listing does not have."""
+
+    def __init__(self):
+        super().__init__()
+        self.buckets = self.buckets[:1]
+
+    def iter_tables(self, bucket_id):
+        return iter(
+            [
+                SourceTable(
+                    id=f"{bucket_id}.typed",
+                    name="typed",
+                    description=None,
+                    columns=[SourceColumn(name="id", description="Native id")],
+                    is_typed=True,
+                )
+            ]
+        )
+
+    def get_table(self, table_id):
+        self.detail_reads.append(table_id)
+        return SourceTable(
+            id=table_id,
+            name="typed",
+            description="Legacy table text",
+            columns=[SourceColumn(name="id", definition={"type": "NUMBER"}, description="Legacy id")],
+            is_typed=True,
+        )
+
+
+class _BodyKeepingOM(_CatalogOM):
+    def __init__(self):
+        super().__init__()
+        self.table_bodies: list[dict] = []
+
+    def put_entity(self, kind, body):
+        if kind == "tables":
+            self.table_bodies.append(body)
+        return super().put_entity(kind, body)
+
+
+def test_re_read_table_is_written_with_the_listed_native_descriptions():
+    reader = _FallbackDetailReader()
+    om = _BodyKeepingOM()
+
+    _sync_catalog(reader, om, StateManager({"run_count": 1}), _catalog_config())
+
+    assert reader.detail_reads == ["in.c-a.typed"]
+    [body] = om.table_bodies
+    assert not body.get("description")
+    assert [(c["name"], c.get("description")) for c in body["columns"]] == [("id", "Native id")]

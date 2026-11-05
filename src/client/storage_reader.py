@@ -20,6 +20,7 @@ import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import IO, Any
+from urllib.parse import urlsplit
 
 import ijson
 import requests
@@ -153,6 +154,26 @@ def _metadata_prefixed_values(entries: list | None, prefix: str) -> dict[str, st
         if isinstance(key, str) and key.startswith(prefix) and value is not None:
             result[key] = value
     return result
+
+
+def _path_and_query(url: str) -> str:
+    """The path and query of an absolute ``links.next`` URL, for :meth:`StorageReader._get`."""
+    parts = urlsplit(url)
+    return f"{parts.path}?{parts.query}" if parts.query else parts.path
+
+
+def with_listed_descriptions(detail: SourceTable, listed: SourceTable) -> SourceTable:
+    """``detail`` with the table and column descriptions of ``listed`` (from :meth:`StorageReader.iter_tables`).
+
+    The table detail's ``definition`` falls back to ``KBC.description`` metadata when the
+    native description is empty; table list V2 does not. Taking the listed descriptions
+    keeps the written values native and equal to the ones in the bucket digest.
+    """
+    listed_columns = {column.name: column.description for column in listed.columns}
+    detail.description = listed.description
+    for column in detail.columns:
+        column.description = listed_columns.get(column.name)
+    return detail
 
 
 def needs_detail(table: SourceTable) -> bool:
@@ -399,18 +420,58 @@ class StorageReader:
         return buckets
 
     def iter_tables(self, bucket_id: str) -> Iterator[SourceTable]:
-        """Every table of a bucket, with columns and metadata, from ONE Storage call.
+        """Every table of a bucket, with columns, metadata and native descriptions.
 
-        The list carries no typed ``definition`` (native column types) and no alias
-        ``sourceTable``; :func:`needs_detail` marks the tables that need
-        :meth:`get_table` for those. Callers fetch that detail only for a bucket they
-        write, so an unchanged bucket costs one call instead of one per table.
+        The bucket table list carries columns and ``columnMetadata`` (legacy types)
+        but no ``definition``; table list V2 carries the native descriptions but no
+        ``columnMetadata``. Both are read per bucket and joined by table id. Typed
+        definitions and alias ``sourceTable`` are only in the table detail;
+        :func:`needs_detail` marks the tables that need :meth:`get_table`, which
+        callers fetch only for a bucket they write.
         """
         raw = self._get(
             f"/v2/storage/buckets/{bucket_id}/tables", params={"include": "columns,metadata,columnMetadata"}
         )
-        for item in raw if isinstance(raw, list) else []:
-            yield self._parse_table(item)
+        tables = [self._parse_table(item) for item in raw] if isinstance(raw, list) else []
+        descriptions = self._native_descriptions(bucket_id)
+        for table in tables:
+            # A table created between the two requests is not in V2 and keeps no description.
+            table_description, column_descriptions = descriptions.get(table.id, (None, {}))
+            table.description = table_description
+            for column in table.columns:
+                column.description = column_descriptions.get(column.name)
+            yield table
+
+    def _native_descriptions(self, bucket_id: str) -> dict[str, tuple[str | None, dict[str, str]]]:
+        """Native table and column descriptions of a bucket's tables, from table list V2.
+
+        ``definition`` is null for a typed table whose column types are not all native;
+        its table description is the item's native ``description`` and its columns have
+        none.
+        """
+        branch = self.branch_id or "default"
+        path: str | None = f"/v2/storage/branch/{branch}/table-list"
+        params: dict | None = {"include": "definition", "filter[bucketId]": bucket_id}
+        result: dict[str, tuple[str | None, dict[str, str]]] = {}
+        while path:
+            page = self._get(path, params=params)
+            if not isinstance(page, dict):
+                raise UserException(f"Keboola Storage returned an unexpected table list for bucket {bucket_id}")
+            for item in page.get("data") or []:
+                definition = item.get("definition")
+                if isinstance(definition, dict):
+                    columns = {
+                        col["name"]: description
+                        for col in definition.get("columns") or []
+                        if col.get("name")
+                        and (description := (col.get("definition") or {}).get("description")) is not None
+                    }
+                    result[item["id"]] = (definition.get("description"), columns)
+                else:
+                    result[item["id"]] = (item.get("description"), {})
+            next_url = (page.get("links") or {}).get("next")
+            path, params = (_path_and_query(next_url), None) if next_url else (None, None)
+        return result
 
     def get_table(self, table_id: str) -> SourceTable:
         raw = self._get(
@@ -437,9 +498,7 @@ class StorageReader:
                     definition=(typed or {}).get("definition"),
                     basetype=(typed or {}).get("basetype"),
                     legacy={k: v for k, v in legacy.items() if v is not None},
-                    description=((typed or {}).get("definition") or {}).get("description")
-                    if "definition" in raw
-                    else _metadata_value(legacy_entries, _DESCRIPTION_KEY),
+                    description=((typed or {}).get("definition") or {}).get("description"),
                 )
             )
 
@@ -450,9 +509,7 @@ class StorageReader:
             id=raw["id"],
             name=raw.get("name", raw["id"]),
             display_name=raw.get("displayName"),
-            description=definition.get("description")
-            if "definition" in raw
-            else _metadata_value(raw.get("metadata"), _DESCRIPTION_KEY) or raw.get("description"),
+            description=definition.get("description"),
             primary_key=list(primary_key),
             columns=columns,
             row_count=raw.get("rowsCount"),

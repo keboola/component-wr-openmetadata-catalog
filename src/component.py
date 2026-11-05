@@ -47,6 +47,7 @@ from client.storage_reader import (
     StorageReader,
     needs_detail,
     resolve_storage_credentials,
+    with_listed_descriptions,
 )
 from configuration import Configuration, CustomPropertiesMode, FailureMode
 from lineage.column_lineage import LineageResult, extract_column_lineage
@@ -781,7 +782,10 @@ class Component(ComponentBase):
             run.seen_schema_fqns.add(schema_fqn)
             run.bucket_id_by_schema[schema_fqn] = bucket.id
             linked = bucket.source_bucket is not None
-            tables = [run.reader.get_table(t.id) if linked or needs_detail(t) else t for t in tables]
+            tables = [
+                with_listed_descriptions(run.reader.get_table(t.id), t) if linked or needs_detail(t) else t
+                for t in tables
+            ]
             self._upsert(
                 om,
                 run,

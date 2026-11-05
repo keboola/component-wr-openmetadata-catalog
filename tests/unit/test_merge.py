@@ -463,3 +463,76 @@ def test_real_edit_with_escaped_characters_still_diverges():
     desired = {"description": "orders -> revenue"}
     om = {"description": "Edited by a person: orders -&gt; net revenue"}
     assert _merge(TWM, desired, om, desired).action == ACTION_SKIPPED_DIVERGED
+
+
+def _table(description=None, column_description=None, data_type="INT"):
+    column = {"name": "a", "dataType": data_type, "ordinalPosition": 1}
+    if column_description is not None:
+        column["description"] = column_description
+    table = {"name": "t", "columns": [column]}
+    if description is not None:
+        table["description"] = description
+    return table
+
+
+def test_withdrawn_table_description_written_earlier_is_cleared():
+    # An earlier version wrote KBC.description text; there is no native description now.
+    written = _table("KBC table text")
+    base = {k: v for k, v in written.items() if k != "name"}
+
+    cleared = TWM.merge(desired=_table(), current=written, base=base, owned_fields=OWNED_TABLE_FIELDS)
+
+    assert cleared.action == ACTION_UPDATED
+    assert cleared.patch == [{"op": "replace", "path": "/description", "value": ""}]
+
+    # A native description set later is written, not reported as diverged.
+    native = TWM.merge(
+        desired=_table("Native table"),
+        current=_table(""),
+        base=cleared.snapshot_fields,
+        owned_fields=OWNED_TABLE_FIELDS,
+    )
+    assert native.action == ACTION_UPDATED
+    assert native.diverged_fields == []
+
+
+def test_withdrawn_column_description_stays_until_a_native_one_is_written():
+    written = _table(column_description="KBC column text")
+    base = {"columns": written["columns"]}
+
+    kept = TWM.merge(desired=_table(), current=written, base=base, owned_fields=OWNED_TABLE_FIELDS)
+    assert kept.action == ACTION_SKIPPED_UNCHANGED
+    assert kept.patch == []
+
+    native = TWM.merge(
+        desired=_table(column_description="Native column"),
+        current=written,
+        base=kept.snapshot_fields,
+        owned_fields=OWNED_TABLE_FIELDS,
+    )
+    assert native.action == ACTION_UPDATED
+    assert native.diverged_fields == []
+
+
+def test_user_description_on_an_undescribed_column_does_not_block_column_changes():
+    # The component never wrote a description for column "a"; a user did, in OM.
+    base = {"columns": _table()["columns"]}
+    current = _table(column_description="User doc")
+
+    d = TWM.merge(desired=_table(data_type="BIGINT"), current=current, base=base, owned_fields=OWNED_TABLE_FIELDS)
+
+    assert d.action == ACTION_UPDATED
+    assert d.diverged_fields == []
+    assert "description" not in d.patch[0]["value"][0]
+
+
+def test_user_edit_of_a_withdrawn_table_description_stays_unowned():
+    written = _table("KBC table text")
+    base = {k: v for k, v in written.items() if k != "name"}
+    current = _table("User rewrote it")
+
+    d = TWM.merge(desired=_table(), current=current, base=base, owned_fields=OWNED_TABLE_FIELDS)
+
+    assert d.action == ACTION_SKIPPED_UNCHANGED
+    assert d.patch == []
+    assert "description" not in d.snapshot_fields
