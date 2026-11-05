@@ -52,21 +52,38 @@ def _component() -> component_mod.Component:
 # ------------------------------------------------------------- Storage reads
 
 
-def test_iter_tables_reads_a_bucket_in_one_call_with_columns_and_metadata():
+def test_iter_tables_reads_a_bucket_with_two_list_calls_and_no_table_detail():
+    tables_list = [
+        {"id": "in.c-a.t1", "name": "t1", "columns": ["id"], "isTyped": True},
+        {"id": "in.c-a.t2", "name": "t2", "columns": ["id"], "isAlias": True},
+        {"id": "in.c-a.t3", "name": "t3", "columns": ["id"]},
+    ]
+
+    def _get(url, params=None, timeout=None):
+        if url.endswith("/v2/storage/dev-branches"):
+            return _Response([{"id": 7, "isDefault": True}])
+        if url.endswith("/table-list"):
+            return _Response({"data": [], "links": {}})
+        return _Response(tables_list)
+
     session = mock.Mock()
-    session.get.return_value = _Response(
-        [
-            {"id": "in.c-a.t1", "name": "t1", "columns": ["id"], "isTyped": True},
-            {"id": "in.c-a.t2", "name": "t2", "columns": ["id"], "isAlias": True},
-            {"id": "in.c-a.t3", "name": "t3", "columns": ["id"]},
-        ]
-    )
+    session.get.side_effect = _get
     reader = StorageReader("https://connection.keboola.com", "t", session=session)
 
     tables = list(reader.iter_tables("in.c-a"))
 
-    session.get.assert_called_once()
-    assert session.get.call_args.kwargs["params"] == {"include": "columns,metadata,columnMetadata"}
+    calls = [(c.args[0], c.kwargs.get("params")) for c in session.get.call_args_list]
+    assert calls == [
+        (
+            "https://connection.keboola.com/v2/storage/buckets/in.c-a/tables",
+            {"include": "columns,metadata,columnMetadata"},
+        ),
+        ("https://connection.keboola.com/v2/storage/dev-branches", None),
+        (
+            "https://connection.keboola.com/v2/storage/branch/7/table-list",
+            {"include": "definition", "filter[bucketId]": "in.c-a"},
+        ),
+    ]
     assert [t.name for t in tables] == ["t1", "t2", "t3"]
     # typed definitions and alias sources are only in the per-table GET
     assert [needs_detail(t) for t in tables] == [True, True, False]

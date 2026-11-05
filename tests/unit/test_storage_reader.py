@@ -175,23 +175,142 @@ def test_get_table_ignores_legacy_description_metadata():
     assert table.columns[0].description is None
 
 
-def test_bucket_list_table_reads_description_metadata():
-    # The bucket table list returns no ``definition``, so the native descriptions are not there.
-    body = [
+_TABLE_LIST_V2 = "/v2/storage/branch/default/table-list"
+
+
+def _bucket_reader(bucket_tables, v2_pages):
+    """A reader over one bucket: the legacy table list plus table list V2 pages.
+
+    ``v2_pages`` maps the requested path (the first page, then each ``links.next``
+    path with its query) to the page body.
+    """
+    session = mock.Mock()
+    calls = []
+
+    def _get(url, params=None, timeout=None):
+        path = url.replace("https://connection.keboola.com", "")
+        calls.append((path, params))
+        if path == "/v2/storage/dev-branches":
+            return FakeResponse(200, [])
+        if path == "/v2/storage/buckets/in.c-sales/tables":
+            return FakeResponse(200, bucket_tables)
+        if path in v2_pages:
+            return FakeResponse(200, v2_pages[path])
+        return FakeResponse(404, {})
+
+    session.get.side_effect = _get
+    return StorageReader("https://connection.keboola.com", "t", session=session), calls
+
+
+def test_bucket_list_table_reads_native_descriptions_from_table_list_v2():
+    bucket_tables = [
+        {
+            "id": "in.c-sales.orders",
+            "name": "orders",
+            "columns": ["id", "note"],
+            "columnMetadata": {"id": [{"key": "KBC.description", "value": "stale column text"}]},
+            "metadata": [{"key": "KBC.description", "value": "stale table text"}],
+        }
+    ]
+    v2 = {
+        _TABLE_LIST_V2: {
+            "data": [
+                {
+                    "id": "in.c-sales.orders",
+                    "description": "Orders",
+                    "definition": {
+                        "description": "Orders",
+                        "columns": [
+                            {"name": "id", "definition": {"description": "Order id"}},
+                            {"name": "note", "definition": {}},
+                        ],
+                    },
+                }
+            ],
+            "links": {},
+        }
+    }
+    reader, calls = _bucket_reader(bucket_tables, v2)
+
+    [table] = reader.iter_tables("in.c-sales")
+
+    assert table.description == "Orders"
+    assert [(c.name, c.description) for c in table.columns] == [("id", "Order id"), ("note", None)]
+    assert (_TABLE_LIST_V2, {"include": "definition", "filter[bucketId]": "in.c-sales"}) in calls
+
+
+def test_bucket_list_table_without_native_descriptions_ignores_description_metadata():
+    bucket_tables = [
         {
             "id": "in.c-sales.orders",
             "name": "orders",
             "columns": ["id"],
-            "columnMetadata": {"id": [{"key": "KBC.description", "value": "Order id"}]},
-            "metadata": [{"key": "KBC.description", "value": "Orders"}],
+            "columnMetadata": {"id": [{"key": "KBC.description", "value": "stale column text"}]},
+            "metadata": [{"key": "KBC.description", "value": "stale table text"}],
         }
     ]
-    session = mock.Mock()
-    session.get.return_value = FakeResponse(200, body)
-    reader = StorageReader("https://connection.keboola.com", "t", session=session)
+    v2 = {
+        _TABLE_LIST_V2: {
+            "data": [
+                {
+                    "id": "in.c-sales.orders",
+                    "description": None,
+                    "definition": {"description": None, "columns": [{"name": "id", "definition": {}}]},
+                }
+            ],
+            "links": {},
+        }
+    }
+    reader, _ = _bucket_reader(bucket_tables, v2)
+
     [table] = reader.iter_tables("in.c-sales")
-    assert table.description == "Orders"
-    assert table.columns[0].description == "Order id"
+
+    assert table.description is None
+    assert table.columns[0].description is None
+
+
+def test_typed_table_with_null_definition_takes_the_native_table_description():
+    # Table list V2 returns a null definition for a typed table whose column types are
+    # not all native; the item's own description is still the native one.
+    bucket_tables = [{"id": "in.c-sales.typed", "name": "typed", "columns": ["id"], "isTyped": True}]
+    v2 = {
+        _TABLE_LIST_V2: {
+            "data": [{"id": "in.c-sales.typed", "description": "Typed table", "definition": None}],
+            "links": {},
+        }
+    }
+    reader, _ = _bucket_reader(bucket_tables, v2)
+
+    [table] = reader.iter_tables("in.c-sales")
+
+    assert table.description == "Typed table"
+    assert table.columns[0].description is None
+
+
+def test_table_list_v2_pages_are_followed_through_links_next():
+    bucket_tables = [
+        {"id": "in.c-sales.a", "name": "a", "columns": ["id"]},
+        {"id": "in.c-sales.b", "name": "b", "columns": ["id"]},
+        {"id": "in.c-sales.new", "name": "new", "columns": ["id"]},
+    ]
+    next_path = f"{_TABLE_LIST_V2}?include=definition&filter%5BbucketId%5D=in.c-sales&page%5Bafter%5D=in.c-sales.a"
+    v2 = {
+        _TABLE_LIST_V2: {
+            "data": [{"id": "in.c-sales.a", "definition": {"description": "A", "columns": []}}],
+            "links": {"next": f"https://connection.keboola.com{next_path}"},
+        },
+        next_path: {
+            "data": [{"id": "in.c-sales.b", "definition": {"description": "B", "columns": []}}],
+            "links": {"next": None},
+        },
+    }
+    reader, calls = _bucket_reader(bucket_tables, v2)
+
+    tables = list(reader.iter_tables("in.c-sales"))
+
+    # "new" was created between the two requests: it is not in V2 and has no description.
+    assert [(t.name, t.description) for t in tables] == [("a", "A"), ("b", "B"), ("new", None)]
+    assert (next_path, None) in calls
 
 
 @pytest.mark.parametrize("column_definition", [None, [], {}])
