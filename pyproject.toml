@@ -14,7 +14,7 @@ dependencies = [
     "sshtunnel>=0.4.0",
     # sshtunnel 0.4.0 (its last release) reads paramiko.DSSKey on every tunnel start,
     # and paramiko 4 removed DSSKey: with paramiko >= 4 no tunnel can open.
-    "paramiko>=3.4,<4",
+    "paramiko>=5.0.0,<6",
 ]
 
 [dependency-groups]
