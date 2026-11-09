@@ -132,7 +132,7 @@
         "write_table_lineage": false,
         "write_pipeline_lineage": false,
         "write_dashboard_lineage": false,
-        "service_name": "keboola-vcr-catalog10",
+        "service_name": "keboola-vcr-catalog12",
         "parallel_requests": 1
       }
     }
@@ -222,7 +222,7 @@
         "write_table_lineage": false,
         "write_pipeline_lineage": false,
         "write_dashboard_lineage": false,
-        "service_name": "keboola-vcr-catalog10",
+        "service_name": "keboola-vcr-catalog12",
         "parallel_requests": 1
       }
     }
@@ -313,7 +313,7 @@
         "write_table_lineage": false,
         "write_pipeline_lineage": false,
         "write_dashboard_lineage": false,
-        "service_name": "keboola-vcr-refresh2",
+        "service_name": "keboola-vcr-refresh4",
         "parallel_requests": 1
       }
     }
@@ -403,7 +403,7 @@
         "write_table_lineage": false,
         "write_pipeline_lineage": false,
         "write_dashboard_lineage": false,
-        "service_name": "keboola-vcr-lineage-off2",
+        "service_name": "keboola-vcr-lineage-off4",
         "parallel_requests": 1
       }
     }
@@ -494,7 +494,7 @@
         "write_table_lineage": false,
         "write_pipeline_lineage": false,
         "write_dashboard_lineage": false,
-        "service_name": "keboola-vcr-merge-tw3",
+        "service_name": "keboola-vcr-merge-tw5",
         "parallel_requests": 1
       }
     }
@@ -585,7 +585,7 @@
         "write_table_lineage": false,
         "write_pipeline_lineage": false,
         "write_dashboard_lineage": false,
-        "service_name": "keboola-vcr-merge-kw3",
+        "service_name": "keboola-vcr-merge-kw5",
         "parallel_requests": 1
       }
     }
@@ -725,7 +725,7 @@
         "write_table_lineage": false,
         "write_pipeline_lineage": false,
         "write_dashboard_lineage": false,
-        "service_name": "keboola-vcr-forward2",
+        "service_name": "keboola-vcr-forward4",
         "parallel_requests": 1
       }
     }

@@ -27,7 +27,7 @@ from keboola.component.base import ComponentBase, sync_action
 from keboola.component.dao import BaseType, ColumnDefinition
 from keboola.component.exceptions import UserException
 from keboola.component.sync_actions import MessageType, SelectElement, ValidationResult
-from keboola.vcr import BaseSanitizer, DefaultSanitizer
+from keboola.vcr import BaseSanitizer, BodyFieldSanitizer, DefaultSanitizer
 
 import report as report_mod
 from client import ssh_proxy
@@ -263,6 +263,10 @@ class CredentialScrubber(BaseSanitizer):
 # value recursively so a future recording can never bake in a foreign private key
 # or cloud access-key id. It runs at record time only, so the already-recorded
 # cassettes are unaffected.
+#
+# ``BodyFieldSanitizer`` drops ``actor`` and ``creatorToken`` (who created a token or
+# a dev branch, with their e-mail) from every recorded body: the repository is public
+# and the writer reads neither field from the responses the VCR cases record.
 VCR_SANITIZERS = [
     DefaultSanitizer(
         additional_sensitive_fields=[
@@ -276,6 +280,7 @@ VCR_SANITIZERS = [
         ],
     ),
     CredentialScrubber(),
+    BodyFieldSanitizer(fields=["actor", "creatorToken"]),
 ]
 
 # Version of the entity bodies this writer emits. Bucket digests only track Storage
