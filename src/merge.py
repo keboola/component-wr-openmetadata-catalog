@@ -143,6 +143,23 @@ def _project_owned(desired_value: object, om_value: object) -> object:
     return om_value
 
 
+def _clear_withdrawn_description(desired: dict, current: dict, base: dict) -> dict:
+    """``desired`` with an empty description where OM still holds one we wrote and no longer source.
+
+    A builder leaves out an empty description, so OM keeps the text it holds and the
+    snapshot loses it; a later description would then look diverged from that text.
+    Text this component wrote itself (it is in ``base``) and no longer sources, e.g. a
+    ``KBC.description`` value from an older version, is cleared while OM still holds it
+    unchanged. Text a user wrote or edited in OM stays unowned. Column descriptions are
+    not cleared: ``columns`` is merged and patched as one array, so clearing one column
+    would diverge on, or overwrite, a user's description of another.
+    """
+    written = base.get("description")
+    if "description" in desired or _is_empty(written) or _project_owned(written, current.get("description")) != written:
+        return desired
+    return {**desired, "description": ""}
+
+
 def _patch_op(current: dict, field_name: str, value: object) -> dict:
     op = "replace" if field_name in current and current.get(field_name) is not None else "add"
     return {"op": op, "path": f"/{field_name}", "value": value}
@@ -166,6 +183,8 @@ class ThreeWayMerger:
             snapshot = {f: desired[f] for f in owned_fields if f in desired}
             return MergeDecision(action=ACTION_CREATED, snapshot_fields=snapshot, is_create=True)
 
+        if base is not None:
+            desired = _clear_withdrawn_description(desired, current, base)
         patch: list[dict] = []
         snapshot: dict = {}
         diverged: list[str] = []

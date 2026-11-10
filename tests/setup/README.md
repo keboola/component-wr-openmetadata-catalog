@@ -136,7 +136,10 @@ Most success cases record straight from the sandbox + scratch project with the
 
 ## Sanitizers (secrets scrubbed from cassettes)
 
-`VCR_SANITIZERS` in `src/component.py` has two layers:
+`VCR_SANITIZERS` in `src/component.py` has three layers (the third,
+`BodyFieldSanitizer`, replaces every `actor` and `creatorToken` value — the
+creator's name and e-mail in `tokens/verify` and `dev-branches` responses — with
+`REDACTED`; the writer reads neither field). The first two:
 
 1. **`DefaultSanitizer`** (1) whitelists request/response headers to
    `{content-type, content-length, accept}` — so `Authorization: Bearer <#bot_token>`
